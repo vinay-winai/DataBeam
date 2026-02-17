@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{BufReader, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
@@ -34,6 +35,13 @@ const SENDME_GZ: &[u8] = &[];
 fn bundled_bin_dir() -> PathBuf {
     let base = dirs::cache_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     base.join("filebeam").join("bin")
+}
+
+fn new_hidden_command(program: impl AsRef<OsStr>) -> Command {
+    let mut cmd = Command::new(program);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    cmd
 }
 
 /// Extract a gzip-compressed binary to the cache directory.
@@ -207,7 +215,7 @@ fn find_release_asset<'a>(tool: &Tool, release: &'a GitHubRelease) -> Option<&'a
 
 #[cfg(not(target_os = "windows"))]
 fn download_bytes(url: &str) -> Result<Vec<u8>, String> {
-    let output = Command::new("curl")
+    let output = new_hidden_command("curl")
         .args(["-fsSL", "-A", "filebeam", url])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -239,8 +247,7 @@ fn download_bytes(url: &str) -> Result<Vec<u8>, String> {
         escape_ps_single_quote(&tmp_path)
     );
 
-    let output = Command::new("powershell")
-        .creation_flags(0x08000000)
+    let output = new_hidden_command("powershell")
         .args(["-NoProfile", "-Command", &script])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -405,9 +412,7 @@ fn detect_tool_with_bundled(tool: &Tool, bundled_path: Option<&PathBuf>) -> Tool
     // Try managed binary first
     if let Some(bp) = bundled_path {
         if bp.exists() {
-            let mut cmd = Command::new(bp);
-            #[cfg(target_os = "windows")]
-            cmd.creation_flags(0x08000000);
+            let mut cmd = new_hidden_command(bp);
 
             let version = cmd.arg("--version")
                 .stdout(Stdio::piped())
@@ -441,9 +446,7 @@ fn detect_tool_with_bundled(tool: &Tool, bundled_path: Option<&PathBuf>) -> Tool
     let available = path_str.is_some();
 
     let version = if let Some(path) = sys_path {
-        let mut cmd = Command::new(path);
-        #[cfg(target_os = "windows")]
-        cmd.creation_flags(0x08000000);
+        let mut cmd = new_hidden_command(path);
 
         cmd.arg("--version")
             .stdout(Stdio::piped())
@@ -582,9 +585,7 @@ pub fn croc_send(
     let binary = binary_path.to_string();
 
     let _worker = thread::spawn(move || {
-        let mut cmd = Command::new(&binary);
-        #[cfg(target_os = "windows")]
-        cmd.creation_flags(0x08000000);
+        let mut cmd = new_hidden_command(&binary);
 
         // --yes is a GLOBAL flag, must come before the subcommand
         cmd.arg("--yes");
@@ -681,9 +682,7 @@ pub fn croc_receive(
     let binary = binary_path.to_string();
 
     let _worker = thread::spawn(move || {
-        let mut cmd = Command::new(&binary);
-        #[cfg(target_os = "windows")]
-        cmd.creation_flags(0x08000000);
+        let mut cmd = new_hidden_command(&binary);
 
         // croc v10.3.1: code must be passed via CROC_SECRET env var
         // (passing code as CLI arg is no longer supported in non-classic mode)
@@ -794,7 +793,8 @@ pub fn sendme_send(
             )));
             return;
         }
-        // Prefer pseudo-terminal wrapper when available (matches the historically stable path).
+        // Prefer pseudo-terminal wrapper on Unix when available.
+        #[cfg(not(target_os = "windows"))]
         let script_path = {
             let fixed = PathBuf::from("/usr/bin/script");
             if fixed.exists() {
@@ -803,8 +803,11 @@ pub fn sendme_send(
                 which::which("script").ok()
             }
         };
+        #[cfg(target_os = "windows")]
+        let script_path: Option<PathBuf> = None;
+
         let mut cmd = if let Some(script) = script_path {
-            let mut c = Command::new(script);
+            let mut c = new_hidden_command(script);
             c.arg("-q");
             c.arg("/dev/null");
             c.arg("env");
@@ -816,7 +819,7 @@ pub fn sendme_send(
             c.arg(&send_path);
             c
         } else {
-            let mut c = Command::new(&binary);
+            let mut c = new_hidden_command(&binary);
             c.env("RUST_LOG", "info");
             c.env("IROH_DATA_DIR", &temp_dir);
             c.arg("send");
@@ -824,8 +827,6 @@ pub fn sendme_send(
             c.arg(&send_path);
             c
         };
-        #[cfg(target_os = "windows")]
-        cmd.creation_flags(0x08000000);
 
         cmd.current_dir(&temp_dir);
 
@@ -995,6 +996,8 @@ pub fn sendme_receive(
             )));
             return;
         }
+        // Prefer pseudo-terminal wrapper on Unix when available.
+        #[cfg(not(target_os = "windows"))]
         let script_path = {
             let fixed = PathBuf::from("/usr/bin/script");
             if fixed.exists() {
@@ -1003,8 +1006,11 @@ pub fn sendme_receive(
                 which::which("script").ok()
             }
         };
+        #[cfg(target_os = "windows")]
+        let script_path: Option<PathBuf> = None;
+
         let mut cmd = if let Some(script) = script_path {
-            let mut c = Command::new(script);
+            let mut c = new_hidden_command(script);
             c.arg("-q");
             c.arg("/dev/null");
             c.arg("env");
@@ -1016,7 +1022,7 @@ pub fn sendme_receive(
             c.arg(&opts.ticket);
             c
         } else {
-            let mut c = Command::new(&binary);
+            let mut c = new_hidden_command(&binary);
             c.env("RUST_LOG", "info");
             c.env("IROH_DATA_DIR", &temp_dir);
             c.arg("receive");
@@ -1024,10 +1030,6 @@ pub fn sendme_receive(
             c.arg(&opts.ticket);
             c
         };
-
-
-        #[cfg(target_os = "windows")]
-        cmd.creation_flags(0x08000000);
 
         if let Some(dir) = &opts.output_dir {
             cmd.current_dir(dir);
@@ -1302,9 +1304,7 @@ impl ProcessHandle {
                 }
                 #[cfg(not(unix))]
                 {
-                    let mut cmd = std::process::Command::new("taskkill");
-                    #[cfg(target_os = "windows")]
-                    cmd.creation_flags(0x08000000);
+                    let mut cmd = new_hidden_command("taskkill");
                     
                     let _ = cmd
                         .args(["/PID", &pid.to_string(), "/F", "/T"])
