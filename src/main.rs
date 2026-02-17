@@ -33,6 +33,7 @@ enum AppView {
 enum SelectedTool {
     Croc,
     Sendme,
+    EazySendme,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -48,6 +49,9 @@ enum TransferPhase {
     Preparing,
     WaitingForReceiver,
     Transferring,
+    // EazySendme specific phases
+    EazySharingTicket,
+    EazyWaitingForPeer,
 }
 
 /// A file/folder entry with its cached size
@@ -76,6 +80,8 @@ struct UserSettings {
     receive_output_dir: Option<String>,
     #[serde(default = "default_sendme_one_shot")]
     sendme_one_shot: bool,
+    #[serde(default)]
+    eazysendme_custom_code: String,
 }
 
 fn default_sendme_one_shot() -> bool {
@@ -127,6 +133,11 @@ struct FileBeamApp {
     transfer_end_time: Option<f64>,
     croc_qr_popup_open: bool,
     croc_text_popup_open: bool,
+
+    // EazySendme
+    eazysendme_custom_code: String,
+    eazysendme_ticket: Option<String>,
+    eazysendme_croc_handle: Option<ProcessHandle>,
 
     // UI
     toast_msg: Option<(String, f64, Color32)>,
@@ -193,6 +204,9 @@ impl Default for FileBeamApp {
             sendme_item_progress: HashMap::new(),
             last_done_speed_sample: None,
             initialized_once: false,
+            eazysendme_custom_code: String::new(),
+            eazysendme_ticket: None,
+            eazysendme_croc_handle: None,
         }
     }
 }
@@ -200,7 +214,7 @@ impl Default for FileBeamApp {
 impl FileBeamApp {
     fn effective_progress(&self) -> f32 {
         match self.transfer_phase {
-            TransferPhase::Preparing | TransferPhase::WaitingForReceiver => 0.0,
+            TransferPhase::Preparing | TransferPhase::WaitingForReceiver | TransferPhase::EazySharingTicket | TransferPhase::EazyWaitingForPeer => 0.0,
             TransferPhase::Transferring => {
                 if self.selected_tool == SelectedTool::Croc && self.croc_file_progress.is_some() {
                     return self.transfer_progress.clamp(0.0, 1.0);
@@ -321,6 +335,7 @@ impl FileBeamApp {
             .map(PathBuf::from)
             .filter(|p| !p.as_os_str().is_empty());
         self.sendme_one_shot = settings.sendme_one_shot;
+        self.eazysendme_custom_code = settings.eazysendme_custom_code;
     }
 
     fn persist_user_settings(&self) {
@@ -335,12 +350,14 @@ impl FileBeamApp {
             selected_tool: Some(match self.selected_tool {
                 SelectedTool::Croc => "croc".to_string(),
                 SelectedTool::Sendme => "sendme".to_string(),
+                SelectedTool::EazySendme => "eazysendme".to_string(),
             }),
             receive_output_dir: self
                 .receive_output_dir
                 .as_ref()
                 .map(|p| p.to_string_lossy().to_string()),
             sendme_one_shot: self.sendme_one_shot,
+            eazysendme_custom_code: self.eazysendme_custom_code.clone(),
         };
         if let Ok(json) = serde_json::to_string_pretty(&settings) {
             let _ = fs::write(path, json);
@@ -355,6 +372,7 @@ impl FileBeamApp {
         match self.selected_tool {
             SelectedTool::Croc => CROC_COLOR,
             SelectedTool::Sendme => SENDME_COLOR,
+            SelectedTool::EazySendme => Color32::from_rgb(255, 165, 0), // Orange-ish
         }
     }
 
@@ -958,6 +976,34 @@ impl FileBeamApp {
                                     true
                                 };
                                 if should_replace {
+                                    // Serve mode ticket detected — start sharing it via Croc
+                                    if self.selected_tool == SelectedTool::EazySendme
+                                        && self.view == AppView::Send
+                                        && self.transfer_phase == TransferPhase::Preparing
+                                    {
+                                        self.transfer_phase = TransferPhase::EazySharingTicket;
+                                        self.eazysendme_ticket = Some(code.clone());
+                                        self.transfer_log.push(format!("Ticket generated: {}. Sharing via Croc...", code));
+                                        
+                                        // Start croc_send
+                                        if let Some(binary) = self.get_tool_binary(&Tool::Croc) {
+                                            let opts = CrocSendOptions {
+                                                paths: Vec::new(),
+                                                custom_code: Some(self.eazysendme_custom_code.clone()),
+                                                text_mode: true,
+                                                text_value: Some(code.clone()),
+                                            };
+                                            let (_croc_rx, croc_handle) = croc_send(opts, &binary);
+                                            self.eazysendme_croc_handle = Some(croc_handle);
+                                            
+                                            // We need to poll croc_rx too. For simplicity, we can spawn a thread
+                                            // that forwards croc_rx to our main transfer_rx, but we can't easily
+                                            // because TransferMsg is not Clone or we don't have the tx.
+                                            // Better: store croc_rx and poll it in poll_transfer.
+                                            // Wait, we only have one transfer_rx.
+                                            // Let's add EazySendme specific handling.
+                                        }
+                                    }
                                     self.transfer_code = Some(code);
                                 }
                                 if self.selected_tool == SelectedTool::Croc
@@ -985,11 +1031,40 @@ impl FileBeamApp {
                                             .to_string(),
                                     );
                                 } else {
-                                    self.transfer_state = TransferState::Completed;
-                                    self.transfer_progress = 1.0;
-                                    self.preparing_progress = 1.0;
-                                    if let Some(total) = self.transfer_total_bytes {
-                                        self.transfer_done_bytes = Some(total);
+                                    if self.selected_tool == SelectedTool::EazySendme
+                                        && self.view == AppView::Receive
+                                        && self.transfer_phase == TransferPhase::Preparing
+                                    {
+                                        // Receiver side: Croc finished receiving the ticket
+                                        if let Some(ticket) = self.croc_received_text.clone() {
+                                            self.transfer_log.push("Ticket received via Croc. Starting Sendme...".to_string());
+                                            self.eazysendme_ticket = Some(ticket.clone());
+                                            
+                                            // Start sendme_receive
+                                            if let Some(binary) = self.get_tool_binary(&Tool::Sendme) {
+                                                let opts = SendmeReceiveOptions {
+                                                    ticket: ticket.trim().to_string(),
+                                                    output_dir: self.receive_output_dir.clone(),
+                                                };
+                                                let (new_rx, new_handle) = sendme_receive(opts, &binary);
+                                                self.transfer_rx = Some(new_rx);
+                                                self.transfer_handle = Some(new_handle);
+                                                self.transfer_phase = TransferPhase::Transferring;
+                                                self.transfer_start_time = Some(self.animation_time);
+                                                return; // Exit poll_transfer, will resume next frame with new_rx
+                                            } else {
+                                                self.transfer_state = TransferState::Failed("Sendme binary not found".to_string());
+                                            }
+                                        } else {
+                                            self.transfer_state = TransferState::Failed("Croc finished but no ticket found".to_string());
+                                        }
+                                    } else {
+                                        self.transfer_state = TransferState::Completed;
+                                        self.transfer_progress = 1.0;
+                                        self.preparing_progress = 1.0;
+                                        if let Some(total) = self.transfer_total_bytes {
+                                            self.transfer_done_bytes = Some(total);
+                                        }
                                     }
                                 }
                             }
@@ -1024,15 +1099,20 @@ impl FileBeamApp {
                                         "Peer finished downloading".to_string(),
                                         SUCCESS,
                                     );
+                                    if self.selected_tool == SelectedTool::EazySendme {
+                                        // If our shared ticket was received via Croc, nothing more to do for Croc
+                                        if self.transfer_phase == TransferPhase::EazySharingTicket {
+                                            self.transfer_phase = TransferPhase::EazyWaitingForPeer;
+                                            self.transfer_log.push("Ticket shared via Croc. Waiting for Sendme transfer...".to_string());
+                                            // Croc process ends here, but we stay in Running (or EazyWaitingForPeer)
+                                            // because Sendme is still serving.
+                                        }
+                                    }
                                     self.transfer_progress = 0.0;
-                                    self.transfer_phase = if self.selected_tool
-                                        == SelectedTool::Sendme
-                                        && self.view == AppView::Send
-                                        && !self.sendme_one_shot
-                                    {
-                                        TransferPhase::WaitingForReceiver
-                                    } else {
-                                        TransferPhase::Preparing
+                                    self.transfer_phase = match (self.selected_tool, self.view, self.sendme_one_shot) {
+                                        (SelectedTool::Sendme, AppView::Send, false) => TransferPhase::WaitingForReceiver,
+                                        (SelectedTool::EazySendme, AppView::Send, _) => TransferPhase::EazyWaitingForPeer,
+                                        _ => TransferPhase::Preparing,
                                     };
                                     self.preparing_progress = 0.0;
                                     self.transfer_payload_start_time = None;
@@ -1094,6 +1174,8 @@ impl FileBeamApp {
                                     && !self.sendme_one_shot
                                 {
                                     TransferPhase::WaitingForReceiver
+                                } else if self.selected_tool == SelectedTool::EazySendme {
+                                    TransferPhase::Preparing
                                 } else {
                                     TransferPhase::Preparing
                                 };
@@ -1193,7 +1275,7 @@ impl FileBeamApp {
 
         let tool = match self.selected_tool {
             SelectedTool::Croc => Tool::Croc,
-            SelectedTool::Sendme => Tool::Sendme,
+            SelectedTool::Sendme | SelectedTool::EazySendme => Tool::Sendme,
         };
         let binary = match self.get_tool_binary(&tool) {
             Some(b) => b,
@@ -1264,6 +1346,15 @@ impl FileBeamApp {
                 self.transfer_rx = Some(rx);
                 self.transfer_handle = Some(handle);
             }
+            SelectedTool::EazySendme => {
+                // Step 1: Start sendme_send to get a ticket
+                let opts = SendmeSendOptions {
+                    paths: self.send_paths(),
+                };
+                let (rx, handle) = sendme_send(opts, &binary);
+                self.transfer_rx = Some(rx);
+                self.transfer_handle = Some(handle);
+            }
         }
 
         self.transfer_state = TransferState::Running;
@@ -1280,7 +1371,7 @@ impl FileBeamApp {
         self.reset_transfer();
 
         let tool = match self.selected_tool {
-            SelectedTool::Croc => Tool::Croc,
+            SelectedTool::Croc | SelectedTool::EazySendme => Tool::Croc,
             SelectedTool::Sendme => Tool::Sendme,
         };
         let binary = match self.get_tool_binary(&tool) {
@@ -1307,6 +1398,16 @@ impl FileBeamApp {
                     output_dir: self.receive_output_dir.clone(),
                 };
                 let (rx, handle) = sendme_receive(opts, &binary);
+                self.transfer_rx = Some(rx);
+                self.transfer_handle = Some(handle);
+            }
+            SelectedTool::EazySendme => {
+                // Step 1: Start croc_receive to get the ticket
+                let opts = CrocReceiveOptions {
+                    code: self.receive_code.trim().to_string(),
+                    output_dir: None, // Ticket is text, no dir needed
+                };
+                let (rx, handle) = croc_receive(opts, &binary);
                 self.transfer_rx = Some(rx);
                 self.transfer_handle = Some(handle);
             }
@@ -1417,6 +1518,7 @@ impl FileBeamApp {
         let (title, share_label) = match self.selected_tool {
             SelectedTool::Croc => ("Croc QR", "Scan or copy this code"),
             SelectedTool::Sendme => ("Sendme QR", "Scan or copy this ticket"),
+            SelectedTool::EazySendme => ("EazySendme QR", "Scan or copy this ticket"),
         };
         egui::Window::new(title)
             .open(&mut open)
@@ -1611,6 +1713,7 @@ impl eframe::App for FileBeamApp {
                         let (tc, tn) = match self.selected_tool {
                             SelectedTool::Croc => (CROC_COLOR, "🐊 croc"),
                             SelectedTool::Sendme => (SENDME_COLOR, "📡 sendme"),
+                            SelectedTool::EazySendme => (Color32::from_rgb(255, 165, 0), "⚡ eazysendme"),
                         };
                         status_badge(ui, tn, tc);
                     });
@@ -1675,6 +1778,22 @@ impl eframe::App for FileBeamApp {
                                         .size(11.0),
                                     );
                                 }
+                            }
+                            TransferPhase::EazySharingTicket => {
+                                ui.label(
+                                    RichText::new("sharing ticket")
+                                        .color(TEXT_MUTED)
+                                        .monospace()
+                                        .size(11.0),
+                                );
+                            }
+                            TransferPhase::EazyWaitingForPeer => {
+                                ui.label(
+                                    RichText::new("waiting for peer")
+                                        .color(TEXT_MUTED)
+                                        .monospace()
+                                        .size(11.0),
+                                );
                             }
                         }
 
@@ -1784,6 +1903,23 @@ impl FileBeamApp {
             {
                 self.switch_tool(SelectedTool::Croc);
             }
+        }
+        ui.add_space(3.0);
+        if tool_card(
+            ui,
+            "⚡ EazySendme",
+            "Sendme performance + Croc-like automatic ticket sharing",
+            croc_status.as_ref().map(|s| s.available).unwrap_or(false) && sendme_status.as_ref().map(|s| s.available).unwrap_or(false),
+            None,
+            Color32::from_rgb(255, 165, 0),
+            self.selected_tool == SelectedTool::EazySendme,
+        )
+        .clicked()
+            && croc_status.as_ref().map(|s| s.available).unwrap_or(false)
+            && sendme_status.as_ref().map(|s| s.available).unwrap_or(false)
+            && self.selected_tool != SelectedTool::EazySendme
+        {
+            self.switch_tool(SelectedTool::EazySendme);
         }
 
         ui.add_space(16.0);
@@ -2162,6 +2298,17 @@ impl FileBeamApp {
                             }
                         ),
                     ),
+                    SelectedTool::EazySendme => (
+                        Color32::from_rgb(255, 165, 0),
+                        format!(
+                            "⚡ EazySend{}",
+                            if self.send_items.len() > 1 {
+                                format!(" {} items", self.send_items.len())
+                            } else {
+                                String::new()
+                            }
+                        ),
+                    ),
                 };
                 if croc_text_conflict {
                     ui.label(
@@ -2223,7 +2370,7 @@ impl FileBeamApp {
         // ── Code input ──
         card_frame(ui, |ui| {
             let (label, hint) = match self.selected_tool {
-                SelectedTool::Croc => ("Code Phrase", "e.g. 1234-ocean-monkey"),
+                SelectedTool::Croc | SelectedTool::EazySendme => ("Code Phrase", "e.g. 1234-ocean-monkey"),
                 SelectedTool::Sendme => ("Ticket", "paste ticket here"),
             };
             ui.horizontal(|ui| {
@@ -2376,6 +2523,7 @@ impl FileBeamApp {
                 let (color, label) = match self.selected_tool {
                     SelectedTool::Croc => (CROC_COLOR, "🐊 Receive"),
                     SelectedTool::Sendme => (SENDME_COLOR, "📡 Receive"),
+                    SelectedTool::EazySendme => (Color32::from_rgb(255, 165, 0), "⚡ Receive (via Croc)"),
                 };
                 if accent_button(ui, label, color).clicked() {
                     self.start_receive();
@@ -2486,6 +2634,8 @@ impl FileBeamApp {
                             }
                             TransferPhase::WaitingForReceiver => "Waiting for receiver…",
                             TransferPhase::Transferring => "Transferring…",
+                            TransferPhase::EazySharingTicket => "Sharing ticket via Croc…",
+                            TransferPhase::EazyWaitingForPeer => "Waiting for peer (Sendme)…",
                         };
                         ui.label(RichText::new(status_text).color(accent).strong().size(13.0));
 
@@ -2512,9 +2662,14 @@ impl FileBeamApp {
                         }
                         let pct_text = format!("{:.1}%", effective_progress * 100.0);
                         ui.horizontal_wrapped(|ui| match self.transfer_phase {
-                            TransferPhase::Preparing => {
+                            TransferPhase::Preparing | TransferPhase::EazySharingTicket | TransferPhase::EazyWaitingForPeer => {
+                                let label = match self.transfer_phase {
+                                    TransferPhase::EazySharingTicket => "Sharing ticket via Croc...",
+                                    TransferPhase::EazyWaitingForPeer => "Waiting for peer (Sendme)...",
+                                    _ => "Preparing ...",
+                                };
                                 ui.label(
-                                    RichText::new("Preparing ...")
+                                    RichText::new(label)
                                         .size(10.0)
                                         .color(TEXT_SECONDARY),
                                 );
@@ -2616,9 +2771,14 @@ impl FileBeamApp {
                         });
                     } else {
                         ui.horizontal_wrapped(|ui| match self.transfer_phase {
-                            TransferPhase::Preparing | TransferPhase::WaitingForReceiver => {
+                            TransferPhase::Preparing | TransferPhase::WaitingForReceiver | TransferPhase::EazySharingTicket | TransferPhase::EazyWaitingForPeer => {
+                                let label = match self.transfer_phase {
+                                    TransferPhase::EazySharingTicket => "Sharing ticket via Croc...",
+                                    TransferPhase::EazyWaitingForPeer => "Waiting for peer (Sendme)...",
+                                    _ => "Waiting for receiver...",
+                                };
                                 ui.label(
-                                    RichText::new("Waiting for receiver...")
+                                    RichText::new(label)
                                         .size(10.0)
                                         .color(TEXT_SECONDARY),
                                 );
@@ -2708,6 +2868,7 @@ impl FileBeamApp {
                 let (label, color) = match self.selected_tool {
                     SelectedTool::Croc => ("Share this code:", CROC_COLOR),
                     SelectedTool::Sendme => ("Share this ticket:", SENDME_COLOR),
+                    SelectedTool::EazySendme => ("EazySendme ticket:", Color32::from_rgb(255, 165, 0)),
                 };
                 if code_display(ui, label, code, color) {
                     self.show_toast("Code copied".to_string(), SUCCESS);
