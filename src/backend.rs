@@ -34,7 +34,7 @@ const SENDME_GZ: &[u8] = &[];
 /// Get the cache directory for extracted binaries
 fn bundled_bin_dir() -> PathBuf {
     let base = dirs::cache_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-    base.join("filebeam").join("bin")
+    base.join("databeam").join("bin")
 }
 
 fn new_hidden_command(program: impl AsRef<OsStr>) -> Command {
@@ -216,7 +216,7 @@ fn find_release_asset<'a>(tool: &Tool, release: &'a GitHubRelease) -> Option<&'a
 #[cfg(not(target_os = "windows"))]
 fn download_bytes(url: &str) -> Result<Vec<u8>, String> {
     let output = new_hidden_command("curl")
-        .args(["-fsSL", "-A", "filebeam", url])
+        .args(["-fsSL", "-A", "databeam", url])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -240,11 +240,14 @@ fn download_bytes(url: &str) -> Result<Vec<u8>, String> {
 
     let tmp =
         tempfile::NamedTempFile::new().map_err(|e| format!("Failed to allocate temp file: {e}"))?;
-    let tmp_path = tmp.path().to_string_lossy().to_string();
+    let tmp_path = tmp.into_temp_path(); // Close file handle, keep temp path
+    let tmp_path_str = tmp_path.to_string_lossy().to_string();
+
     let script = format!(
-        "$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -UseBasicParsing -Headers @{{'User-Agent'='filebeam'; 'Accept'='application/vnd.github+json, application/octet-stream'}} -Uri '{}' -OutFile '{}'",
+        "$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -UseBasicParsing -Headers @{{'User-Agent'='Mozilla/5.0 (Windows NT 10.0; Win64; x64) DataBeam/{}'; 'Accept'='application/vnd.github+json, application/octet-stream'}} -Uri '{}' -OutFile '{}'",
+        "0.1.0",
         escape_ps_single_quote(url),
-        escape_ps_single_quote(&tmp_path)
+        escape_ps_single_quote(&tmp_path_str)
     );
 
     let output = new_hidden_command("powershell")
@@ -261,7 +264,7 @@ fn download_bytes(url: &str) -> Result<Vec<u8>, String> {
         ));
     }
 
-    fs::read(tmp.path()).map_err(|e| format!("Failed to read downloaded file: {e}"))
+    fs::read(&tmp_path).map_err(|e| format!("Failed to read downloaded file: {e}"))
 }
 
 fn extract_binary_from_tar_gz(
@@ -595,8 +598,9 @@ pub fn croc_send(
             cmd.env("CROC_SECRET", code);
         }
         if opts.text_mode {
+            cmd.arg("--text");
             if let Some(text) = &opts.text_value {
-                cmd.arg("--text").arg(text);
+                cmd.arg(text);
             }
         } else {
             for p in &opts.paths {
@@ -605,6 +609,8 @@ pub fn croc_send(
         }
 
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        // Use temp dir for execution to ensure croc can write/remove its internal temp files
+        cmd.current_dir(std::env::temp_dir());
 
         let _ = tx.send(TransferMsg::Started);
 
@@ -780,7 +786,7 @@ pub fn sendme_send(
         };
 
         let temp_dir = std::env::temp_dir().join(format!(
-            "filebeam_sendme_{}",
+            "databeam_sendme_{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -902,7 +908,7 @@ pub fn sendme_send(
 /// Create a staging directory with all items copied/linked into it for sendme
 fn create_staging_dir(paths: &[PathBuf]) -> Result<(PathBuf, tempfile::TempDir), String> {
     let staging = tempfile::Builder::new()
-        .prefix("filebeam_")
+        .prefix("databeam_")
         .tempdir()
         .map_err(|e| format!("Could not create temp dir: {}", e))?;
 
@@ -968,6 +974,28 @@ fn cleanup_sendme_send_dirs(base_dir: &Path) {
     }
 }
 
+fn cleanup_sendme_receive_artifacts(base_dir: &Path) {
+    let Ok(entries) = fs::read_dir(base_dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(".sendme") {
+            continue;
+        }
+
+        if path.is_dir() {
+            let _ = fs::remove_dir_all(path);
+        } else {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 // ── Sendme Receive ─────────────────────────────────────────────────
 
 pub fn sendme_receive(
@@ -983,7 +1011,7 @@ pub fn sendme_receive(
 
     let _worker = thread::spawn(move || {
         let temp_dir = std::env::temp_dir().join(format!(
-            "filebeam_sendme_recv_{}",
+            "databeam_sendme_recv_{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -1088,11 +1116,25 @@ pub fn sendme_receive(
                         let _ = tx.send(TransferMsg::Error(format!("Process error: {}", e)));
                     }
                 }
+                if let Some(out) = &opts.output_dir {
+                    cleanup_sendme_receive_artifacts(&PathBuf::from(out));
+                } else {
+                    cleanup_sendme_receive_artifacts(
+                        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                    );
+                }
                 cleanup_runtime_dir(&temp_dir);
             }
             Err(e) => {
                 let _ = tx.send(TransferMsg::Error(format!("Failed to start sendme: {}", e)));
                 cleanup_runtime_dir(&temp_dir);
+                if let Some(out) = &opts.output_dir {
+                    cleanup_sendme_receive_artifacts(&PathBuf::from(out));
+                } else {
+                    cleanup_sendme_receive_artifacts(
+                        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                    );
+                }
             }
         }
     });
@@ -1206,6 +1248,11 @@ fn parse_sendme_send_output(line: &str, tx: &mpsc::Sender<TransferMsg>) {
         return;
     };
 
+    // If it's stderr (heuristic: if line doesn't match standard patterns or is explicitly passed as stderr in future), 
+    // actually we are mixing stdout/stderr in the same pipe reader in the caller? 
+    // No, we have separate threads for stdout and stderr, but they both call this parser.
+    // For now, let's just log everything.
+
     if (lower.contains("error") || lower.contains("failed") || lower.contains("aborted"))
         && (lower.contains("handshake")
             || lower.contains("incompatible")
@@ -1216,7 +1263,7 @@ fn parse_sendme_send_output(line: &str, tx: &mpsc::Sender<TransferMsg>) {
         ));
     }
 
-    // Sender should one-shot complete only on explicit send-finished signals.
+    // Sender one-shot completion should be signaled by explicit send-finished lines.
     if lower.contains("finished sending") || lower.contains("transfer complete") {
         let _ = tx.send(TransferMsg::Progress(1.0));
         let _ = tx.send(TransferMsg::PeerDisconnected);
@@ -1249,10 +1296,9 @@ fn parse_sendme_receive_output(line: &str, tx: &mpsc::Sender<TransferMsg>) {
         }
     }
 
-    // Receiver completion should key off final summary line, not intermediate export lines.
+    // Receiver completion should key off process exit, not log line, to ensure export finishes.
     if lower.contains("downloaded") && lower.contains("files") {
         let _ = tx.send(TransferMsg::Progress(1.0));
-        let _ = tx.send(TransferMsg::Completed);
     }
 }
 

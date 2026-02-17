@@ -4,3 +4,9 @@ Cargo.lock
 *.swo
 .DS_Store
 .sendme-send-*
+dist/*.exe
+dist/*.pdb
+dist/*.zip
+dist/*.tar.gz
+dist/*
+!dist/.gitkeep

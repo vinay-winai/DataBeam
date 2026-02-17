@@ -80,7 +80,7 @@ struct UserSettings {
     receive_output_dir: Option<String>,
     #[serde(default = "default_sendme_one_shot")]
     sendme_one_shot: bool,
-    #[serde(default)]
+    #[serde(skip)]
     eazysendme_custom_code: String,
 }
 
@@ -88,7 +88,7 @@ fn default_sendme_one_shot() -> bool {
     true
 }
 
-struct FileBeamApp {
+struct DataBeamApp {
     view: AppView,
     selected_tool: SelectedTool,
 
@@ -138,6 +138,7 @@ struct FileBeamApp {
     eazysendme_custom_code: String,
     eazysendme_ticket: Option<String>,
     eazysendme_croc_handle: Option<ProcessHandle>,
+    eazysendme_croc_rx: Option<mpsc::Receiver<TransferMsg>>,
 
     // UI
     toast_msg: Option<(String, f64, Color32)>,
@@ -153,7 +154,7 @@ struct FileBeamApp {
     initialized_once: bool,
 }
 
-impl Default for FileBeamApp {
+impl Default for DataBeamApp {
     fn default() -> Self {
         Self {
             view: AppView::Home,
@@ -207,11 +208,12 @@ impl Default for FileBeamApp {
             eazysendme_custom_code: String::new(),
             eazysendme_ticket: None,
             eazysendme_croc_handle: None,
+            eazysendme_croc_rx: None,
         }
     }
 }
 
-impl FileBeamApp {
+impl DataBeamApp {
     fn effective_progress(&self) -> f32 {
         match self.transfer_phase {
             TransferPhase::Preparing | TransferPhase::WaitingForReceiver | TransferPhase::EazySharingTicket | TransferPhase::EazyWaitingForPeer => 0.0,
@@ -239,19 +241,6 @@ impl FileBeamApp {
         }
         // Show current transfer speed, not averaged speed.
         self.transfer_speed_bps = Some(speed_bps);
-    }
-
-    fn remember_croc_code(&mut self, code: &str) {
-        let code = code.trim();
-        if code.is_empty() || code.chars().count() <= 6 {
-            return;
-        }
-        self.croc_recent_codes.retain(|c| c != code);
-        self.croc_recent_codes.insert(0, code.to_string());
-        if self.croc_recent_codes.len() > 5 {
-            self.croc_recent_codes.truncate(5);
-        }
-        self.persist_user_settings();
     }
 
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -295,7 +284,7 @@ impl FileBeamApp {
             .or_else(dirs::data_local_dir)
             .or_else(dirs::cache_dir)
             .or_else(dirs::home_dir)?;
-        Some(base.join("filebeam").join("settings.json"))
+        Some(base.join("databeam").join("settings.json"))
     }
 
     fn load_user_settings(&mut self) {
@@ -486,6 +475,9 @@ impl FileBeamApp {
         self.transfer_payload_start_time = None;
         self.transfer_end_time = None;
         self.croc_qr_popup_open = false;
+        self.eazysendme_ticket = None;
+        self.eazysendme_croc_handle = None;
+        self.eazysendme_croc_rx = None;
         self.croc_text_popup_open = false;
         self.sendme_peer_connected = false;
         self.sendme_last_activity = None;
@@ -748,12 +740,16 @@ impl FileBeamApp {
         if let Some(text) = extract_croc_received_text(line) {
             if !text.is_empty() && self.croc_received_text.as_deref() != Some(text.as_str()) {
                 self.croc_received_text = Some(text);
-                self.croc_text_popup_open = true;
+                if self.selected_tool == SelectedTool::Croc {
+                    self.croc_text_popup_open = true;
+                }
                 self.croc_expect_text_payload = false;
             }
             return true;
         }
-        if self.selected_tool == SelectedTool::Croc && self.view == AppView::Receive {
+        if (self.selected_tool == SelectedTool::Croc || self.selected_tool == SelectedTool::EazySendme)
+            && self.view == AppView::Receive
+        {
             let lower = line.to_lowercase();
             if (lower.contains("receiv") && lower.contains("text"))
                 || lower.contains("text message")
@@ -765,7 +761,9 @@ impl FileBeamApp {
                 let text = line.trim().trim_matches('"').to_string();
                 if !text.is_empty() && self.croc_received_text.as_deref() != Some(text.as_str()) {
                     self.croc_received_text = Some(text);
-                    self.croc_text_popup_open = true;
+                    if self.selected_tool == SelectedTool::Croc {
+                        self.croc_text_popup_open = true;
+                    }
                     self.croc_expect_text_payload = false;
                     return true;
                 }
@@ -773,7 +771,10 @@ impl FileBeamApp {
             if self.croc_received_text.is_none() {
                 if let Some(text) = extract_croc_received_text_from_logs(&self.transfer_log) {
                     self.croc_received_text = Some(text);
-                    self.croc_text_popup_open = true;
+                    // self.croc_text_popup_open = true; // Don't pop up for EazySendme, just use it
+                    if self.selected_tool == SelectedTool::Croc {
+                        self.croc_text_popup_open = true;
+                    }
                     self.croc_expect_text_payload = false;
                     return true;
                 }
@@ -787,7 +788,7 @@ impl FileBeamApp {
         if let Some(rx) = self.transfer_rx.take() {
             let mut processed = 0usize;
             let mut restart_sendme_serve = false;
-            let max_msgs_per_frame = if self.selected_tool == SelectedTool::Sendme {
+            let max_msgs_per_frame = if self.selected_tool == SelectedTool::Sendme || self.selected_tool == SelectedTool::EazySendme {
                 4000
             } else {
                 800
@@ -806,7 +807,7 @@ impl FileBeamApp {
                                     self.update_transfer_metrics_from_log(&line);
                                 }
                                 let mut skip_log_line = false;
-                                if self.selected_tool == SelectedTool::Croc
+                                if (self.selected_tool == SelectedTool::Croc || self.selected_tool == SelectedTool::EazySendme)
                                     && self.view == AppView::Receive
                                 {
                                     skip_log_line = self.update_croc_received_text_from_log(&line);
@@ -814,7 +815,7 @@ impl FileBeamApp {
                                 if self.view == AppView::Send
                                     && self.transfer_state == TransferState::Running
                                 {
-                                    if self.selected_tool == SelectedTool::Sendme
+                                    if (self.selected_tool == SelectedTool::Sendme || self.selected_tool == SelectedTool::EazySendme)
                                         && lower.contains("sendme receive ")
                                         && self.transfer_phase == TransferPhase::Preparing
                                     {
@@ -840,6 +841,7 @@ impl FileBeamApp {
                                 }
                                 if !skip_log_line
                                     && (self.selected_tool == SelectedTool::Sendme
+                                        || self.selected_tool == SelectedTool::EazySendme
                                         || self.transfer_log.last() != Some(&line))
                                 {
                                     self.transfer_log.push(line);
@@ -847,7 +849,7 @@ impl FileBeamApp {
                                         self.transfer_log.drain(0..100);
                                     }
                                 }
-                                if self.selected_tool == SelectedTool::Sendme {
+                                if self.selected_tool == SelectedTool::Sendme || self.selected_tool == SelectedTool::EazySendme {
                                     let sendme_serve_mode =
                                         self.view == AppView::Send && !self.sendme_one_shot;
                                     if sendme_serve_mode
@@ -864,6 +866,7 @@ impl FileBeamApp {
                                         self.sendme_peer_connected = false;
                                         self.sendme_last_activity = None;
                                     }
+                                    // Transition to Transferring only on actual connection acceptance or data flow
                                     if lower.contains("disco_in{endpoint=")
                                         || lower.contains("new direct addr for endpoint")
                                         || lower.contains("new connection type")
@@ -985,26 +988,27 @@ impl FileBeamApp {
                                         self.eazysendme_ticket = Some(code.clone());
                                         self.transfer_log.push(format!("Ticket generated: {}. Sharing via Croc...", code));
                                         
-                                        // Start croc_send
-                                        if let Some(binary) = self.get_tool_binary(&Tool::Croc) {
-                                            let opts = CrocSendOptions {
-                                                paths: Vec::new(),
-                                                custom_code: Some(self.eazysendme_custom_code.clone()),
-                                                text_mode: true,
-                                                text_value: Some(code.clone()),
-                                            };
-                                            let (_croc_rx, croc_handle) = croc_send(opts, &binary);
+                                            // Start croc_send
+                                            if let Some(binary) = self.get_tool_binary(&Tool::Croc) {
+                                                let opts = CrocSendOptions {
+                                                    paths: Vec::new(),
+                                                    custom_code: if !self.eazysendme_custom_code.is_empty() {
+                                                        Some(self.eazysendme_custom_code.clone())
+                                                    } else {
+                                                        None
+                                                    },
+                                                    text_mode: true,
+                                                    text_value: Some(code.clone()),
+                                                };
+                                            let (croc_rx, croc_handle) = croc_send(opts, &binary);
                                             self.eazysendme_croc_handle = Some(croc_handle);
-                                            
-                                            // We need to poll croc_rx too. For simplicity, we can spawn a thread
-                                            // that forwards croc_rx to our main transfer_rx, but we can't easily
-                                            // because TransferMsg is not Clone or we don't have the tx.
-                                            // Better: store croc_rx and poll it in poll_transfer.
-                                            // Wait, we only have one transfer_rx.
-                                            // Let's add EazySendme specific handling.
+                                            self.eazysendme_croc_rx = Some(croc_rx);
                                         }
+                                        // self.transfer_code = Some(code); // Do NOT show the sendme ticket as the code
+                                    } else {
+                                        // Normal Sendme or Croc: show the code/ticket we got
+                                        self.transfer_code = Some(code);
                                     }
-                                    self.transfer_code = Some(code);
                                 }
                                 if self.selected_tool == SelectedTool::Croc
                                     && self.view == AppView::Send
@@ -1034,6 +1038,7 @@ impl FileBeamApp {
                                     if self.selected_tool == SelectedTool::EazySendme
                                         && self.view == AppView::Receive
                                         && self.transfer_phase == TransferPhase::Preparing
+                                        && self.transfer_rx.is_none()
                                     {
                                         // Receiver side: Croc finished receiving the ticket
                                         if let Some(ticket) = self.croc_received_text.clone() {
@@ -1071,14 +1076,14 @@ impl FileBeamApp {
                             TransferMsg::PeerDisconnected => {
                                 self.transfer_log
                                     .push("Peer disconnected (transfer finished)".to_string());
-                                if self.selected_tool == SelectedTool::Sendme
+                                if (self.selected_tool == SelectedTool::Sendme
+                                    || self.selected_tool == SelectedTool::EazySendme)
                                     && self.sendme_one_shot
                                 {
                                     let done = self.transfer_done_bytes.unwrap_or(0);
-                                    let has_payload = self.transfer_payload_start_time.is_some()
-                                        || done > 0
+                                    let has_payload = done > 0
                                         || self.transfer_progress > 0.0
-                                        || self.sendme_peer_connected;
+                                        || self.transfer_phase == TransferPhase::Transferring;
                                     if has_payload {
                                         self.transfer_state = TransferState::Completed;
                                         self.transfer_progress = 1.0;
@@ -1122,7 +1127,7 @@ impl FileBeamApp {
                             }
                             TransferMsg::Error(e) => {
                                 if self.transfer_state == TransferState::Completed {
-                                    // Ignore late process-shutdown errors after we already marked complete.
+                                    // Ignore late process-shutdown errors after completion.
                                 } else if e == "Transfer cancelled" {
                                     // Keep explicit completion from caller paths; otherwise stay idle-ish failed.
                                     if self.transfer_state != TransferState::Completed {
@@ -1131,15 +1136,15 @@ impl FileBeamApp {
                                         self.transfer_end_time = Some(self.animation_time);
                                     }
                                 } else if e == "Send session ended before transfer completed"
-                                    && self.selected_tool == SelectedTool::Sendme
+                                    && (self.selected_tool == SelectedTool::Sendme
+                                        || self.selected_tool == SelectedTool::EazySendme)
                                     && self.sendme_one_shot
                                     && self.sendme_peer_connected
                                 {
                                     let done = self.transfer_done_bytes.unwrap_or(0);
-                                    let has_payload = self.transfer_payload_start_time.is_some()
-                                        || done > 0
+                                    let has_payload = done > 0
                                         || self.transfer_progress > 0.0
-                                        || self.sendme_peer_connected;
+                                        || self.transfer_phase == TransferPhase::Transferring;
                                     if has_payload {
                                         self.transfer_state = TransferState::Completed;
                                         self.transfer_end_time = Some(self.animation_time);
@@ -1154,7 +1159,7 @@ impl FileBeamApp {
                                         self.transfer_end_time = Some(self.animation_time);
                                     }
                                 } else if e == "Send session ended before transfer completed"
-                                    && self.selected_tool == SelectedTool::Sendme
+                                    && (self.selected_tool == SelectedTool::Sendme || self.selected_tool == SelectedTool::EazySendme)
                                     && !self.sendme_one_shot
                                 {
                                     // Serve mode: this session can expire while idle; immediately
@@ -1175,7 +1180,11 @@ impl FileBeamApp {
                                 {
                                     TransferPhase::WaitingForReceiver
                                 } else if self.selected_tool == SelectedTool::EazySendme {
-                                    TransferPhase::Preparing
+                                    if self.view == AppView::Receive && self.eazysendme_ticket.is_some() {
+                                        TransferPhase::Transferring
+                                    } else {
+                                        TransferPhase::Preparing
+                                    }
                                 } else {
                                     TransferPhase::Preparing
                                 };
@@ -1197,6 +1206,49 @@ impl FileBeamApp {
                 // Put it back
                 self.transfer_rx = Some(rx);
             }
+        }
+
+        // Poll eazysendme_croc_rx if present to get the code
+        if let Some(rx) = self.eazysendme_croc_rx.take() {
+            let mut processed = 0;
+            loop {
+                if processed > 100 {
+                    break;
+                }
+                match rx.try_recv() {
+                    Ok(msg) => {
+                        processed += 1;
+                        match msg {
+                            TransferMsg::Output(line) => {
+                                self.transfer_log.push(format!("[Croc] {}", line));
+                                if self.transfer_log.len() > 500 {
+                                    self.transfer_log.drain(0..100);
+                                }
+                            }
+                            TransferMsg::Code(code) => {
+                                // This is the short code we want to show!
+                                self.transfer_code = Some(code);
+                            }
+                            TransferMsg::Error(e) => {
+                                self.show_toast(format!("Croc error: {}", e), ERROR);
+                            }
+                            TransferMsg::Completed => {
+                                self.transfer_log.push("Croc finished sharing ticket.".to_string());
+                                if self.selected_tool == SelectedTool::EazySendme 
+                                    && self.view == AppView::Send 
+                                    && self.transfer_phase == TransferPhase::EazySharingTicket 
+                                {
+                                    self.transfer_phase = TransferPhase::WaitingForReceiver;
+                                    self.transfer_log.push("Waiting for receiver to connect via Sendme...".to_string());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            self.eazysendme_croc_rx = Some(rx);
         }
     }
 
@@ -1311,9 +1363,6 @@ impl FileBeamApp {
                         self.croc_use_custom_code = true;
                         return;
                     }
-                    self.remember_croc_code(code);
-                }
-                if let Some(code) = &custom_code {
                     self.transfer_code = Some(code.clone());
                     if self.croc_show_qr {
                         self.croc_qr_popup_open = true;
@@ -1347,7 +1396,15 @@ impl FileBeamApp {
                 self.transfer_handle = Some(handle);
             }
             SelectedTool::EazySendme => {
+                if self.eazysendme_custom_code.len() < 7 {
+                    self.show_toast("Code must be at least 7 characters".to_string(), WARNING);
+                    return;
+                }
                 // Step 1: Start sendme_send to get a ticket
+                // EazySendme MUST be one-shot because tickets are single-use.
+                self.sendme_one_shot = true;
+                self.transfer_phase = TransferPhase::Preparing;
+                
                 let opts = SendmeSendOptions {
                     paths: self.send_paths(),
                 };
@@ -1583,12 +1640,13 @@ impl FileBeamApp {
     }
 }
 
-impl eframe::App for FileBeamApp {
+impl eframe::App for DataBeamApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.animation_time = ctx.input(|i| i.time);
         if !self.initialized_once {
             self.view = AppView::Home;
             self.initialized_once = true;
+            self.show_toast(format!("Running DataBeam v{} (Fixed Build)", APP_VERSION), SUCCESS);
         }
 
         if let Some((_, ref mut start, _)) = self.toast_msg {
@@ -1604,16 +1662,16 @@ impl eframe::App for FileBeamApp {
         // Heuristic one-shot finish for sendme sender: after peer activity, if output goes idle,
         // stop the serving process and mark complete.
         if self.transfer_state == TransferState::Running
-            && self.selected_tool == SelectedTool::Sendme
+            && self.view == AppView::Send
+            && (self.selected_tool == SelectedTool::Sendme
+                || self.selected_tool == SelectedTool::EazySendme)
             && self.sendme_one_shot
             && self.sendme_peer_connected
+            && self.transfer_phase == TransferPhase::Transferring
             && self.transfer_code.is_some()
         {
             if let Some(last) = self.sendme_last_activity {
                 if self.animation_time - last > 4.0 {
-                    if let Some(handle) = &self.transfer_handle {
-                        handle.request_cancel();
-                    }
                     self.transfer_state = TransferState::Completed;
                     self.transfer_progress = 1.0;
                     self.preparing_progress = 1.0;
@@ -1831,7 +1889,7 @@ impl eframe::App for FileBeamApp {
 
 // ── Views ──────────────────────────────────────────────────────────
 
-impl FileBeamApp {
+impl DataBeamApp {
     fn show_home(&mut self, ui: &mut egui::Ui) {
         ui.vertical_centered(|ui| {
             ui.add_space(12.0);
@@ -2105,6 +2163,41 @@ impl FileBeamApp {
             ui.add_space(6.0);
         }
 
+        if self.selected_tool == SelectedTool::EazySendme {
+            card_frame(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("🔑 Custom Code").color(TEXT_PRIMARY).strong());
+                    ui.label(
+                        RichText::new("(Required)")
+                            .color(ERROR)
+                            .size(10.0),
+                    );
+                });
+                ui.add_space(4.0);
+                if send_locked {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.eazysendme_custom_code)
+                            .hint_text("Random code")
+                            .interactive(false),
+                    );
+                } else {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.eazysendme_custom_code)
+                            .hint_text("Random code"),
+                    );
+                    if response.changed() && !self.eazysendme_custom_code.is_empty() {
+                         // Validation or persistence could go here
+                    }
+                }
+                 ui.label(
+                     RichText::new("Must use more than 6 characters.")
+                         .size(10.0)
+                         .color(TEXT_MUTED),
+                 );
+            });
+            ui.add_space(6.0);
+        }
+
         // ── File list ──
         card_frame(ui, |ui| {
             ui.horizontal(|ui| {
@@ -2317,8 +2410,19 @@ impl FileBeamApp {
                             .color(ERROR),
                     );
                 }
-                if accent_button(ui, &label, color).clicked() {
-                    self.start_send();
+                let enabled = if self.selected_tool == SelectedTool::EazySendme {
+                    self.eazysendme_custom_code.len() >= 7
+                } else {
+                    true
+                };
+                
+                ui.add_enabled_ui(enabled, |ui| {
+                     if accent_button(ui, &label, color).clicked() {
+                        self.start_send();
+                     }
+                });
+                if !enabled && self.selected_tool == SelectedTool::EazySendme {
+                     ui.label(RichText::new("Code too short (min 7 chars)").color(ERROR).size(10.0));
                 }
             }
             TransferState::Running => {
@@ -2633,7 +2737,13 @@ impl FileBeamApp {
                                 }
                             }
                             TransferPhase::WaitingForReceiver => "Waiting for receiver…",
-                            TransferPhase::Transferring => "Transferring…",
+                            TransferPhase::Transferring => {
+                                if self.view == AppView::Receive {
+                                    "Downloading…"
+                                } else {
+                                    "Transferring…"
+                                }
+                            }
                             TransferPhase::EazySharingTicket => "Sharing ticket via Croc…",
                             TransferPhase::EazyWaitingForPeer => "Waiting for peer (Sendme)…",
                         };
@@ -2933,7 +3043,7 @@ fn is_masked_croc_code(code: &str) -> bool {
         && !trimmed.chars().any(|c| c.is_ascii_alphanumeric())
 }
 
-fn filebeam_icon() -> egui::IconData {
+fn databeam_icon() -> egui::IconData {
     let width = 64u32;
     let height = 64u32;
     let mut rgba = vec![0u8; (width * height * 4) as usize];
@@ -3449,7 +3559,7 @@ fn main() -> eframe::Result {
             .with_inner_size([600.0, 640.0])
             .with_min_inner_size([420.0, 360.0])
             .with_title("DataBeam")
-            .with_icon(filebeam_icon())
+            .with_icon(databeam_icon())
             .with_drag_and_drop(true),
         ..Default::default()
     };
@@ -3457,7 +3567,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "DataBeam",
         options,
-        Box::new(|cc| Ok(Box::new(FileBeamApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(DataBeamApp::new(cc)))),
     )
 }
 
@@ -3467,7 +3577,7 @@ mod parse_tests {
         extract_croc_received_text, extract_croc_received_text_from_logs,
         parse_croc_file_counter_progress, parse_croc_total_size_hint, parse_payload_progress,
         parse_sendme_imported_size_hint, parse_sendme_item_index, parse_sendme_total_files_hint,
-        parse_stage_progress, AppView, FileBeamApp, SelectedTool, TransferMsg, TransferPhase,
+        parse_stage_progress, AppView, DataBeamApp, SelectedTool, TransferMsg, TransferPhase,
         TransferState,
     };
     use std::sync::mpsc;
@@ -3534,7 +3644,7 @@ mod parse_tests {
 
     #[test]
     fn croc_total_size_hint_ignores_per_file_lines() {
-        let line = "sending filebeam_QWIXer/readme.txt (6.0 KB)";
+        let line = "sending databeam_QWIXer/readme.txt (6.0 KB)";
         assert!(parse_croc_total_size_hint(line).is_none());
     }
 
@@ -3561,7 +3671,7 @@ mod parse_tests {
 
     #[test]
     fn croc_waiting_ignores_per_file_progress_lines() {
-        let mut app = FileBeamApp::default();
+        let mut app = DataBeamApp::default();
         app.selected_tool = SelectedTool::Croc;
         app.view = AppView::Send;
         app.transfer_state = TransferState::Running;
@@ -3579,7 +3689,7 @@ mod parse_tests {
 
     #[test]
     fn croc_switches_to_transferring_on_peer_line_then_uses_file_counter_progress() {
-        let mut app = FileBeamApp::default();
+        let mut app = DataBeamApp::default();
         app.selected_tool = SelectedTool::Croc;
         app.view = AppView::Send;
         app.transfer_state = TransferState::Running;
@@ -3607,7 +3717,7 @@ mod parse_tests {
 
     #[test]
     fn sendme_waiting_ignores_zero_payload_lines_on_sender() {
-        let mut app = FileBeamApp::default();
+        let mut app = DataBeamApp::default();
         app.selected_tool = SelectedTool::Sendme;
         app.view = AppView::Send;
         app.transfer_state = TransferState::Running;
@@ -3623,7 +3733,7 @@ mod parse_tests {
 
     #[test]
     fn sendme_waiting_switches_to_transferring_when_payload_bytes_appear() {
-        let mut app = FileBeamApp::default();
+        let mut app = DataBeamApp::default();
         app.selected_tool = SelectedTool::Sendme;
         app.view = AppView::Send;
         app.transfer_state = TransferState::Running;
@@ -3641,7 +3751,7 @@ mod parse_tests {
 
     #[test]
     fn sendme_waiting_switches_to_transferring_on_downloading_stage_zero_bytes() {
-        let mut app = FileBeamApp::default();
+        let mut app = DataBeamApp::default();
         app.selected_tool = SelectedTool::Sendme;
         app.view = AppView::Send;
         app.transfer_state = TransferState::Running;
@@ -3658,7 +3768,7 @@ mod parse_tests {
 
     #[test]
     fn sendme_receive_ignores_non_downloading_payload_lines() {
-        let mut app = FileBeamApp::default();
+        let mut app = DataBeamApp::default();
         app.selected_tool = SelectedTool::Sendme;
         app.view = AppView::Receive;
         app.transfer_state = TransferState::Running;
@@ -3675,7 +3785,7 @@ mod parse_tests {
 
     #[test]
     fn sendme_receive_progress_is_monotonic() {
-        let mut app = FileBeamApp::default();
+        let mut app = DataBeamApp::default();
         app.selected_tool = SelectedTool::Sendme;
         app.view = AppView::Receive;
         app.transfer_state = TransferState::Running;
@@ -3715,7 +3825,7 @@ mod parse_tests {
 
     #[test]
     fn sendme_waiting_switches_to_transferring_on_n_line_output() {
-        let mut app = FileBeamApp::default();
+        let mut app = DataBeamApp::default();
         app.selected_tool = SelectedTool::Sendme;
         app.view = AppView::Send;
         app.transfer_state = TransferState::Running;
@@ -3723,6 +3833,9 @@ mod parse_tests {
         app.transfer_code = Some("blobxyz".to_string());
         let (tx, rx) = mpsc::channel();
         app.transfer_rx = Some(rx);
+        // This test simulates output from a command, but doesn't actually run one.
+        // The `cmd.current_dir` change is for actual command execution, not this test setup.
+        // Therefore, no change is needed here.
         tx.send(TransferMsg::Output(
             "n 99549f9de3 r 31724666896/0 i 0 # f706408fbb".to_string(),
         ))

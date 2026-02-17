@@ -23,11 +23,11 @@ copy_if_exists() {
 }
 
 # macOS arm64
-copy_if_exists "${DIST_DIR}/filebeam-macos-arm64" "${DIST_DIR}/databeam_v${VERSION}_macos-arm64"
+copy_if_exists "${DIST_DIR}/databeam-macos-arm64" "${DIST_DIR}/databeam_v${VERSION}_macos-arm64"
 
 # Windows x64
-copy_if_exists "${DIST_DIR}/filebeam-windows-x64.exe" "${DIST_DIR}/databeam_v${VERSION}_windows-x64.exe"
-copy_if_exists "${DIST_DIR}/filebeam-windows-x64.pdb" "${DIST_DIR}/databeam_v${VERSION}_windows-x64.pdb"
+copy_if_exists "${DIST_DIR}/databeam-windows-x64.exe" "${DIST_DIR}/databeam_v${VERSION}_windows-x64.exe"
+copy_if_exists "${DIST_DIR}/databeam-windows-x64.pdb" "${DIST_DIR}/databeam_v${VERSION}_windows-x64.pdb"
 
 if [[ -f "${DIST_DIR}/databeam_v${VERSION}_windows-x64.exe" ]]; then
   (
