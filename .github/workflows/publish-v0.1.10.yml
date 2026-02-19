@@ -1,0 +1,47 @@
+name: Publish v0.1.10 From Existing Artifacts
+
+on:
+  push:
+    branches:
+      - side_branch
+    paths:
+      - ".github/workflows/publish-v0.1.10.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish-existing:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download existing artifacts from run 22202721850
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: 22202721850
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Verify artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la dist
+          test -n "$(find dist -maxdepth 1 -type f | head -n 1)"
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.1.10
+          name: DataBeam v0.1.10
+          generate_release_notes: true
+          files: dist/*
