@@ -100,14 +100,15 @@ jobs:
             exit 1
           fi
           ditto -c -k --sequesterRsrc --keepParent "$app_path" "dist/databeam_v${version}_macos-arm64.app.zip"
-          cargo bundle --release --format dmg
-          dmg_path="$(find target/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
-          if [ -z "${dmg_path}" ]; then
-            echo "No .dmg produced under target/release/bundle/dmg"
-            find target/release -maxdepth 4 -type f | sort
-            exit 1
-          fi
-          cp "$dmg_path" "dist/databeam_v${version}_macos-arm64.dmg"
+          dmg_stage_dir="$(mktemp -d)"
+          cp -R "$app_path" "$dmg_stage_dir/"
+          hdiutil create \
+            -volname "DataBeam" \
+            -srcfolder "$dmg_stage_dir" \
+            -ov \
+            -format UDZO \
+            "dist/databeam_v${version}_macos-arm64.dmg"
+          rm -rf "$dmg_stage_dir"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4

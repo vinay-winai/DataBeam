@@ -31,10 +31,16 @@ fn bundled_bin_dir() -> PathBuf {
 }
 
 fn new_hidden_command(program: impl AsRef<OsStr>) -> Command {
-    let mut cmd = Command::new(program);
     #[cfg(target_os = "windows")]
-    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    cmd
+    {
+        let mut cmd = Command::new(program);
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        cmd
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Command::new(program)
+    }
 }
 
 /// Extract a gzip-compressed binary to the cache directory.
