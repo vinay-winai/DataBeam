@@ -1289,14 +1289,17 @@ impl DataBeamApp {
                                                 "Ticket received via Croc. Starting Sendme..."
                                                     .to_string(),
                                             );
-                                            self.eazysendme_ticket = Some(ticket.clone());
+                                            let normalized_ticket =
+                                                normalize_sendme_ticket(&ticket).unwrap_or(ticket);
+                                            self.eazysendme_ticket =
+                                                Some(normalized_ticket.clone());
 
                                             // Start sendme_receive
                                             if let Some(binary) =
                                                 self.get_tool_binary(&Tool::Sendme)
                                             {
                                                 let opts = SendmeReceiveOptions {
-                                                    ticket: ticket.trim().to_string(),
+                                                    ticket: normalized_ticket,
                                                     output_dir: self.receive_output_dir.clone(),
                                                 };
                                                 let (new_rx, new_handle) =
@@ -3776,6 +3779,28 @@ fn extract_croc_received_text_from_logs(log: &[String]) -> Option<String> {
     None
 }
 
+fn normalize_sendme_ticket(text: &str) -> Option<String> {
+    let trimmed = text.trim().trim_matches('"').trim_matches('\'');
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Accept either a raw "blob..." ticket or a full command line like
+    // "sendme receive blob...".
+    for token in trimmed.split_whitespace() {
+        let t = token
+            .trim_matches(|c: char| c == '"' || c == '\'' || c == ',' || c == ';')
+            .trim();
+        if t.starts_with("blob")
+            && t.len() > 20
+            && t.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        {
+            return Some(t.to_string());
+        }
+    }
+    None
+}
+
 fn is_probable_croc_text_payload_line(line: &str) -> bool {
     let candidate = line.trim().trim_matches('"');
     if candidate.is_empty() || candidate.len() > 2000 {
@@ -3873,10 +3898,10 @@ fn main() -> eframe::Result {
 mod parse_tests {
     use super::{
         extract_croc_received_text, extract_croc_received_text_from_logs,
-        parse_croc_file_counter_progress, parse_croc_total_size_hint, parse_payload_progress,
-        parse_sendme_imported_size_hint, parse_sendme_item_index, parse_sendme_total_files_hint,
-        parse_stage_progress, AppView, DataBeamApp, SelectedTool, TransferMsg, TransferPhase,
-        TransferState,
+        normalize_sendme_ticket, parse_croc_file_counter_progress, parse_croc_total_size_hint,
+        parse_payload_progress, parse_sendme_imported_size_hint, parse_sendme_item_index,
+        parse_sendme_total_files_hint, parse_stage_progress, AppView, DataBeamApp, SelectedTool,
+        TransferMsg, TransferPhase, TransferState,
     };
     use std::sync::mpsc;
 
@@ -4119,6 +4144,21 @@ mod parse_tests {
         ];
         let text = extract_croc_received_text_from_logs(&log).expect("fallback text");
         assert_eq!(text, "hello popup");
+    }
+
+    #[test]
+    fn normalize_sendme_ticket_parses_raw_and_command() {
+        let raw = "blobabc123def456ghi789jkl";
+        assert_eq!(
+            normalize_sendme_ticket(raw).as_deref(),
+            Some("blobabc123def456ghi789jkl")
+        );
+
+        let command = "sendme receive blobabc123def456ghi789jkl";
+        assert_eq!(
+            normalize_sendme_ticket(command).as_deref(),
+            Some("blobabc123def456ghi789jkl")
+        );
     }
 
     #[test]

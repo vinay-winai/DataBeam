@@ -399,10 +399,12 @@ pub fn init_bundled_binaries() -> (Option<PathBuf>, Option<PathBuf>) {
     let mut croc_path = extract_bundled_binary(&managed_binary_name(&Tool::Croc), CROC_GZ);
     let mut sendme_path = extract_bundled_binary(&managed_binary_name(&Tool::Sendme), SENDME_GZ);
 
-    if croc_path.is_none() && which::which(Tool::Croc.name()).is_err() {
+    // Prefer managed binaries on every platform to keep versions consistent across peers.
+    // If managed download is unavailable, detection later falls back to system PATH.
+    if croc_path.is_none() {
         croc_path = install_managed_binary(&Tool::Croc);
     }
-    if sendme_path.is_none() && which::which(Tool::Sendme.name()).is_err() {
+    if sendme_path.is_none() {
         sendme_path = install_managed_binary(&Tool::Sendme);
     }
 
