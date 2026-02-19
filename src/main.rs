@@ -153,6 +153,11 @@ struct DataBeamApp {
     sendme_total_items: Option<u64>,
     sendme_done_bytes_est: u64,
     sendme_item_progress: HashMap<u64, u64>,
+    sendme_item_totals: HashMap<u64, u64>,
+    sendme_stream_done_base: u64,
+    sendme_stream_last_done: Option<u64>,
+    sendme_stream_last_total: Option<u64>,
+    sendme_sender_payload_complete: bool,
     last_done_speed_sample: Option<(f64, u64)>,
     initialized_once: bool,
 }
@@ -209,6 +214,11 @@ impl Default for DataBeamApp {
             sendme_total_items: None,
             sendme_done_bytes_est: 0,
             sendme_item_progress: HashMap::new(),
+            sendme_item_totals: HashMap::new(),
+            sendme_stream_done_base: 0,
+            sendme_stream_last_done: None,
+            sendme_stream_last_total: None,
+            sendme_sender_payload_complete: false,
             last_done_speed_sample: None,
             initialized_once: false,
             eazysendme_custom_code: String::new(),
@@ -496,6 +506,11 @@ impl DataBeamApp {
         self.sendme_total_items = None;
         self.sendme_done_bytes_est = 0;
         self.sendme_item_progress.clear();
+        self.sendme_item_totals.clear();
+        self.sendme_stream_done_base = 0;
+        self.sendme_stream_last_done = None;
+        self.sendme_stream_last_total = None;
+        self.sendme_sender_payload_complete = false;
         self.last_done_speed_sample = None;
     }
 
@@ -509,6 +524,14 @@ impl DataBeamApp {
         self.sendme_had_transfer = false;
         self.sendme_waiting_after_cycle = true;
         self.sendme_last_activity = None;
+        self.sendme_total_items = None;
+        self.sendme_done_bytes_est = 0;
+        self.sendme_item_progress.clear();
+        self.sendme_item_totals.clear();
+        self.sendme_stream_done_base = 0;
+        self.sendme_stream_last_done = None;
+        self.sendme_stream_last_total = None;
+        self.sendme_sender_payload_complete = false;
     }
 
     fn mark_sendme_one_shot_completed(&mut self) {
@@ -525,6 +548,7 @@ impl DataBeamApp {
         self.sendme_had_transfer = false;
         self.sendme_waiting_after_cycle = false;
         self.sendme_last_activity = None;
+        self.sendme_sender_payload_complete = false;
         if let Some(handle) = &self.transfer_handle {
             handle.request_cancel();
         }
@@ -664,29 +688,79 @@ impl DataBeamApp {
             }
             if self.view == AppView::Send {
                 let item_index = parse_sendme_item_index(line);
-                if let (Some(idx), Some((item_done, item_total))) =
-                    (item_index, parse_payload_progress(line))
-                {
+                let sender_payload = parse_payload_progress(line);
+                if let (Some((item_done, item_total)), Some(idx)) = (sender_payload, item_index) {
                     if item_total > 0 {
                         let key = idx.saturating_sub(1);
                         let done = item_done.min(item_total);
-                        let prev = self.sendme_item_progress.get(&key).copied().unwrap_or(0);
-                        if done > prev {
+                        let prev_done = self.sendme_item_progress.get(&key).copied().unwrap_or(0);
+                        let prev_total = self
+                            .sendme_item_totals
+                            .get(&key)
+                            .copied()
+                            .unwrap_or(item_total);
+                        if done >= prev_done {
                             self.sendme_done_bytes_est = self
                                 .sendme_done_bytes_est
-                                .saturating_add(done.saturating_sub(prev));
-                            self.sendme_item_progress.insert(key, done);
+                                .saturating_add(done.saturating_sub(prev_done));
+                        } else if item_total != prev_total {
+                            // Progress reset for a reused item slot: count prior file as complete,
+                            // then start accumulating the next file from its new done value.
+                            self.sendme_done_bytes_est = self
+                                .sendme_done_bytes_est
+                                .saturating_sub(prev_done)
+                                .saturating_add(prev_total.max(prev_done))
+                                .saturating_add(done);
                         }
+                        self.sendme_item_progress.insert(key, done);
+                        self.sendme_item_totals.insert(key, item_total);
+                    }
+                } else if let Some((item_done, item_total)) = sender_payload {
+                    // Fallback for noisy/truncated sender lines that miss `i <idx>` tokens:
+                    // treat a done drop as rollover into the next file in a sequential stream.
+                    let done = item_done.min(item_total);
+                    if item_total > 0 && line.contains(" r ") && line.contains(" # ") {
+                        if let (Some(prev_done), Some(prev_total)) =
+                            (self.sendme_stream_last_done, self.sendme_stream_last_total)
+                        {
+                            if done < prev_done {
+                                self.sendme_stream_done_base =
+                                    self.sendme_stream_done_base.saturating_add(prev_total);
+                            }
+                        }
+                        self.sendme_stream_last_done = Some(done);
+                        self.sendme_stream_last_total = Some(item_total);
                     }
                 }
                 if let Some(total_bytes) = self.transfer_total_bytes {
                     if total_bytes > 0 {
-                        let est_done = self.sendme_done_bytes_est.min(total_bytes);
+                        let stream_done =
+                            if let (Some(cur_done), Some(cur_total)) =
+                                (self.sendme_stream_last_done, self.sendme_stream_last_total)
+                            {
+                                if cur_total > 0 {
+                                    self.sendme_stream_done_base
+                                        .saturating_add(cur_done.min(cur_total))
+                                } else {
+                                    self.sendme_stream_done_base
+                                }
+                            } else {
+                                self.sendme_stream_done_base
+                            };
+                        let est_done = self
+                            .sendme_done_bytes_est
+                            .max(stream_done)
+                            .min(total_bytes);
                         if est_done > self.transfer_done_bytes.unwrap_or(0) {
                             self.transfer_done_bytes = Some(est_done);
                             self.transfer_progress =
                                 (est_done as f32 / total_bytes as f32).clamp(0.0, 1.0);
                             self.update_derived_speed_from_done_bytes();
+                        }
+                        if let Some((item_done, item_total)) = sender_payload {
+                            self.sendme_sender_payload_complete = est_done >= total_bytes
+                                && item_total > 0
+                                && item_done.min(item_total) >= item_total;
                         }
                     }
                 }
@@ -910,6 +984,19 @@ impl DataBeamApp {
                                     parse_sendme_r_counter(&line).is_some();
                                 if self.transfer_state == TransferState::Running {
                                     self.update_transfer_metrics_from_log(&line);
+                                }
+                                if (self.selected_tool == SelectedTool::Sendme
+                                    || self.selected_tool == SelectedTool::EazySendme)
+                                    && self.view == AppView::Send
+                                    && self.transfer_state == TransferState::Running
+                                    && self.sendme_had_transfer
+                                    && self.sendme_sender_payload_complete
+                                {
+                                    if self.sendme_one_shot {
+                                        self.mark_sendme_one_shot_completed();
+                                    } else {
+                                        self.mark_sendme_sender_waiting();
+                                    }
                                 }
                                 let mut skip_log_line = false;
                                 if (self.selected_tool == SelectedTool::Croc
@@ -4167,6 +4254,61 @@ mod parse_tests {
 
         assert_eq!(app.transfer_phase, TransferPhase::Transferring);
         assert!(app.sendme_had_transfer);
+    }
+
+    #[test]
+    fn sendme_sender_rollover_adds_previous_file_total() {
+        let mut app = DataBeamApp::default();
+        app.selected_tool = SelectedTool::Sendme;
+        app.view = AppView::Send;
+        app.transfer_state = TransferState::Running;
+        app.transfer_phase = TransferPhase::Transferring;
+        app.transfer_total_bytes = Some((500_f64 * 1024.0 * 1024.0) as u64);
+
+        app.update_transfer_metrics_from_log(
+            "n deadbeef r 1/1 i 0 # abc [] 150.00 MiB/200.00 MiB",
+        );
+        let first = app.transfer_done_bytes.unwrap_or(0);
+        assert!(first > 149 * 1024 * 1024);
+
+        app.update_transfer_metrics_from_log(
+            "n deadbeef r 1/1 i 0 # abc [] 10.00 MiB/100.00 MiB",
+        );
+        let second = app.transfer_done_bytes.unwrap_or(0);
+        assert!(
+            second >= (210_f64 * 1024.0 * 1024.0) as u64,
+            "expected rollover accounting to include prior file total, got {second}"
+        );
+    }
+
+    #[test]
+    fn sendme_sender_payload_complete_marks_one_shot_complete() {
+        let mut app = DataBeamApp::default();
+        app.selected_tool = SelectedTool::Sendme;
+        app.view = AppView::Send;
+        app.transfer_state = TransferState::Running;
+        app.transfer_phase = TransferPhase::Transferring;
+        app.sendme_one_shot = true;
+        app.transfer_total_bytes = Some((300_f64 * 1024.0 * 1024.0) as u64);
+        let (tx, rx) = mpsc::channel();
+        app.transfer_rx = Some(rx);
+        tx.send(TransferMsg::Output(
+            "n deadbeef r 1/1 i 0 # abc [] 200.00 MiB/200.00 MiB".to_string(),
+        ))
+        .expect("send output");
+        tx.send(TransferMsg::Output(
+            "n deadbeef r 1/1 i 1 # abc [] 100.00 MiB/100.00 MiB".to_string(),
+        ))
+        .expect("send output");
+        drop(tx);
+
+        app.poll_transfer();
+
+        assert_eq!(app.transfer_state, TransferState::Completed);
+        assert_eq!(
+            app.transfer_done_bytes,
+            Some((300_f64 * 1024.0 * 1024.0) as u64)
+        );
     }
 
     #[test]
