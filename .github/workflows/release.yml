@@ -67,29 +67,46 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
+          set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           mkdir -p dist
           cp target/release/databeam "dist/databeam_v${version}_linux-x64"
           tar -C dist -czf "dist/databeam_v${version}_linux-x64.tar.gz" "databeam_v${version}_linux-x64"
           cargo install cargo-bundle --locked
-          cargo bundle --release --locked --format deb
-          deb_path="$(ls target/release/bundle/deb/*.deb | head -n 1)"
+          cargo bundle --release --format deb
+          deb_path="$(find target/release/bundle/deb -maxdepth 1 -name '*.deb' -print -quit)"
+          if [ -z "${deb_path}" ]; then
+            echo "No .deb produced under target/release/bundle/deb"
+            find target/release -maxdepth 4 -type f | sort
+            exit 1
+          fi
           cp "$deb_path" "dist/databeam_v${version}_linux-x64.deb"
 
       - name: Package macOS assets
         if: runner.os == 'macOS'
         shell: bash
         run: |
+          set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           mkdir -p dist
           cp target/release/databeam "dist/databeam_v${version}_macos-arm64"
           tar -C dist -czf "dist/databeam_v${version}_macos-arm64.tar.gz" "databeam_v${version}_macos-arm64"
           cargo install cargo-bundle --locked
-          cargo bundle --release --locked --format osx
-          app_path="$(find target/release/bundle/osx -maxdepth 1 -name '*.app' | head -n 1)"
+          cargo bundle --release --format osx
+          app_path="$(find target/release/bundle/osx -maxdepth 1 -name '*.app' -print -quit)"
+          if [ -z "${app_path}" ]; then
+            echo "No .app produced under target/release/bundle/osx"
+            find target/release -maxdepth 4 -type d | sort
+            exit 1
+          fi
           ditto -c -k --sequesterRsrc --keepParent "$app_path" "dist/databeam_v${version}_macos-arm64.app.zip"
-          cargo bundle --release --locked --format dmg
-          dmg_path="$(find target/release/bundle/dmg -maxdepth 1 -name '*.dmg' | head -n 1)"
+          cargo bundle --release --format dmg
+          dmg_path="$(find target/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
+          if [ -z "${dmg_path}" ]; then
+            echo "No .dmg produced under target/release/bundle/dmg"
+            find target/release -maxdepth 4 -type f | sort
+            exit 1
+          fi
           cp "$dmg_path" "dist/databeam_v${version}_macos-arm64.dmg"
 
       - name: Upload build artifacts
