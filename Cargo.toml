@@ -1,6 +1,6 @@
 [package]
 name = "databeam"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 description = "A beautiful GUI wrapper for croc and sendme file transfer tools"
 authors = ["DataBeam"]
@@ -22,6 +22,7 @@ libc = "0.2.182"
 tar = "0.4"
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
 qrcode = "0.14"
+portable-pty = "0.8"
 
 [profile.release]
 opt-level = "z"
@@ -32,3 +33,10 @@ panic = "abort"
 
 [profile.dev]
 opt-level = 1
+
+[package.metadata.bundle]
+name = "DataBeam"
+identifier = "com.vinaywinai.databeam"
+short_description = "Secure GUI wrapper for croc and sendme"
+category = "Productivity"
+copyright = "Copyright (c) DataBeam"

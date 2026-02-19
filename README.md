@@ -91,11 +91,22 @@ src/
 Prebuilt binaries are published in the GitHub Releases page on every version tag (`v*`):
 
 - `databeam_vX.Y.Z_windows-x64.zip`
+- `databeam_vX.Y.Z_linux-x64.deb` (one-click install on Ubuntu/Debian desktops)
 - `databeam_vX.Y.Z_linux-x64.tar.gz`
+- `databeam_vX.Y.Z_macos-arm64.dmg` (one-click install on macOS)
+- `databeam_vX.Y.Z_macos-arm64.app.zip`
 - `databeam_vX.Y.Z_macos-arm64.tar.gz`
 - `SHA256SUMS.txt`
 
 Release assets are produced by `.github/workflows/release.yml`.
+
+## Managed Tool Binaries
+
+DataBeam now uses one uniform strategy on all platforms:
+- If `croc` / `sendme` are already on PATH, it uses them.
+- If missing, it downloads the correct official release binary at runtime and caches it.
+
+No platform-specific embedded `binaries/` payloads are required in the repo.
 
 ### Create a release
 

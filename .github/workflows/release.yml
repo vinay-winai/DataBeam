@@ -71,6 +71,10 @@ jobs:
           mkdir -p dist
           cp target/release/databeam "dist/databeam_v${version}_linux-x64"
           tar -C dist -czf "dist/databeam_v${version}_linux-x64.tar.gz" "databeam_v${version}_linux-x64"
+          cargo install cargo-bundle --locked
+          cargo bundle --release --locked --format deb
+          deb_path="$(ls target/release/bundle/deb/*.deb | head -n 1)"
+          cp "$deb_path" "dist/databeam_v${version}_linux-x64.deb"
 
       - name: Package macOS assets
         if: runner.os == 'macOS'
@@ -80,6 +84,13 @@ jobs:
           mkdir -p dist
           cp target/release/databeam "dist/databeam_v${version}_macos-arm64"
           tar -C dist -czf "dist/databeam_v${version}_macos-arm64.tar.gz" "databeam_v${version}_macos-arm64"
+          cargo install cargo-bundle --locked
+          cargo bundle --release --locked --format osx
+          app_path="$(find target/release/bundle/osx -maxdepth 1 -name '*.app' | head -n 1)"
+          ditto -c -k --sequesterRsrc --keepParent "$app_path" "dist/databeam_v${version}_macos-arm64.app.zip"
+          cargo bundle --release --locked --format dmg
+          dmg_path="$(find target/release/bundle/dmg -maxdepth 1 -name '*.dmg' | head -n 1)"
+          cp "$dmg_path" "dist/databeam_v${version}_macos-arm64.dmg"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4

@@ -11,24 +11,17 @@ use std::sync::{
 use std::thread;
 
 use flate2::read::GzDecoder;
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::Deserialize;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
 // ── Embedded Binaries ──────────────────────────────────────────────
-// These are gzip-compressed CLI binaries baked into the executable at
-// compile time. On first launch they are decompressed to a cache dir.
+// Embedded payloads are intentionally disabled.
+// DataBeam uses managed downloads or system-installed binaries.
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const CROC_GZ: &[u8] = include_bytes!("../binaries/macos-arm64/croc.gz");
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const SENDME_GZ: &[u8] = include_bytes!("../binaries/macos-arm64/sendme.gz");
-
-// Fallback stubs for other platforms (no bundled binaries)
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 const CROC_GZ: &[u8] = &[];
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 const SENDME_GZ: &[u8] = &[];
 
 /// Get the cache directory for extracted binaries
@@ -417,7 +410,8 @@ fn detect_tool_with_bundled(tool: &Tool, bundled_path: Option<&PathBuf>) -> Tool
         if bp.exists() {
             let mut cmd = new_hidden_command(bp);
 
-            let version = cmd.arg("--version")
+            let version = cmd
+                .arg("--version")
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .output()
@@ -507,6 +501,8 @@ pub enum TransferMsg {
     Error(String),
     Started,
     PeerDisconnected,
+    WaitingForReceiver,
+    SenderTransferActivity,
 }
 
 // ── Transfer Options ───────────────────────────────────────────────
@@ -572,6 +568,63 @@ fn read_lines_cr_aware(
         let line = String::from_utf8_lossy(&buf).to_string();
         parser(&line, &tx);
     }
+}
+
+fn run_sendme_with_pty(
+    binary: &str,
+    args: &[String],
+    runtime_dir: &Path,
+    current_dir: Option<&Path>,
+    tx: &mpsc::Sender<TransferMsg>,
+    cancel: Arc<AtomicBool>,
+    pid_handle: Arc<std::sync::Mutex<Option<u32>>>,
+    parser: fn(&str, &mpsc::Sender<TransferMsg>),
+) -> Result<(bool, String), String> {
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| format!("Failed to create PTY: {e}"))?;
+
+    let mut cmd = CommandBuilder::new(binary);
+    cmd.env("RUST_LOG", "info");
+    cmd.env("IROH_DATA_DIR", runtime_dir.to_string_lossy().to_string());
+    for arg in args {
+        cmd.arg(arg);
+    }
+    if let Some(dir) = current_dir {
+        cmd.cwd(dir.to_string_lossy().to_string());
+    }
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| format!("Failed to start sendme in PTY: {e}"))?;
+
+    if let Ok(mut guard) = pid_handle.lock() {
+        *guard = child.process_id();
+    }
+
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| format!("Failed to attach PTY reader: {e}"))?;
+    let tx_reader = tx.clone();
+    let cancel_reader = cancel.clone();
+    let reader_thread = thread::spawn(move || {
+        read_lines_cr_aware(reader, tx_reader, parser, cancel_reader);
+    });
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("Process wait failed: {e}"))?;
+    let _ = reader_thread.join();
+
+    Ok((status.success(), format!("{status:?}")))
 }
 
 // ── Croc Send ──────────────────────────────────────────────────────
@@ -799,106 +852,103 @@ pub fn sendme_send(
             )));
             return;
         }
-        // Prefer pseudo-terminal wrapper on Unix when available.
-        #[cfg(not(target_os = "windows"))]
-        let script_path = {
-            let fixed = PathBuf::from("/usr/bin/script");
-            if fixed.exists() {
-                Some(fixed)
-            } else {
-                which::which("script").ok()
-            }
-        };
-        #[cfg(target_os = "windows")]
-        let script_path: Option<PathBuf> = None;
-
-        let mut cmd = if let Some(script) = script_path {
-            let mut c = new_hidden_command(script);
-            c.arg("-q");
-            c.arg("/dev/null");
-            c.arg("env");
-            c.arg("RUST_LOG=info");
-            c.arg(format!("IROH_DATA_DIR={}", temp_dir.display()));
-            c.arg(&binary);
-            c.arg("send");
-            c.arg("-v");
-            c.arg(&send_path);
-            c
-        } else {
-            let mut c = new_hidden_command(&binary);
-            c.env("RUST_LOG", "info");
-            c.env("IROH_DATA_DIR", &temp_dir);
-            c.arg("send");
-            c.arg("-v");
-            c.arg(&send_path);
-            c
-        };
-
-        cmd.current_dir(&temp_dir);
-
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
         let _ = tx.send(TransferMsg::Started);
 
-        match cmd.spawn() {
-            Ok(mut child) => {
-                if let Ok(mut guard) = pid_handle.lock() {
-                    *guard = Some(child.id());
-                }
+        let send_args = vec![
+            "send".to_string(),
+            "-v".to_string(),
+            send_path.to_string_lossy().to_string(),
+        ];
+        let pty_result = run_sendme_with_pty(
+            &binary,
+            &send_args,
+            &temp_dir,
+            Some(&temp_dir),
+            &tx,
+            cancel2.clone(),
+            pid_handle.clone(),
+            parse_sendme_send_output,
+        );
 
-                let stderr = child.stderr.take();
-                let stdout = child.stdout.take();
+        let status = match pty_result {
+            Ok(status) => Some(status),
+            Err(_) => {
+                let mut cmd = new_hidden_command(&binary);
+                cmd.env("RUST_LOG", "info");
+                cmd.env("IROH_DATA_DIR", &temp_dir);
+                cmd.arg("send");
+                cmd.arg("-v");
+                cmd.arg(&send_path);
+                cmd.current_dir(&temp_dir);
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
 
-                let tx2 = tx.clone();
-                let c2 = cancel2.clone();
-                if let Some(stderr) = stderr {
-                    thread::spawn(move || {
-                        read_lines_cr_aware(stderr, tx2, parse_sendme_send_output, c2);
-                    });
-                }
+                match cmd.spawn() {
+                    Ok(mut child) => {
+                        if let Ok(mut guard) = pid_handle.lock() {
+                            *guard = Some(child.id());
+                        }
 
-                let tx3 = tx.clone();
-                let c3 = cancel2.clone();
-                if let Some(stdout) = stdout {
-                    thread::spawn(move || {
-                        read_lines_cr_aware(stdout, tx3, parse_sendme_send_output, c3);
-                    });
-                }
+                        let stderr = child.stderr.take();
+                        let stdout = child.stdout.take();
 
-                let status = child.wait();
-                if cancel2.load(Ordering::Relaxed) {
-                    let _ = tx.send(TransferMsg::Error("Transfer cancelled".to_string()));
-                    cleanup_sendme_send_dirs(
-                        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                    );
-                    cleanup_runtime_dir(&temp_dir);
-                    return;
-                }
-                match status {
-                    Ok(_) => {
-                        let _ = tx.send(TransferMsg::Error(
-                            "Send session ended before transfer completed".to_string(),
-                        ));
+                        let tx2 = tx.clone();
+                        let c2 = cancel2.clone();
+                        if let Some(stderr) = stderr {
+                            thread::spawn(move || {
+                                read_lines_cr_aware(stderr, tx2, parse_sendme_send_output, c2);
+                            });
+                        }
+
+                        let tx3 = tx.clone();
+                        let c3 = cancel2.clone();
+                        if let Some(stdout) = stdout {
+                            thread::spawn(move || {
+                                read_lines_cr_aware(stdout, tx3, parse_sendme_send_output, c3);
+                            });
+                        }
+
+                        match child.wait() {
+                            Ok(exit) => Some((exit.success(), format!("{exit}"))),
+                            Err(e) => {
+                                let _ =
+                                    tx.send(TransferMsg::Error(format!("Process error: {}", e)));
+                                None
+                            }
+                        }
                     }
                     Err(e) => {
-                        let _ = tx.send(TransferMsg::Error(format!("Process error: {}", e)));
+                        let _ =
+                            tx.send(TransferMsg::Error(format!("Failed to start sendme: {}", e)));
+                        None
                     }
                 }
-                cleanup_sendme_send_dirs(
-                    &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                );
-                cleanup_runtime_dir(&temp_dir);
             }
-            Err(e) => {
-                let _ = tx.send(TransferMsg::Error(format!("Failed to start sendme: {}", e)));
-                cleanup_sendme_send_dirs(
-                    &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                );
-                cleanup_runtime_dir(&temp_dir);
+        };
+
+        if cancel2.load(Ordering::Relaxed) {
+            let _ = tx.send(TransferMsg::Error("Transfer cancelled".to_string()));
+            cleanup_sendme_send_dirs(
+                &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            );
+            cleanup_runtime_dir(&temp_dir);
+            return;
+        }
+
+        if let Some((success, status_text)) = status {
+            if success {
+                let _ = tx.send(TransferMsg::PeerDisconnected);
+            } else {
+                let _ = tx.send(TransferMsg::Error(format!(
+                    "Send session ended with status: {}",
+                    status_text
+                )));
             }
         }
+
+        cleanup_sendme_send_dirs(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        cleanup_runtime_dir(&temp_dir);
         // _staging_dir is dropped here, cleaning up the temp directory
     });
 
@@ -1024,119 +1074,105 @@ pub fn sendme_receive(
             )));
             return;
         }
-        // Prefer pseudo-terminal wrapper on Unix when available.
-        #[cfg(not(target_os = "windows"))]
-        let script_path = {
-            let fixed = PathBuf::from("/usr/bin/script");
-            if fixed.exists() {
-                Some(fixed)
-            } else {
-                which::which("script").ok()
-            }
-        };
-        #[cfg(target_os = "windows")]
-        let script_path: Option<PathBuf> = None;
-
-        let mut cmd = if let Some(script) = script_path {
-            let mut c = new_hidden_command(script);
-            c.arg("-q");
-            c.arg("/dev/null");
-            c.arg("env");
-            c.arg("RUST_LOG=info");
-            c.arg(format!("IROH_DATA_DIR={}", temp_dir.display()));
-            c.arg(&binary);
-            c.arg("receive");
-            c.arg("-v");
-            c.arg(&opts.ticket);
-            c
-        } else {
-            let mut c = new_hidden_command(&binary);
-            c.env("RUST_LOG", "info");
-            c.env("IROH_DATA_DIR", &temp_dir);
-            c.arg("receive");
-            c.arg("-v");
-            c.arg(&opts.ticket);
-            c
-        };
-
-        if let Some(dir) = &opts.output_dir {
-            cmd.current_dir(dir);
-        }
-
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
         let _ = tx.send(TransferMsg::Started);
 
-        match cmd.spawn() {
-            Ok(mut child) => {
-                if let Ok(mut guard) = pid_handle.lock() {
-                    *guard = Some(child.id());
-                }
+        let recv_args = vec!["receive".to_string(), "-v".to_string(), opts.ticket.clone()];
+        let pty_result = run_sendme_with_pty(
+            &binary,
+            &recv_args,
+            &temp_dir,
+            opts.output_dir.as_deref(),
+            &tx,
+            cancel2.clone(),
+            pid_handle.clone(),
+            parse_sendme_receive_output,
+        );
 
-                let stderr = child.stderr.take();
-                let stdout = child.stdout.take();
-
-                let tx2 = tx.clone();
-                let c2 = cancel2.clone();
-                if let Some(stderr) = stderr {
-                    thread::spawn(move || {
-                        read_lines_cr_aware(stderr, tx2, parse_sendme_receive_output, c2);
-                    });
+        let status = match pty_result {
+            Ok(status) => Some(status),
+            Err(_) => {
+                let mut cmd = new_hidden_command(&binary);
+                cmd.env("RUST_LOG", "info");
+                cmd.env("IROH_DATA_DIR", &temp_dir);
+                cmd.arg("receive");
+                cmd.arg("-v");
+                cmd.arg(&opts.ticket);
+                if let Some(dir) = &opts.output_dir {
+                    cmd.current_dir(dir);
                 }
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
 
-                let tx3 = tx.clone();
-                let c3 = cancel2.clone();
-                if let Some(stdout) = stdout {
-                    thread::spawn(move || {
-                        read_lines_cr_aware(stdout, tx3, parse_sendme_receive_output, c3);
-                    });
-                }
+                match cmd.spawn() {
+                    Ok(mut child) => {
+                        if let Ok(mut guard) = pid_handle.lock() {
+                            *guard = Some(child.id());
+                        }
 
-                let status = child.wait();
-                if cancel2.load(Ordering::Relaxed) {
-                    let _ = tx.send(TransferMsg::Error("Transfer cancelled".to_string()));
-                    cleanup_runtime_dir(&temp_dir);
-                    return;
-                }
-                match status {
-                    Ok(exit) => {
-                        if exit.success() {
-                            let _ = tx.send(TransferMsg::Progress(1.0));
-                            let _ = tx.send(TransferMsg::Completed);
-                        } else {
-                            let _ = tx.send(TransferMsg::Error(format!(
-                                "Receive session ended with status: {}",
-                                exit
-                            )));
+                        let stderr = child.stderr.take();
+                        let stdout = child.stdout.take();
+
+                        let tx2 = tx.clone();
+                        let c2 = cancel2.clone();
+                        if let Some(stderr) = stderr {
+                            thread::spawn(move || {
+                                read_lines_cr_aware(stderr, tx2, parse_sendme_receive_output, c2);
+                            });
+                        }
+
+                        let tx3 = tx.clone();
+                        let c3 = cancel2.clone();
+                        if let Some(stdout) = stdout {
+                            thread::spawn(move || {
+                                read_lines_cr_aware(stdout, tx3, parse_sendme_receive_output, c3);
+                            });
+                        }
+
+                        match child.wait() {
+                            Ok(exit) => Some((exit.success(), format!("{exit}"))),
+                            Err(e) => {
+                                let _ =
+                                    tx.send(TransferMsg::Error(format!("Process error: {}", e)));
+                                None
+                            }
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(TransferMsg::Error(format!("Process error: {}", e)));
+                        let _ =
+                            tx.send(TransferMsg::Error(format!("Failed to start sendme: {}", e)));
+                        None
                     }
                 }
-                if let Some(out) = &opts.output_dir {
-                    cleanup_sendme_receive_artifacts(&PathBuf::from(out));
-                } else {
-                    cleanup_sendme_receive_artifacts(
-                        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                    );
-                }
-                cleanup_runtime_dir(&temp_dir);
             }
-            Err(e) => {
-                let _ = tx.send(TransferMsg::Error(format!("Failed to start sendme: {}", e)));
-                cleanup_runtime_dir(&temp_dir);
-                if let Some(out) = &opts.output_dir {
-                    cleanup_sendme_receive_artifacts(&PathBuf::from(out));
-                } else {
-                    cleanup_sendme_receive_artifacts(
-                        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                    );
-                }
+        };
+
+        if cancel2.load(Ordering::Relaxed) {
+            let _ = tx.send(TransferMsg::Error("Transfer cancelled".to_string()));
+            cleanup_runtime_dir(&temp_dir);
+            return;
+        }
+
+        if let Some((success, status_text)) = status {
+            if success {
+                let _ = tx.send(TransferMsg::Progress(1.0));
+                let _ = tx.send(TransferMsg::Completed);
+            } else {
+                let _ = tx.send(TransferMsg::Error(format!(
+                    "Receive session ended with status: {}",
+                    status_text
+                )));
             }
         }
+
+        if let Some(out) = &opts.output_dir {
+            cleanup_sendme_receive_artifacts(&PathBuf::from(out));
+        } else {
+            cleanup_sendme_receive_artifacts(
+                &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            );
+        }
+        cleanup_runtime_dir(&temp_dir);
     });
 
     (rx, ProcessHandle { cancel, child_pid })
@@ -1244,12 +1280,12 @@ fn parse_sendme_common(line: &str, tx: &mpsc::Sender<TransferMsg>) -> Option<(St
 }
 
 fn parse_sendme_send_output(line: &str, tx: &mpsc::Sender<TransferMsg>) {
-    let Some((_trimmed, lower)) = parse_sendme_common(line, tx) else {
+    let Some((trimmed, lower)) = parse_sendme_common(line, tx) else {
         return;
     };
 
-    // If it's stderr (heuristic: if line doesn't match standard patterns or is explicitly passed as stderr in future), 
-    // actually we are mixing stdout/stderr in the same pipe reader in the caller? 
+    // If it's stderr (heuristic: if line doesn't match standard patterns or is explicitly passed as stderr in future),
+    // actually we are mixing stdout/stderr in the same pipe reader in the caller?
     // No, we have separate threads for stdout and stderr, but they both call this parser.
     // For now, let's just log everything.
 
@@ -1263,8 +1299,20 @@ fn parse_sendme_send_output(line: &str, tx: &mpsc::Sender<TransferMsg>) {
         ));
     }
 
+    if sendme_waiting_banner(&lower) {
+        let _ = tx.send(TransferMsg::WaitingForReceiver);
+    }
+
+    if sendme_sender_activity_line(&trimmed, &lower) {
+        let _ = tx.send(TransferMsg::SenderTransferActivity);
+    }
+
     // Sender one-shot completion should be signaled by explicit send-finished lines.
-    if lower.contains("finished sending") || lower.contains("transfer complete") {
+    if lower.contains("finished sending")
+        || lower.contains("transfer complete")
+        || lower.contains("peer disconnected")
+        || lower.contains("client disconnected")
+    {
         let _ = tx.send(TransferMsg::Progress(1.0));
         let _ = tx.send(TransferMsg::PeerDisconnected);
     }
@@ -1281,6 +1329,11 @@ fn parse_sendme_receive_output(line: &str, tx: &mpsc::Sender<TransferMsg>) {
         return;
     };
 
+    if lower.starts_with("error:") {
+        let _ = tx.send(TransferMsg::Error(trimmed.to_string()));
+        return;
+    }
+
     if lower.contains("error") || lower.contains("failed") || lower.contains("aborted") {
         if lower.contains("handshake")
             || lower.contains("incompatible")
@@ -1296,10 +1349,36 @@ fn parse_sendme_receive_output(line: &str, tx: &mpsc::Sender<TransferMsg>) {
         }
     }
 
-    // Receiver completion should key off process exit, not log line, to ensure export finishes.
+    // Some sendme builds keep the process alive briefly after this final summary line.
+    // Emit completion immediately so UI can transition out of downloading state.
     if lower.contains("downloaded") && lower.contains("files") {
         let _ = tx.send(TransferMsg::Progress(1.0));
+        let _ = tx.send(TransferMsg::Completed);
     }
+}
+
+fn sendme_waiting_banner(lower: &str) -> bool {
+    lower.contains("waiting for incoming transfer")
+        || lower.contains("waiting for incoming")
+        || lower.contains("waiting for receiver")
+}
+
+fn sendme_sender_activity_line(trimmed: &str, lower: &str) -> bool {
+    if (lower.contains("[3/4]") || lower.contains("[4/4]"))
+        && (lower.contains("uploading") || lower.contains("downloading"))
+    {
+        return true;
+    }
+    if lower.contains("uploading ...") || lower.contains("downloading ...") {
+        return true;
+    }
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    for pair in tokens.windows(2) {
+        if pair[0] == "r" && pair[1].contains('/') {
+            return true;
+        }
+    }
+    false
 }
 
 /// Strip ANSI escape sequences from a string
@@ -1351,10 +1430,8 @@ impl ProcessHandle {
                 #[cfg(not(unix))]
                 {
                     let mut cmd = new_hidden_command("taskkill");
-                    
-                    let _ = cmd
-                        .args(["/PID", &pid.to_string(), "/F", "/T"])
-                        .output();
+
+                    let _ = cmd.args(["/PID", &pid.to_string(), "/F", "/T"]).output();
                 }
             }
         }
@@ -1458,7 +1535,7 @@ mod tests {
     }
 
     #[test]
-    fn sendme_send_parser_ignores_client_disconnected_noise() {
+    fn sendme_send_parser_marks_client_disconnected_as_disconnected() {
         let (tx, rx) = mpsc::channel();
         parse_sendme_send_output("client disconnected", &tx);
 
@@ -1475,8 +1552,57 @@ mod tests {
         }
 
         assert!(
-            !saw_disconnect,
-            "did not expect PeerDisconnected for generic client disconnected line"
+            saw_disconnect,
+            "expected PeerDisconnected for client disconnected line"
+        );
+    }
+
+    #[test]
+    fn sendme_send_parser_emits_waiting_for_receiver_signal() {
+        let (tx, rx) = mpsc::channel();
+        parse_sendme_send_output("waiting for incoming transfer", &tx);
+
+        let mut saw_waiting = false;
+        for _ in 0..6 {
+            match rx.try_recv() {
+                Ok(TransferMsg::WaitingForReceiver) => {
+                    saw_waiting = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+
+        assert!(
+            saw_waiting,
+            "expected parser to emit WaitingForReceiver for waiting banner"
+        );
+    }
+
+    #[test]
+    fn sendme_send_parser_emits_sender_transfer_activity() {
+        let (tx, rx) = mpsc::channel();
+        parse_sendme_send_output(
+            "[3/4] Uploading ... [00:03] [###>---] 300.00 MiB/600.00 MiB 10.00 MiB/s",
+            &tx,
+        );
+
+        let mut saw_activity = false;
+        for _ in 0..6 {
+            match rx.try_recv() {
+                Ok(TransferMsg::SenderTransferActivity) => {
+                    saw_activity = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+
+        assert!(
+            saw_activity,
+            "expected parser to emit SenderTransferActivity for upload progress line"
         );
     }
 
@@ -1492,5 +1618,51 @@ mod tests {
             Ok(TransferMsg::Output(_)) => {}
             other => panic!("expected output message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sendme_receive_parser_marks_downloaded_files_as_completed() {
+        let (tx, rx) = mpsc::channel();
+        parse_sendme_receive_output("downloaded 7 files, 595.45 MiB. took 5 seconds", &tx);
+
+        let mut saw_completed = false;
+        for _ in 0..6 {
+            match rx.try_recv() {
+                Ok(TransferMsg::Completed) => {
+                    saw_completed = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+
+        assert!(
+            saw_completed,
+            "expected receive parser to emit Completed for downloaded files line"
+        );
+    }
+
+    #[test]
+    fn sendme_receive_parser_emits_error_message_for_error_prefix_line() {
+        let (tx, rx) = mpsc::channel();
+        parse_sendme_receive_output("error: ticket not found", &tx);
+
+        let mut saw_error = false;
+        for _ in 0..6 {
+            match rx.try_recv() {
+                Ok(TransferMsg::Error(msg)) => {
+                    saw_error = msg.to_lowercase().starts_with("error:");
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+
+        assert!(
+            saw_error,
+            "expected receive parser to emit Error for error: line"
+        );
     }
 }

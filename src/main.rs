@@ -5,7 +5,7 @@ mod widgets;
 
 use eframe::egui;
 use egui::{Color32, RichText, Vec2};
-use qrcode::render::unicode;
+use qrcode::types::Color as QrModuleColor;
 use qrcode::QrCode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -144,8 +144,11 @@ struct DataBeamApp {
     toast_msg: Option<(String, f64, Color32)>,
     animation_time: f64,
     drag_hover: bool,
+    picker_block_until: f64,
     sendme_one_shot: bool,
     sendme_peer_connected: bool,
+    sendme_had_transfer: bool,
+    sendme_waiting_after_cycle: bool,
     sendme_last_activity: Option<f64>,
     sendme_total_items: Option<u64>,
     sendme_done_bytes_est: u64,
@@ -197,8 +200,11 @@ impl Default for DataBeamApp {
             toast_msg: None,
             animation_time: 0.0,
             drag_hover: false,
+            picker_block_until: 0.0,
             sendme_one_shot: true,
             sendme_peer_connected: false,
+            sendme_had_transfer: false,
+            sendme_waiting_after_cycle: false,
             sendme_last_activity: None,
             sendme_total_items: None,
             sendme_done_bytes_est: 0,
@@ -216,7 +222,10 @@ impl Default for DataBeamApp {
 impl DataBeamApp {
     fn effective_progress(&self) -> f32 {
         match self.transfer_phase {
-            TransferPhase::Preparing | TransferPhase::WaitingForReceiver | TransferPhase::EazySharingTicket | TransferPhase::EazyWaitingForPeer => 0.0,
+            TransferPhase::Preparing
+            | TransferPhase::WaitingForReceiver
+            | TransferPhase::EazySharingTicket
+            | TransferPhase::EazyWaitingForPeer => 0.0,
             TransferPhase::Transferring => {
                 if self.selected_tool == SelectedTool::Croc && self.croc_file_progress.is_some() {
                     return self.transfer_progress.clamp(0.0, 1.0);
@@ -480,11 +489,45 @@ impl DataBeamApp {
         self.eazysendme_croc_rx = None;
         self.croc_text_popup_open = false;
         self.sendme_peer_connected = false;
+        self.sendme_had_transfer = false;
+        self.sendme_waiting_after_cycle = false;
         self.sendme_last_activity = None;
+        self.picker_block_until = 0.0;
         self.sendme_total_items = None;
         self.sendme_done_bytes_est = 0;
         self.sendme_item_progress.clear();
         self.last_done_speed_sample = None;
+    }
+
+    fn mark_sendme_sender_waiting(&mut self) {
+        self.transfer_phase = TransferPhase::WaitingForReceiver;
+        self.transfer_payload_start_time = None;
+        self.transfer_progress = 0.0;
+        self.transfer_done_bytes = None;
+        self.transfer_speed_bps = None;
+        self.sendme_peer_connected = false;
+        self.sendme_had_transfer = false;
+        self.sendme_waiting_after_cycle = true;
+        self.sendme_last_activity = None;
+    }
+
+    fn mark_sendme_one_shot_completed(&mut self) {
+        self.transfer_state = TransferState::Completed;
+        self.transfer_progress = 1.0;
+        self.preparing_progress = 1.0;
+        self.transfer_end_time = Some(self.animation_time);
+        if let Some(total) = self.transfer_total_bytes {
+            if total > 0 {
+                self.transfer_done_bytes = Some(total);
+            }
+        }
+        self.sendme_peer_connected = false;
+        self.sendme_had_transfer = false;
+        self.sendme_waiting_after_cycle = false;
+        self.sendme_last_activity = None;
+        if let Some(handle) = &self.transfer_handle {
+            handle.request_cancel();
+        }
     }
 
     fn cancel_transfer(&mut self) {
@@ -513,15 +556,35 @@ impl DataBeamApp {
 
     fn update_transfer_metrics_from_log(&mut self, line: &str) {
         let lower = line.to_lowercase();
+        let eazy_receive_pre_ticket = self.selected_tool == SelectedTool::EazySendme
+            && self.view == AppView::Receive
+            && self.eazysendme_ticket.is_none();
+        if eazy_receive_pre_ticket {
+            return;
+        }
+        let eazy_sendme_active = self.selected_tool == SelectedTool::EazySendme
+            && match self.view {
+                AppView::Send => true,
+                AppView::Receive => self.eazysendme_ticket.is_some(),
+                _ => false,
+            };
+        let sendme_like = self.selected_tool == SelectedTool::Sendme || eazy_sendme_active;
+        let sendme_r_counter = if sendme_like {
+            parse_sendme_r_counter(line)
+        } else {
+            None
+        };
         let export_line = lower.contains("exporting ");
         let croc_counter_any = if self.selected_tool == SelectedTool::Croc {
             parse_croc_file_counter_progress(line)
         } else {
             None
         };
-        if is_cli_progress_line(line) {
+        let sendme_raw_progress_line =
+            sendme_like && self.view == AppView::Receive && sendme_r_counter.is_some();
+        if is_cli_progress_line(line) || sendme_raw_progress_line {
             if !(self.selected_tool == SelectedTool::Croc && croc_counter_any.is_some()) {
-                self.latest_cli_progress_line = Some(line.trim().to_string());
+                self.latest_cli_progress_line = Some(compact_cli_progress_line(line));
             }
         }
         if self.selected_tool == SelectedTool::Croc
@@ -552,7 +615,7 @@ impl DataBeamApp {
                 }
             }
         }
-        if self.selected_tool == SelectedTool::Sendme {
+        if sendme_like {
             if let Some(total) = parse_sendme_imported_size_hint(line) {
                 let update = match self.transfer_total_bytes {
                     Some(existing) => total > existing,
@@ -569,6 +632,34 @@ impl DataBeamApp {
                 };
                 if update {
                     self.sendme_total_items = Some(total_items);
+                }
+            }
+            if self.view == AppView::Receive {
+                if let Some((counter_done, counter_total)) = sendme_r_counter {
+                    if counter_total > 0 {
+                        let update = match self.transfer_total_bytes {
+                            Some(existing) => counter_total > existing,
+                            None => true,
+                        };
+                        if update {
+                            self.transfer_total_bytes = Some(counter_total);
+                        }
+                        let prev_done = self.transfer_done_bytes.unwrap_or(0);
+                        let mut next_done = counter_done.max(prev_done);
+                        next_done = next_done.min(counter_total);
+                        if next_done > prev_done {
+                            self.transfer_done_bytes = Some(next_done);
+                            self.update_derived_speed_from_done_bytes();
+                        }
+                        self.transfer_progress =
+                            (next_done as f32 / counter_total as f32).clamp(0.0, 1.0);
+                        if self.transfer_phase != TransferPhase::Transferring {
+                            self.transfer_phase = TransferPhase::Transferring;
+                            if self.transfer_payload_start_time.is_none() {
+                                self.transfer_payload_start_time = Some(self.animation_time);
+                            }
+                        }
+                    }
                 }
             }
             if self.view == AppView::Send {
@@ -633,13 +724,18 @@ impl DataBeamApp {
         }
 
         if !export_line && croc_file_counter.is_none() {
-            if let Some((done, total)) = parse_payload_progress(line) {
+            let payload_progress = if sendme_like && self.view == AppView::Receive {
+                parse_sendme_r_payload_progress(line).or_else(|| parse_payload_progress(line))
+            } else {
+                parse_payload_progress(line)
+            };
+            if let Some((done, total)) = payload_progress {
                 if self.selected_tool == SelectedTool::Croc
                     && self.transfer_phase != TransferPhase::Transferring
                 {
                     return;
                 }
-                let allow_sendme_payload = if self.selected_tool == SelectedTool::Sendme {
+                let allow_sendme_payload = if sendme_like {
                     match self.view {
                         AppView::Send => {
                             lower.contains("download")
@@ -652,6 +748,7 @@ impl DataBeamApp {
                                 || lower.contains("uploading")
                                 || lower.contains("[3/4]")
                                 || lower.contains("[4/4]")
+                                || parse_sendme_r_payload_progress(line).is_some()
                         }
                         _ => true,
                     }
@@ -734,6 +831,9 @@ impl DataBeamApp {
                 self.push_speed_sample(speed);
             }
         }
+        if sendme_like && self.view == AppView::Send && self.transfer_done_bytes.unwrap_or(0) > 0 {
+            self.sendme_had_transfer = true;
+        }
     }
 
     fn update_croc_received_text_from_log(&mut self, line: &str) -> bool {
@@ -747,7 +847,8 @@ impl DataBeamApp {
             }
             return true;
         }
-        if (self.selected_tool == SelectedTool::Croc || self.selected_tool == SelectedTool::EazySendme)
+        if (self.selected_tool == SelectedTool::Croc
+            || self.selected_tool == SelectedTool::EazySendme)
             && self.view == AppView::Receive
         {
             let lower = line.to_lowercase();
@@ -788,7 +889,9 @@ impl DataBeamApp {
         if let Some(rx) = self.transfer_rx.take() {
             let mut processed = 0usize;
             let mut restart_sendme_serve = false;
-            let max_msgs_per_frame = if self.selected_tool == SelectedTool::Sendme || self.selected_tool == SelectedTool::EazySendme {
+            let max_msgs_per_frame = if self.selected_tool == SelectedTool::Sendme
+                || self.selected_tool == SelectedTool::EazySendme
+            {
                 4000
             } else {
                 800
@@ -803,11 +906,14 @@ impl DataBeamApp {
                         match msg {
                             TransferMsg::Output(line) => {
                                 let lower = line.to_lowercase();
+                                let sendme_counter_activity =
+                                    parse_sendme_r_counter(&line).is_some();
                                 if self.transfer_state == TransferState::Running {
                                     self.update_transfer_metrics_from_log(&line);
                                 }
                                 let mut skip_log_line = false;
-                                if (self.selected_tool == SelectedTool::Croc || self.selected_tool == SelectedTool::EazySendme)
+                                if (self.selected_tool == SelectedTool::Croc
+                                    || self.selected_tool == SelectedTool::EazySendme)
                                     && self.view == AppView::Receive
                                 {
                                     skip_log_line = self.update_croc_received_text_from_log(&line);
@@ -815,11 +921,30 @@ impl DataBeamApp {
                                 if self.view == AppView::Send
                                     && self.transfer_state == TransferState::Running
                                 {
-                                    if (self.selected_tool == SelectedTool::Sendme || self.selected_tool == SelectedTool::EazySendme)
+                                    if (self.selected_tool == SelectedTool::Sendme
+                                        || self.selected_tool == SelectedTool::EazySendme)
                                         && lower.contains("sendme receive ")
-                                        && self.transfer_phase == TransferPhase::Preparing
                                     {
-                                        self.transfer_phase = TransferPhase::WaitingForReceiver;
+                                        if self.sendme_had_transfer {
+                                            if self.sendme_one_shot {
+                                                self.mark_sendme_one_shot_completed();
+                                            } else {
+                                                self.mark_sendme_sender_waiting();
+                                            }
+                                        } else if self.transfer_phase == TransferPhase::Preparing {
+                                            self.transfer_phase = TransferPhase::WaitingForReceiver;
+                                        }
+                                    }
+                                    if (self.selected_tool == SelectedTool::Sendme
+                                        || self.selected_tool == SelectedTool::EazySendme)
+                                        && lower.contains("to get this data, use")
+                                        && self.sendme_had_transfer
+                                    {
+                                        if self.sendme_one_shot {
+                                            self.mark_sendme_one_shot_completed();
+                                        } else {
+                                            self.mark_sendme_sender_waiting();
+                                        }
                                     }
                                     if self.selected_tool == SelectedTool::Croc
                                         && lower.contains("code copied to clipboard")
@@ -833,6 +958,7 @@ impl DataBeamApp {
                                             || lower.contains("receiving (<-"))
                                     {
                                         self.transfer_phase = TransferPhase::Transferring;
+                                        self.sendme_had_transfer = true;
                                         if self.transfer_payload_start_time.is_none() {
                                             self.transfer_payload_start_time =
                                                 Some(self.animation_time);
@@ -849,22 +975,33 @@ impl DataBeamApp {
                                         self.transfer_log.drain(0..100);
                                     }
                                 }
-                                if self.selected_tool == SelectedTool::Sendme || self.selected_tool == SelectedTool::EazySendme {
-                                    let sendme_serve_mode =
-                                        self.view == AppView::Send && !self.sendme_one_shot;
-                                    if sendme_serve_mode
-                                        && (lower.contains("client disconnected")
-                                            || lower.contains("finished sending")
-                                            || lower.contains("transfer complete")
-                                            || lower.contains("peer disconnected"))
+                                if self.selected_tool == SelectedTool::Sendme
+                                    || self.selected_tool == SelectedTool::EazySendme
+                                {
+                                    let sendme_sender = self.view == AppView::Send;
+                                    let sendme_end_signal = lower.contains("client disconnected")
+                                        || lower.contains("finished sending")
+                                        || lower.contains("transfer complete")
+                                        || lower.contains("peer disconnected");
+                                    let sendme_waiting_signal = lower
+                                        .contains("waiting for incoming transfer")
+                                        || lower.contains("waiting for incoming")
+                                        || lower.contains("waiting for receiver");
+                                    let sendme_cycle_finished = sendme_end_signal
+                                        || (sendme_sender
+                                            && self.sendme_had_transfer
+                                            && sendme_waiting_signal);
+
+                                    if sendme_sender
+                                        && self.sendme_one_shot
+                                        && sendme_cycle_finished
                                     {
-                                        self.transfer_phase = TransferPhase::WaitingForReceiver;
-                                        self.transfer_payload_start_time = None;
-                                        self.transfer_progress = 0.0;
-                                        self.transfer_done_bytes = None;
-                                        self.transfer_speed_bps = None;
-                                        self.sendme_peer_connected = false;
-                                        self.sendme_last_activity = None;
+                                        self.mark_sendme_one_shot_completed();
+                                    } else if sendme_sender
+                                        && !self.sendme_one_shot
+                                        && sendme_cycle_finished
+                                    {
+                                        self.mark_sendme_sender_waiting();
                                     }
                                     // Transition to Transferring only on actual connection acceptance or data flow
                                     if lower.contains("disco_in{endpoint=")
@@ -876,17 +1013,8 @@ impl DataBeamApp {
                                         || lower.contains("add_endpoint_addr")
                                     {
                                         self.sendme_peer_connected = true;
+                                        self.sendme_waiting_after_cycle = false;
                                         self.sendme_last_activity = Some(self.animation_time);
-                                        if self.view == AppView::Send
-                                            && self.transfer_phase
-                                                == TransferPhase::WaitingForReceiver
-                                        {
-                                            self.transfer_phase = TransferPhase::Transferring;
-                                            if self.transfer_payload_start_time.is_none() {
-                                                self.transfer_payload_start_time =
-                                                    Some(self.animation_time);
-                                            }
-                                        }
                                     } else if self.sendme_peer_connected
                                         && (lower.contains(" r ")
                                             || lower.contains("sending")
@@ -899,53 +1027,26 @@ impl DataBeamApp {
                                                 == TransferPhase::WaitingForReceiver
                                         {
                                             self.transfer_phase = TransferPhase::Transferring;
+                                            self.sendme_had_transfer = true;
                                             if self.transfer_payload_start_time.is_none() {
                                                 self.transfer_payload_start_time =
                                                     Some(self.animation_time);
                                             }
                                         }
-                                    } else if self.sendme_peer_connected
-                                        && self.view == AppView::Send
-                                        && self.transfer_phase == TransferPhase::WaitingForReceiver
-                                        && !lower.contains("sendme receive ")
-                                    {
-                                        // Once peer is connected, any subsequent sender-side log
-                                        // activity indicates active transfer preparation/data flow.
-                                        self.transfer_phase = TransferPhase::Transferring;
-                                        if self.transfer_payload_start_time.is_none() {
-                                            self.transfer_payload_start_time =
-                                                Some(self.animation_time);
-                                        }
                                     }
                                     if self.view == AppView::Send
-                                        && self.transfer_phase == TransferPhase::WaitingForReceiver
-                                        && (lower.contains("getting sizes")
-                                            || lower.contains("connecting")
-                                            || lower.contains("getting collection")
-                                            || lower.contains("downloading")
-                                            || lower.contains("exporting ")
-                                            || lower.contains("[1/4]")
-                                            || lower.contains("[2/4]")
-                                            || lower.contains("[3/4]")
-                                            || lower.contains("[4/4]"))
+                                        && (sendme_counter_activity
+                                            || ((lower.contains("[3/4]")
+                                                || lower.contains("[4/4]"))
+                                                && (lower.contains("uploading")
+                                                    || lower.contains("downloading"))))
+                                        && (!self.sendme_waiting_after_cycle
+                                            || self.sendme_peer_connected)
                                     {
-                                        self.transfer_phase = TransferPhase::Transferring;
-                                        if self.transfer_payload_start_time.is_none() {
-                                            self.transfer_payload_start_time =
-                                                Some(self.animation_time);
-                                        }
-                                    }
-                                    if self.view == AppView::Send
-                                        && self.transfer_phase == TransferPhase::WaitingForReceiver
-                                        && self.transfer_code.is_some()
-                                    {
-                                        let is_prep_noise = lower.contains("using secret key")
-                                            || lower.starts_with("imported directory ")
-                                            || lower.starts_with("imported file ")
-                                            || lower.contains("to get this data")
-                                            || lower.contains("sendme receive ")
-                                            || lower.contains("press c to copy");
-                                        if !is_prep_noise {
+                                        self.sendme_had_transfer = true;
+                                        self.sendme_waiting_after_cycle = false;
+                                        self.sendme_last_activity = Some(self.animation_time);
+                                        if self.transfer_phase != TransferPhase::Transferring {
                                             self.transfer_phase = TransferPhase::Transferring;
                                             if self.transfer_payload_start_time.is_none() {
                                                 self.transfer_payload_start_time =
@@ -982,17 +1083,24 @@ impl DataBeamApp {
                                     // Serve mode ticket detected — start sharing it via Croc
                                     if self.selected_tool == SelectedTool::EazySendme
                                         && self.view == AppView::Send
-                                        && self.transfer_phase == TransferPhase::Preparing
                                     {
-                                        self.transfer_phase = TransferPhase::EazySharingTicket;
-                                        self.eazysendme_ticket = Some(code.clone());
-                                        self.transfer_log.push(format!("Ticket generated: {}. Sharing via Croc...", code));
-                                        
+                                        if self.eazysendme_ticket.is_none() {
+                                            self.transfer_phase = TransferPhase::EazySharingTicket;
+                                            self.eazysendme_ticket = Some(code.clone());
+                                            self.transfer_log.push(format!(
+                                                "Ticket generated: {}. Sharing via Croc...",
+                                                code
+                                            ));
+
                                             // Start croc_send
-                                            if let Some(binary) = self.get_tool_binary(&Tool::Croc) {
+                                            if let Some(binary) = self.get_tool_binary(&Tool::Croc)
+                                            {
                                                 let opts = CrocSendOptions {
                                                     paths: Vec::new(),
-                                                    custom_code: if !self.eazysendme_custom_code.is_empty() {
+                                                    custom_code: if !self
+                                                        .eazysendme_custom_code
+                                                        .is_empty()
+                                                    {
                                                         Some(self.eazysendme_custom_code.clone())
                                                     } else {
                                                         None
@@ -1000,11 +1108,17 @@ impl DataBeamApp {
                                                     text_mode: true,
                                                     text_value: Some(code.clone()),
                                                 };
-                                            let (croc_rx, croc_handle) = croc_send(opts, &binary);
-                                            self.eazysendme_croc_handle = Some(croc_handle);
-                                            self.eazysendme_croc_rx = Some(croc_rx);
+                                                let (croc_rx, croc_handle) =
+                                                    croc_send(opts, &binary);
+                                                self.eazysendme_croc_handle = Some(croc_handle);
+                                                self.eazysendme_croc_rx = Some(croc_rx);
+                                            }
                                         }
                                         // self.transfer_code = Some(code); // Do NOT show the sendme ticket as the code
+                                    } else if self.selected_tool == SelectedTool::EazySendme
+                                        && self.view == AppView::Receive
+                                    {
+                                        // Keep Eazy receive code field owned by Croc flow.
                                     } else {
                                         // Normal Sendme or Croc: show the code/ticket we got
                                         self.transfer_code = Some(code);
@@ -1022,6 +1136,48 @@ impl DataBeamApp {
                                     && self.transfer_phase == TransferPhase::Preparing
                                 {
                                     self.transfer_phase = TransferPhase::WaitingForReceiver;
+                                    self.sendme_waiting_after_cycle = false;
+                                }
+                            }
+                            TransferMsg::WaitingForReceiver => {
+                                let sendme_sender = (self.selected_tool == SelectedTool::Sendme
+                                    || self.selected_tool == SelectedTool::EazySendme)
+                                    && self.view == AppView::Send
+                                    && self.transfer_state == TransferState::Running;
+                                if sendme_sender {
+                                    if self.sendme_had_transfer {
+                                        if self.sendme_one_shot {
+                                            self.mark_sendme_one_shot_completed();
+                                        } else {
+                                            self.mark_sendme_sender_waiting();
+                                        }
+                                    } else {
+                                        self.transfer_phase = TransferPhase::WaitingForReceiver;
+                                        self.sendme_waiting_after_cycle = false;
+                                    }
+                                }
+                            }
+                            TransferMsg::SenderTransferActivity => {
+                                if (self.selected_tool == SelectedTool::Sendme
+                                    || self.selected_tool == SelectedTool::EazySendme)
+                                    && self.view == AppView::Send
+                                    && self.transfer_state == TransferState::Running
+                                {
+                                    if self.sendme_waiting_after_cycle
+                                        && !self.sendme_peer_connected
+                                    {
+                                        continue;
+                                    }
+                                    self.sendme_had_transfer = true;
+                                    self.sendme_waiting_after_cycle = false;
+                                    self.sendme_last_activity = Some(self.animation_time);
+                                    if self.transfer_phase != TransferPhase::Transferring {
+                                        self.transfer_phase = TransferPhase::Transferring;
+                                        if self.transfer_payload_start_time.is_none() {
+                                            self.transfer_payload_start_time =
+                                                Some(self.animation_time);
+                                        }
+                                    }
                                 }
                             }
                             TransferMsg::Completed => {
@@ -1042,26 +1198,37 @@ impl DataBeamApp {
                                     {
                                         // Receiver side: Croc finished receiving the ticket
                                         if let Some(ticket) = self.croc_received_text.clone() {
-                                            self.transfer_log.push("Ticket received via Croc. Starting Sendme...".to_string());
+                                            self.transfer_log.push(
+                                                "Ticket received via Croc. Starting Sendme..."
+                                                    .to_string(),
+                                            );
                                             self.eazysendme_ticket = Some(ticket.clone());
-                                            
+
                                             // Start sendme_receive
-                                            if let Some(binary) = self.get_tool_binary(&Tool::Sendme) {
+                                            if let Some(binary) =
+                                                self.get_tool_binary(&Tool::Sendme)
+                                            {
                                                 let opts = SendmeReceiveOptions {
                                                     ticket: ticket.trim().to_string(),
                                                     output_dir: self.receive_output_dir.clone(),
                                                 };
-                                                let (new_rx, new_handle) = sendme_receive(opts, &binary);
+                                                let (new_rx, new_handle) =
+                                                    sendme_receive(opts, &binary);
                                                 self.transfer_rx = Some(new_rx);
                                                 self.transfer_handle = Some(new_handle);
-                                                self.transfer_phase = TransferPhase::Transferring;
-                                                self.transfer_start_time = Some(self.animation_time);
+                                                self.transfer_phase = TransferPhase::Preparing;
+                                                self.transfer_start_time =
+                                                    Some(self.animation_time);
                                                 return; // Exit poll_transfer, will resume next frame with new_rx
                                             } else {
-                                                self.transfer_state = TransferState::Failed("Sendme binary not found".to_string());
+                                                self.transfer_state = TransferState::Failed(
+                                                    "Sendme binary not found".to_string(),
+                                                );
                                             }
                                         } else {
-                                            self.transfer_state = TransferState::Failed("Croc finished but no ticket found".to_string());
+                                            self.transfer_state = TransferState::Failed(
+                                                "Croc finished but no ticket found".to_string(),
+                                            );
                                         }
                                     } else {
                                         self.transfer_state = TransferState::Completed;
@@ -1074,6 +1241,9 @@ impl DataBeamApp {
                                 }
                             }
                             TransferMsg::PeerDisconnected => {
+                                if self.transfer_state == TransferState::Completed {
+                                    continue;
+                                }
                                 self.transfer_log
                                     .push("Peer disconnected (transfer finished)".to_string());
                                 if (self.selected_tool == SelectedTool::Sendme
@@ -1081,17 +1251,9 @@ impl DataBeamApp {
                                     && self.sendme_one_shot
                                 {
                                     let done = self.transfer_done_bytes.unwrap_or(0);
-                                    let has_payload = done > 0
-                                        || self.transfer_progress > 0.0
-                                        || self.transfer_phase == TransferPhase::Transferring;
+                                    let has_payload = done > 0 || self.sendme_had_transfer;
                                     if has_payload {
-                                        self.transfer_state = TransferState::Completed;
-                                        self.transfer_progress = 1.0;
-                                        self.preparing_progress = 1.0;
-                                        self.transfer_end_time = Some(self.animation_time);
-                                        if let Some(total) = self.transfer_total_bytes {
-                                            self.transfer_done_bytes = Some(total);
-                                        }
+                                        self.mark_sendme_one_shot_completed();
                                     } else {
                                         self.transfer_state = TransferState::Failed(
                                             "Peer disconnected before transfer started".to_string(),
@@ -1113,16 +1275,30 @@ impl DataBeamApp {
                                             // because Sendme is still serving.
                                         }
                                     }
-                                    self.transfer_progress = 0.0;
-                                    self.transfer_phase = match (self.selected_tool, self.view, self.sendme_one_shot) {
-                                        (SelectedTool::Sendme, AppView::Send, false) => TransferPhase::WaitingForReceiver,
-                                        (SelectedTool::EazySendme, AppView::Send, _) => TransferPhase::EazyWaitingForPeer,
-                                        _ => TransferPhase::Preparing,
-                                    };
-                                    self.preparing_progress = 0.0;
-                                    self.transfer_payload_start_time = None;
-                                    self.transfer_done_bytes = None;
-                                    self.transfer_total_bytes = None;
+                                    if self.selected_tool == SelectedTool::Sendme
+                                        && self.view == AppView::Send
+                                        && !self.sendme_one_shot
+                                    {
+                                        self.mark_sendme_sender_waiting();
+                                    } else {
+                                        self.transfer_progress = 0.0;
+                                        self.transfer_phase = match (
+                                            self.selected_tool,
+                                            self.view,
+                                            self.sendme_one_shot,
+                                        ) {
+                                            (SelectedTool::EazySendme, AppView::Send, _) => {
+                                                TransferPhase::EazyWaitingForPeer
+                                            }
+                                            _ => TransferPhase::Preparing,
+                                        };
+                                        self.preparing_progress = 0.0;
+                                        self.transfer_payload_start_time = None;
+                                        self.transfer_done_bytes = None;
+                                        self.transfer_total_bytes = None;
+                                        self.sendme_had_transfer = false;
+                                        self.sendme_waiting_after_cycle = false;
+                                    }
                                 }
                             }
                             TransferMsg::Error(e) => {
@@ -1139,19 +1315,13 @@ impl DataBeamApp {
                                     && (self.selected_tool == SelectedTool::Sendme
                                         || self.selected_tool == SelectedTool::EazySendme)
                                     && self.sendme_one_shot
-                                    && self.sendme_peer_connected
+                                    && (self.sendme_had_transfer
+                                        || self.transfer_done_bytes.unwrap_or(0) > 0)
                                 {
                                     let done = self.transfer_done_bytes.unwrap_or(0);
-                                    let has_payload = done > 0
-                                        || self.transfer_progress > 0.0
-                                        || self.transfer_phase == TransferPhase::Transferring;
+                                    let has_payload = done > 0 || self.sendme_had_transfer;
                                     if has_payload {
-                                        self.transfer_state = TransferState::Completed;
-                                        self.transfer_end_time = Some(self.animation_time);
-                                        self.transfer_progress = 1.0;
-                                        if let Some(total) = self.transfer_total_bytes {
-                                            self.transfer_done_bytes = Some(total);
-                                        }
+                                        self.mark_sendme_one_shot_completed();
                                     } else {
                                         self.transfer_state = TransferState::Failed(
                                             "Send session ended before payload started".to_string(),
@@ -1159,7 +1329,8 @@ impl DataBeamApp {
                                         self.transfer_end_time = Some(self.animation_time);
                                     }
                                 } else if e == "Send session ended before transfer completed"
-                                    && (self.selected_tool == SelectedTool::Sendme || self.selected_tool == SelectedTool::EazySendme)
+                                    && (self.selected_tool == SelectedTool::Sendme
+                                        || self.selected_tool == SelectedTool::EazySendme)
                                     && !self.sendme_one_shot
                                 {
                                     // Serve mode: this session can expire while idle; immediately
@@ -1178,13 +1349,13 @@ impl DataBeamApp {
                                     && self.view == AppView::Send
                                     && !self.sendme_one_shot
                                 {
-                                    TransferPhase::WaitingForReceiver
+                                    TransferPhase::Preparing
+                                } else if self.selected_tool == SelectedTool::Sendme
+                                    && self.view == AppView::Receive
+                                {
+                                    TransferPhase::Preparing
                                 } else if self.selected_tool == SelectedTool::EazySendme {
-                                    if self.view == AppView::Receive && self.eazysendme_ticket.is_some() {
-                                        TransferPhase::Transferring
-                                    } else {
-                                        TransferPhase::Preparing
-                                    }
+                                    TransferPhase::Preparing
                                 } else {
                                     TransferPhase::Preparing
                                 };
@@ -1194,6 +1365,8 @@ impl DataBeamApp {
                                 self.transfer_speed_bps = None;
                                 self.transfer_speed_samples.clear();
                                 self.transfer_done_bytes = None;
+                                self.sendme_had_transfer = false;
+                                self.sendme_waiting_after_cycle = false;
                             }
                         }
                     }
@@ -1228,18 +1401,31 @@ impl DataBeamApp {
                             TransferMsg::Code(code) => {
                                 // This is the short code we want to show!
                                 self.transfer_code = Some(code);
+                                if self.selected_tool == SelectedTool::EazySendme
+                                    && self.view == AppView::Send
+                                    && self.transfer_phase == TransferPhase::EazySharingTicket
+                                {
+                                    self.transfer_phase = TransferPhase::EazyWaitingForPeer;
+                                    self.transfer_log.push(
+                                        "Croc code generated. Share this code with receiver."
+                                            .to_string(),
+                                    );
+                                }
                             }
                             TransferMsg::Error(e) => {
                                 self.show_toast(format!("Croc error: {}", e), ERROR);
                             }
                             TransferMsg::Completed => {
-                                self.transfer_log.push("Croc finished sharing ticket.".to_string());
-                                if self.selected_tool == SelectedTool::EazySendme 
-                                    && self.view == AppView::Send 
-                                    && self.transfer_phase == TransferPhase::EazySharingTicket 
+                                self.transfer_log
+                                    .push("Croc finished sharing ticket.".to_string());
+                                if self.selected_tool == SelectedTool::EazySendme
+                                    && self.view == AppView::Send
+                                    && self.transfer_phase == TransferPhase::EazySharingTicket
                                 {
-                                    self.transfer_phase = TransferPhase::WaitingForReceiver;
-                                    self.transfer_log.push("Waiting for receiver to connect via Sendme...".to_string());
+                                    self.transfer_phase = TransferPhase::EazyWaitingForPeer;
+                                    self.transfer_log.push(
+                                        "Waiting for receiver to connect via Sendme...".to_string(),
+                                    );
                                 }
                             }
                             _ => {}
@@ -1285,7 +1471,6 @@ impl DataBeamApp {
                 .dropped_files
                 .iter()
                 .filter_map(|f| f.path.clone())
-                .filter(|p| p.exists())
                 .collect()
         });
 
@@ -1404,7 +1589,7 @@ impl DataBeamApp {
                 // EazySendme MUST be one-shot because tickets are single-use.
                 self.sendme_one_shot = true;
                 self.transfer_phase = TransferPhase::Preparing;
-                
+
                 let opts = SendmeSendOptions {
                     paths: self.send_paths(),
                 };
@@ -1593,13 +1778,7 @@ impl DataBeamApp {
                     self.show_toast("Code copied".to_string(), SUCCESS);
                 }
                 ui.add_space(4.0);
-                let mut qr_text = render_qr_ascii(code);
-                ui.add(
-                    egui::TextEdit::multiline(&mut qr_text)
-                        .interactive(false)
-                        .font(egui::FontId::new(7.0, egui::FontFamily::Monospace))
-                        .desired_rows(24),
-                );
+                render_qr_blocks(ui, code, 320.0);
                 ui.label(
                     RichText::new(code)
                         .monospace()
@@ -1646,7 +1825,10 @@ impl eframe::App for DataBeamApp {
         if !self.initialized_once {
             self.view = AppView::Home;
             self.initialized_once = true;
-            self.show_toast(format!("Running DataBeam v{} (Fixed Build)", APP_VERSION), SUCCESS);
+            self.show_toast(
+                format!("Running DataBeam v{} (Fixed Build)", APP_VERSION),
+                SUCCESS,
+            );
         }
 
         if let Some((_, ref mut start, _)) = self.toast_msg {
@@ -1658,51 +1840,6 @@ impl eframe::App for DataBeamApp {
         self.handle_dropped_files(ctx);
         self.poll_size_updates();
         self.poll_transfer();
-
-        // Heuristic one-shot finish for sendme sender: after peer activity, if output goes idle,
-        // stop the serving process and mark complete.
-        if self.transfer_state == TransferState::Running
-            && self.view == AppView::Send
-            && (self.selected_tool == SelectedTool::Sendme
-                || self.selected_tool == SelectedTool::EazySendme)
-            && self.sendme_one_shot
-            && self.sendme_peer_connected
-            && self.transfer_phase == TransferPhase::Transferring
-            && self.transfer_code.is_some()
-        {
-            if let Some(last) = self.sendme_last_activity {
-                if self.animation_time - last > 4.0 {
-                    self.transfer_state = TransferState::Completed;
-                    self.transfer_progress = 1.0;
-                    self.preparing_progress = 1.0;
-                    self.transfer_end_time = Some(self.animation_time);
-                    if let Some(total) = self.transfer_total_bytes {
-                        self.transfer_done_bytes = Some(total);
-                    }
-                    self.show_toast("Single transfer complete".to_string(), SUCCESS);
-                }
-            }
-        }
-
-        // Serve-mode fallback: if sender was in transferring state but output goes idle after
-        // receiver disconnect/finish signals are missed, snap back to waiting.
-        if self.transfer_state == TransferState::Running
-            && self.selected_tool == SelectedTool::Sendme
-            && self.view == AppView::Send
-            && !self.sendme_one_shot
-            && self.transfer_phase == TransferPhase::Transferring
-        {
-            if let Some(last) = self.sendme_last_activity {
-                if self.animation_time - last > 8.0 {
-                    self.transfer_phase = TransferPhase::WaitingForReceiver;
-                    self.transfer_progress = 0.0;
-                    self.transfer_done_bytes = None;
-                    self.transfer_speed_bps = None;
-                    self.transfer_payload_start_time = None;
-                    self.sendme_peer_connected = false;
-                }
-            }
-        }
 
         if self.transfer_state == TransferState::Running {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -1771,7 +1908,9 @@ impl eframe::App for DataBeamApp {
                         let (tc, tn) = match self.selected_tool {
                             SelectedTool::Croc => (CROC_COLOR, "🐊 croc"),
                             SelectedTool::Sendme => (SENDME_COLOR, "📡 sendme"),
-                            SelectedTool::EazySendme => (Color32::from_rgb(255, 165, 0), "⚡ eazysendme"),
+                            SelectedTool::EazySendme => {
+                                (Color32::from_rgb(255, 165, 0), "⚡ eazysendme")
+                            }
                         };
                         status_badge(ui, tn, tc);
                     });
@@ -1967,7 +2106,8 @@ impl DataBeamApp {
             ui,
             "⚡ EazySendme",
             "Sendme performance + Croc-like automatic ticket sharing",
-            croc_status.as_ref().map(|s| s.available).unwrap_or(false) && sendme_status.as_ref().map(|s| s.available).unwrap_or(false),
+            croc_status.as_ref().map(|s| s.available).unwrap_or(false)
+                && sendme_status.as_ref().map(|s| s.available).unwrap_or(false),
             None,
             Color32::from_rgb(255, 165, 0),
             self.selected_tool == SelectedTool::EazySendme,
@@ -2167,11 +2307,7 @@ impl DataBeamApp {
             card_frame(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("🔑 Custom Code").color(TEXT_PRIMARY).strong());
-                    ui.label(
-                        RichText::new("(Required)")
-                            .color(ERROR)
-                            .size(10.0),
-                    );
+                    ui.label(RichText::new("(Required)").color(ERROR).size(10.0));
                 });
                 ui.add_space(4.0);
                 if send_locked {
@@ -2186,14 +2322,14 @@ impl DataBeamApp {
                             .hint_text("Random code"),
                     );
                     if response.changed() && !self.eazysendme_custom_code.is_empty() {
-                         // Validation or persistence could go here
+                        // Validation or persistence could go here
                     }
                 }
-                 ui.label(
-                     RichText::new("Must use more than 6 characters.")
-                         .size(10.0)
-                         .color(TEXT_MUTED),
-                 );
+                ui.label(
+                    RichText::new("Must use more than 6 characters.")
+                        .size(10.0)
+                        .color(TEXT_MUTED),
+                );
             });
             ui.add_space(6.0);
         }
@@ -2230,21 +2366,26 @@ impl DataBeamApp {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let accent = self.engine_color();
+                    let picker_ready = self.animation_time >= self.picker_block_until;
                     // Add buttons specific to folders/files
                     if !send_locked
                         && !croc_text_mode
+                        && picker_ready
                         && accent_button_sized(ui, "+ Folder", accent, Vec2::new(70.0, 22.0))
                             .clicked()
                     {
+                        self.picker_block_until = self.animation_time + 0.35;
                         if let Some(p) = rfd::FileDialog::new().pick_folder() {
                             self.add_path(p);
                         }
                     }
                     if !send_locked
                         && !croc_text_mode
+                        && picker_ready
                         && accent_button_sized(ui, "+ File", accent, Vec2::new(60.0, 22.0))
                             .clicked()
                     {
+                        self.picker_block_until = self.animation_time + 0.35;
                         if let Some(paths) = rfd::FileDialog::new().pick_files() {
                             for p in paths {
                                 self.add_path(p);
@@ -2415,14 +2556,18 @@ impl DataBeamApp {
                 } else {
                     true
                 };
-                
+
                 ui.add_enabled_ui(enabled, |ui| {
-                     if accent_button(ui, &label, color).clicked() {
+                    if accent_button(ui, &label, color).clicked() {
                         self.start_send();
-                     }
+                    }
                 });
                 if !enabled && self.selected_tool == SelectedTool::EazySendme {
-                     ui.label(RichText::new("Code too short (min 7 chars)").color(ERROR).size(10.0));
+                    ui.label(
+                        RichText::new("Code too short (min 7 chars)")
+                            .color(ERROR)
+                            .size(10.0),
+                    );
                 }
             }
             TransferState::Running => {
@@ -2474,7 +2619,9 @@ impl DataBeamApp {
         // ── Code input ──
         card_frame(ui, |ui| {
             let (label, hint) = match self.selected_tool {
-                SelectedTool::Croc | SelectedTool::EazySendme => ("Code Phrase", "e.g. 1234-ocean-monkey"),
+                SelectedTool::Croc | SelectedTool::EazySendme => {
+                    ("Code Phrase", "e.g. 1234-ocean-monkey")
+                }
                 SelectedTool::Sendme => ("Ticket", "paste ticket here"),
             };
             ui.horizontal(|ui| {
@@ -2627,7 +2774,9 @@ impl DataBeamApp {
                 let (color, label) = match self.selected_tool {
                     SelectedTool::Croc => (CROC_COLOR, "🐊 Receive"),
                     SelectedTool::Sendme => (SENDME_COLOR, "📡 Receive"),
-                    SelectedTool::EazySendme => (Color32::from_rgb(255, 165, 0), "⚡ Receive (via Croc)"),
+                    SelectedTool::EazySendme => {
+                        (Color32::from_rgb(255, 165, 0), "⚡ Receive (via Croc)")
+                    }
                 };
                 if accent_button(ui, label, color).clicked() {
                     self.start_receive();
@@ -2649,6 +2798,7 @@ impl DataBeamApp {
                     .clicked()
                     {
                         self.reset_transfer();
+                        self.receive_code.clear();
                     }
                     if let Some(dir) = self.effective_receive_folder() {
                         if accent_button_sized(
@@ -2672,6 +2822,7 @@ impl DataBeamApp {
                         .clicked()
                     {
                         self.reset_transfer();
+                        self.receive_code.clear();
                     }
                     if accent_button_sized(
                         ui,
@@ -2760,7 +2911,7 @@ impl DataBeamApp {
                     });
                     ui.add_space(4.0);
 
-                    if !sendme_serve_mode {
+                    if !sendme_serve_mode || self.transfer_phase == TransferPhase::Transferring {
                         if self.transfer_phase == TransferPhase::Transferring {
                             animated_progress_bar(ui, effective_progress, accent);
                         } else {
@@ -2772,17 +2923,19 @@ impl DataBeamApp {
                         }
                         let pct_text = format!("{:.1}%", effective_progress * 100.0);
                         ui.horizontal_wrapped(|ui| match self.transfer_phase {
-                            TransferPhase::Preparing | TransferPhase::EazySharingTicket | TransferPhase::EazyWaitingForPeer => {
+                            TransferPhase::Preparing
+                            | TransferPhase::EazySharingTicket
+                            | TransferPhase::EazyWaitingForPeer => {
                                 let label = match self.transfer_phase {
-                                    TransferPhase::EazySharingTicket => "Sharing ticket via Croc...",
-                                    TransferPhase::EazyWaitingForPeer => "Waiting for peer (Sendme)...",
+                                    TransferPhase::EazySharingTicket => {
+                                        "Sharing ticket via Croc..."
+                                    }
+                                    TransferPhase::EazyWaitingForPeer => {
+                                        "Waiting for peer (Sendme)..."
+                                    }
                                     _ => "Preparing ...",
                                 };
-                                ui.label(
-                                    RichText::new(label)
-                                        .size(10.0)
-                                        .color(TEXT_SECONDARY),
-                                );
+                                ui.label(RichText::new(label).size(10.0).color(TEXT_SECONDARY));
                                 if total > 0 {
                                     ui.label(
                                         RichText::new(format!(
@@ -2812,17 +2965,7 @@ impl DataBeamApp {
                                 }
                             }
                             TransferPhase::Transferring => {
-                                let progress_label = if self.selected_tool == SelectedTool::Sendme
-                                    && self.view == AppView::Send
-                                    && self.sendme_one_shot
-                                {
-                                    format!(
-                                        "Progress (crude estimate, typically finishes faster): {}",
-                                        pct_text
-                                    )
-                                } else {
-                                    format!("Progress: {}", pct_text)
-                                };
+                                let progress_label = format!("Progress: {}", pct_text);
                                 ui.label(
                                     RichText::new(progress_label)
                                         .size(10.0)
@@ -2881,17 +3024,20 @@ impl DataBeamApp {
                         });
                     } else {
                         ui.horizontal_wrapped(|ui| match self.transfer_phase {
-                            TransferPhase::Preparing | TransferPhase::WaitingForReceiver | TransferPhase::EazySharingTicket | TransferPhase::EazyWaitingForPeer => {
+                            TransferPhase::Preparing
+                            | TransferPhase::WaitingForReceiver
+                            | TransferPhase::EazySharingTicket
+                            | TransferPhase::EazyWaitingForPeer => {
                                 let label = match self.transfer_phase {
-                                    TransferPhase::EazySharingTicket => "Sharing ticket via Croc...",
-                                    TransferPhase::EazyWaitingForPeer => "Waiting for peer (Sendme)...",
+                                    TransferPhase::EazySharingTicket => {
+                                        "Sharing ticket via Croc..."
+                                    }
+                                    TransferPhase::EazyWaitingForPeer => {
+                                        "Waiting for peer (Sendme)..."
+                                    }
                                     _ => "Waiting for receiver...",
                                 };
-                                ui.label(
-                                    RichText::new(label)
-                                        .size(10.0)
-                                        .color(TEXT_SECONDARY),
-                                );
+                                ui.label(RichText::new(label).size(10.0).color(TEXT_SECONDARY));
                             }
                             TransferPhase::Transferring => {
                                 ui.label(
@@ -2978,7 +3124,9 @@ impl DataBeamApp {
                 let (label, color) = match self.selected_tool {
                     SelectedTool::Croc => ("Share this code:", CROC_COLOR),
                     SelectedTool::Sendme => ("Share this ticket:", SENDME_COLOR),
-                    SelectedTool::EazySendme => ("EazySendme ticket:", Color32::from_rgb(255, 165, 0)),
+                    SelectedTool::EazySendme => {
+                        ("EazySendme ticket:", Color32::from_rgb(255, 165, 0))
+                    }
                 };
                 if code_display(ui, label, code, color) {
                     self.show_toast("Code copied".to_string(), SUCCESS);
@@ -3025,14 +3173,33 @@ impl DataBeamApp {
 
 // ── Helpers ────────────────────────────────────────────────────────
 
-fn render_qr_ascii(code: &str) -> String {
-    if let Ok(qr) = QrCode::new(code.as_bytes()) {
-        qr.render::<unicode::Dense1x2>()
-            .dark_color(unicode::Dense1x2::Dark)
-            .light_color(unicode::Dense1x2::Light)
-            .build()
-    } else {
-        "Unable to generate QR".to_string()
+fn render_qr_blocks(ui: &mut egui::Ui, code: &str, max_side: f32) {
+    let Ok(qr) = QrCode::new(code.as_bytes()) else {
+        ui.label("Unable to generate QR");
+        return;
+    };
+    let colors = qr.to_colors();
+    let side = qr.width();
+    if side == 0 {
+        ui.label("Unable to generate QR");
+        return;
+    }
+
+    let module = (max_side / side as f32).max(2.0);
+    let draw_side = module * side as f32;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(draw_side, draw_side), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 6.0, Color32::WHITE);
+
+    for y in 0..side {
+        for x in 0..side {
+            let idx = y * side + x;
+            if colors[idx] == QrModuleColor::Dark {
+                let min = rect.min + Vec2::new(x as f32 * module, y as f32 * module);
+                let max = min + Vec2::splat(module);
+                painter.rect_filled(egui::Rect::from_min_max(min, max), 0.0, Color32::BLACK);
+            }
+        }
     }
 }
 
@@ -3217,6 +3384,29 @@ fn parse_sendme_item_index(line: &str) -> Option<u64> {
     None
 }
 
+fn parse_sendme_r_counter(line: &str) -> Option<(u64, u64)> {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    for pair in tokens.windows(2) {
+        if pair[0] == "r" {
+            let raw = pair[1]
+                .trim_matches(|c: char| c == '[' || c == ']' || c == '(' || c == ')' || c == ',');
+            let (done_s, total_s) = raw.split_once('/')?;
+            let done = done_s.parse::<u64>().ok()?;
+            let total = total_s.parse::<u64>().ok()?;
+            return Some((done, total));
+        }
+    }
+    None
+}
+
+fn parse_sendme_r_payload_progress(line: &str) -> Option<(u64, u64)> {
+    let (done, total) = parse_sendme_r_counter(line)?;
+    if total == 0 || done > total {
+        return None;
+    }
+    Some((done, total))
+}
+
 fn is_cli_progress_line(line: &str) -> bool {
     let lower = line.to_lowercase();
     (lower.contains("download") || lower.contains("upload"))
@@ -3226,6 +3416,27 @@ fn is_cli_progress_line(line: &str) -> bool {
             || line.contains("KB/s")
             || line.contains("MB/s")
             || line.contains("GB/s"))
+}
+
+fn compact_cli_progress_line(line: &str) -> String {
+    let trimmed = line.trim();
+    if let Some(idx) = trimmed.rfind("[3/4]") {
+        return trimmed[idx..].trim().to_string();
+    }
+    if let Some(idx) = trimmed.rfind("[4/4]") {
+        return trimmed[idx..].trim().to_string();
+    }
+    if trimmed.chars().count() > 220 {
+        return trimmed
+            .chars()
+            .rev()
+            .take(220)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+    }
+    trimmed.to_string()
 }
 
 fn parse_payload_progress(line: &str) -> Option<(u64, u64)> {
@@ -3845,5 +4056,181 @@ mod parse_tests {
         app.poll_transfer();
 
         assert_eq!(app.transfer_phase, TransferPhase::Transferring);
+    }
+
+    #[test]
+    fn sendme_serve_mode_waiting_banner_resets_to_waiting() {
+        let mut app = DataBeamApp::default();
+        app.selected_tool = SelectedTool::Sendme;
+        app.view = AppView::Send;
+        app.transfer_state = TransferState::Running;
+        app.sendme_one_shot = false;
+        app.transfer_phase = TransferPhase::Transferring;
+        app.transfer_progress = 0.42;
+        app.transfer_done_bytes = Some(1024);
+        app.sendme_had_transfer = true;
+        let (tx, rx) = mpsc::channel();
+        app.transfer_rx = Some(rx);
+        tx.send(TransferMsg::WaitingForReceiver)
+            .expect("send output");
+        drop(tx);
+
+        app.poll_transfer();
+
+        assert_eq!(app.transfer_state, TransferState::Running);
+        assert_eq!(app.transfer_phase, TransferPhase::WaitingForReceiver);
+        assert!(app.transfer_done_bytes.is_none());
+        assert!(app.transfer_progress <= f32::EPSILON);
+    }
+
+    #[test]
+    fn sendme_one_shot_waiting_banner_marks_complete() {
+        let mut app = DataBeamApp::default();
+        app.selected_tool = SelectedTool::Sendme;
+        app.view = AppView::Send;
+        app.transfer_state = TransferState::Running;
+        app.sendme_one_shot = true;
+        app.transfer_phase = TransferPhase::Transferring;
+        app.transfer_progress = 0.42;
+        app.transfer_done_bytes = Some(1024);
+        app.transfer_total_bytes = Some(2048);
+        app.sendme_had_transfer = true;
+        let (tx, rx) = mpsc::channel();
+        app.transfer_rx = Some(rx);
+        tx.send(TransferMsg::WaitingForReceiver)
+            .expect("send output");
+        drop(tx);
+
+        app.poll_transfer();
+
+        assert_eq!(app.transfer_state, TransferState::Completed);
+        assert!((app.transfer_progress - 1.0).abs() < f32::EPSILON);
+        assert_eq!(app.transfer_done_bytes, Some(2048));
+    }
+
+    #[test]
+    fn sendme_one_shot_waiting_banner_marks_complete_after_seen_transfer_flag() {
+        let mut app = DataBeamApp::default();
+        app.selected_tool = SelectedTool::Sendme;
+        app.view = AppView::Send;
+        app.transfer_state = TransferState::Running;
+        app.sendme_one_shot = true;
+        app.transfer_phase = TransferPhase::WaitingForReceiver;
+        app.sendme_had_transfer = true;
+        let (tx, rx) = mpsc::channel();
+        app.transfer_rx = Some(rx);
+        tx.send(TransferMsg::WaitingForReceiver)
+            .expect("send output");
+        drop(tx);
+
+        app.poll_transfer();
+
+        assert_eq!(app.transfer_state, TransferState::Completed);
+        assert!((app.transfer_progress - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn sendme_waiting_signal_does_not_complete_one_shot_before_transfer() {
+        let mut app = DataBeamApp::default();
+        app.selected_tool = SelectedTool::Sendme;
+        app.view = AppView::Send;
+        app.transfer_state = TransferState::Running;
+        app.sendme_one_shot = true;
+        app.transfer_phase = TransferPhase::Preparing;
+        let (tx, rx) = mpsc::channel();
+        app.transfer_rx = Some(rx);
+        tx.send(TransferMsg::WaitingForReceiver)
+            .expect("send waiting");
+        drop(tx);
+
+        app.poll_transfer();
+
+        assert_eq!(app.transfer_state, TransferState::Running);
+        assert_eq!(app.transfer_phase, TransferPhase::WaitingForReceiver);
+    }
+
+    #[test]
+    fn sendme_sender_activity_switches_to_transferring() {
+        let mut app = DataBeamApp::default();
+        app.selected_tool = SelectedTool::Sendme;
+        app.view = AppView::Send;
+        app.transfer_state = TransferState::Running;
+        app.sendme_one_shot = true;
+        app.transfer_phase = TransferPhase::WaitingForReceiver;
+        let (tx, rx) = mpsc::channel();
+        app.transfer_rx = Some(rx);
+        tx.send(TransferMsg::SenderTransferActivity)
+            .expect("send activity");
+        drop(tx);
+
+        app.poll_transfer();
+
+        assert_eq!(app.transfer_phase, TransferPhase::Transferring);
+        assert!(app.sendme_had_transfer);
+    }
+
+    #[test]
+    fn sendme_stale_activity_after_waiting_cycle_is_ignored() {
+        let mut app = DataBeamApp::default();
+        app.selected_tool = SelectedTool::Sendme;
+        app.view = AppView::Send;
+        app.transfer_state = TransferState::Running;
+        app.sendme_one_shot = false;
+        app.transfer_phase = TransferPhase::Transferring;
+        app.sendme_had_transfer = true;
+        let (tx, rx) = mpsc::channel();
+        app.transfer_rx = Some(rx);
+        tx.send(TransferMsg::WaitingForReceiver)
+            .expect("send waiting");
+        tx.send(TransferMsg::SenderTransferActivity)
+            .expect("send stale activity");
+        drop(tx);
+
+        app.poll_transfer();
+
+        assert_eq!(app.transfer_state, TransferState::Running);
+        assert_eq!(app.transfer_phase, TransferPhase::WaitingForReceiver);
+        assert!(!app.sendme_had_transfer);
+    }
+
+    #[test]
+    fn sendme_repeat_ticket_line_finishes_serve_cycle() {
+        let mut app = DataBeamApp::default();
+        app.selected_tool = SelectedTool::Sendme;
+        app.view = AppView::Send;
+        app.transfer_state = TransferState::Running;
+        app.sendme_one_shot = false;
+        app.transfer_phase = TransferPhase::Transferring;
+        app.sendme_had_transfer = true;
+        let (tx, rx) = mpsc::channel();
+        app.transfer_rx = Some(rx);
+        tx.send(TransferMsg::Output("sendme receive blobabc123".to_string()))
+            .expect("send output");
+        drop(tx);
+
+        app.poll_transfer();
+
+        assert_eq!(app.transfer_state, TransferState::Running);
+        assert_eq!(app.transfer_phase, TransferPhase::WaitingForReceiver);
+    }
+
+    #[test]
+    fn sendme_repeat_ticket_line_finishes_one_shot_cycle() {
+        let mut app = DataBeamApp::default();
+        app.selected_tool = SelectedTool::Sendme;
+        app.view = AppView::Send;
+        app.transfer_state = TransferState::Running;
+        app.sendme_one_shot = true;
+        app.transfer_phase = TransferPhase::Transferring;
+        app.sendme_had_transfer = true;
+        let (tx, rx) = mpsc::channel();
+        app.transfer_rx = Some(rx);
+        tx.send(TransferMsg::Output("to get this data, use".to_string()))
+            .expect("send output");
+        drop(tx);
+
+        app.poll_transfer();
+
+        assert_eq!(app.transfer_state, TransferState::Completed);
     }
 }
