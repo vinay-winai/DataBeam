@@ -1,9 +1,9 @@
 [package]
 name = "databeam"
-version = "0.1.7"
+version = "0.1.10"
 edition = "2021"
 description = "A beautiful GUI wrapper for croc and sendme file transfer tools"
-authors = ["DataBeam"]
+authors = ["DataBeam <databeam@users.noreply.github.com>"]
 
 [dependencies]
 eframe = { version = "0.31", features = ["persistence"] }
@@ -40,3 +40,17 @@ identifier = "com.vinaywinai.databeam"
 short_description = "Secure GUI wrapper for croc and sendme"
 category = "Productivity"
 copyright = "Copyright (c) DataBeam"
+linux_use_terminal = false
+deb_depends = [
+  "libasound2",
+  "libglib2.0-0",
+  "libgtk-3-0",
+  "libx11-6",
+  "libxcursor1",
+  "libxi6",
+  "libxkbcommon0",
+  "libxrandr2",
+  "libwayland-client0",
+  "libwayland-cursor0",
+  "libwayland-egl1",
+]

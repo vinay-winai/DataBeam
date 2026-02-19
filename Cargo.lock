@@ -813,7 +813,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "databeam"
-version = "0.1.7"
+version = "0.1.10"
 dependencies = [
  "dirs",
  "eframe",
