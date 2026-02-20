@@ -225,7 +225,8 @@ pub async fn download(
             dirs::download_dir().unwrap_or_else(|| std::env::current_dir().unwrap())
         });
 
-        export(&db, collection, &output_dir).await?;
+        emit_event(&app_handle, "receive-export-started");
+        export(&db, collection, &output_dir, &app_handle).await?;
 
         // Emit completion event AFTER everything is done
         emit_event(&app_handle, "receive-completed");
@@ -260,7 +261,7 @@ pub async fn download(
     })
 }
 
-async fn export(db: &Store, collection: Collection, output_dir: &Path) -> anyhow::Result<()> {
+async fn export(db: &Store, collection: Collection, output_dir: &Path, app_handle: &AppHandle) -> anyhow::Result<()> {
     for (_i, (name, hash)) in collection.iter().enumerate() {
         let target = get_export_path(output_dir, name)?;
         if target.exists() {
@@ -275,16 +276,26 @@ async fn export(db: &Store, collection: Collection, output_dir: &Path) -> anyhow
             .stream()
             .await;
 
+        let mut current_size = 0u64;
+        let mut last_log_offset = 0u64;
+
         while let Some(item) = stream.next().await {
             match item {
-                ExportProgressItem::Size(_size) => {
-                    // Skip progress updates for library version
+                ExportProgressItem::Size(size) => {
+                    current_size = size;
                 }
-                ExportProgressItem::CopyProgress(_offset) => {
-                    // Skip progress updates for library version
+                ExportProgressItem::CopyProgress(offset) => {
+                    if offset - last_log_offset > 1_000_000 {
+                        last_log_offset = offset;
+                        let payload = format!("{}:{}", offset, current_size);
+                        emit_event_with_payload(app_handle, "receive-export-progress", &payload);
+                    }
                 }
                 ExportProgressItem::Done => {
-                    // Export completed
+                    if current_size > 0 {
+                        let payload = format!("{}:{}", current_size, current_size);
+                        emit_event_with_payload(app_handle, "receive-export-progress", &payload);
+                    }
                 }
                 ExportProgressItem::Error(cause) => {
                     anyhow::bail!("error exporting {}: {}", name, cause);
@@ -415,3 +426,6 @@ fn show_get_error(e: GetError) -> GetError {
     }
     e
 }
+
+
+

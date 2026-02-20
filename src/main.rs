@@ -3030,7 +3030,11 @@ impl DataBeamApp {
                             TransferPhase::WaitingForReceiver => "Waiting for receiver…",
                             TransferPhase::Transferring => {
                                 if self.view == AppView::Receive {
-                                    "Downloading…"
+                                    if effective_progress >= 0.999 {
+                                        "Building and verifying content…"
+                                    } else {
+                                        "Downloading…"
+                                    }
                                 } else {
                                     "Transferring…"
                                 }

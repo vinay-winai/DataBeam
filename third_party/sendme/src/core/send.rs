@@ -460,16 +460,19 @@ async fn show_provide_progress_with_logging(
                             while let Ok(Some(update)) = rx.recv().await {
                                 match update {
                                     iroh_blobs::provider::events::RequestUpdate::Started(_m) => {
+                                        {
+                                            let mut states = transfer_states_task.lock().await;
+                                            states.entry((connection_id, request_id))
+                                                .and_modify(|s| s.last_offset = 0)
+                                                .or_insert(TransferState {
+                                                    start_time: Instant::now(),
+                                                    last_offset: 0,
+                                                });
+                                        }
+
                                         if !transfer_started {
                                             let active_count = {
-                                                let mut states = transfer_states_task.lock().await;
-                                                states.insert(
-                                                    (connection_id, request_id),
-                                                    TransferState {
-                                                        start_time: Instant::now(),
-                                                        last_offset: 0,
-                                                    }
-                                                );
+                                                let states = transfer_states_task.lock().await;
                                                 states.len()
                                             };
 
