@@ -1,4 +1,4 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+﻿#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod backend;
 mod theme;
 mod widgets;
@@ -145,6 +145,7 @@ struct DataBeamApp {
     animation_time: f64,
     drag_hover: bool,
     picker_block_until: f64,
+    picker_in_flight: bool,
     sendme_one_shot: bool,
     sendme_peer_connected: bool,
     sendme_had_transfer: bool,
@@ -160,6 +161,17 @@ struct DataBeamApp {
     sendme_sender_payload_complete: bool,
     last_done_speed_sample: Option<(f64, u64)>,
     initialized_once: bool,
+}
+
+impl Drop for DataBeamApp {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.transfer_handle {
+            handle.request_cancel();
+        }
+        if let Some(handle) = &self.eazysendme_croc_handle {
+            handle.request_cancel();
+        }
+    }
 }
 
 impl Default for DataBeamApp {
@@ -206,6 +218,7 @@ impl Default for DataBeamApp {
             animation_time: 0.0,
             drag_hover: false,
             picker_block_until: 0.0,
+            picker_in_flight: false,
             sendme_one_shot: true,
             sendme_peer_connected: false,
             sendme_had_transfer: false,
@@ -474,6 +487,12 @@ impl DataBeamApp {
     }
 
     fn reset_transfer(&mut self) {
+        if let Some(handle) = &self.transfer_handle {
+            handle.request_cancel();
+        }
+        if let Some(handle) = &self.eazysendme_croc_handle {
+            handle.request_cancel();
+        }
         self.transfer_state = TransferState::Idle;
         self.transfer_progress = 0.0;
         self.transfer_code = None;
@@ -503,6 +522,7 @@ impl DataBeamApp {
         self.sendme_waiting_after_cycle = false;
         self.sendme_last_activity = None;
         self.picker_block_until = 0.0;
+        self.picker_in_flight = false;
         self.sendme_total_items = None;
         self.sendme_done_bytes_est = 0;
         self.sendme_item_progress.clear();
@@ -966,7 +986,7 @@ impl DataBeamApp {
             let max_msgs_per_frame = if self.selected_tool == SelectedTool::Sendme
                 || self.selected_tool == SelectedTool::EazySendme
             {
-                4000
+                600
             } else {
                 800
             };
@@ -1427,6 +1447,14 @@ impl DataBeamApp {
                                     // start a fresh sendme process instead of failing the UI.
                                     restart_sendme_serve = true;
                                     break;
+                                } else if e == "Sendme transfer failed on sender side"
+                                    && (self.selected_tool == SelectedTool::Sendme
+                                        || self.selected_tool == SelectedTool::EazySendme)
+                                    && !self.sendme_one_shot
+                                {
+                                    // Serve mode: non-fatal per-cycle sender failure, restart cleanly.
+                                    restart_sendme_serve = true;
+                                    break;
                                 } else {
                                     self.transfer_state = TransferState::Failed(e);
                                     self.transfer_end_time = Some(self.animation_time);
@@ -1563,6 +1591,20 @@ impl DataBeamApp {
                 .filter_map(|f| f.path.clone())
                 .collect()
         });
+        let dropped = if dropped.is_empty() {
+            ctx.input(|i| {
+                i.events
+                    .iter()
+                    .filter_map(|e| match e {
+                        egui::Event::Paste(s) if s.contains("file://") => Some(s.as_str()),
+                        _ => None,
+                    })
+                    .flat_map(parse_file_uri_list)
+                    .collect::<Vec<PathBuf>>()
+            })
+        } else {
+            dropped
+        };
 
         if !dropped.is_empty() {
             if self.view != AppView::Send {
@@ -1600,15 +1642,16 @@ impl DataBeamApp {
         self.reset_transfer();
         let known_total = self.known_total_size();
 
-        let tool = match self.selected_tool {
-            SelectedTool::Croc => Tool::Croc,
-            SelectedTool::Sendme | SelectedTool::EazySendme => Tool::Sendme,
-        };
-        let binary = match self.get_tool_binary(&tool) {
-            Some(b) => b,
-            None => {
-                self.show_toast("Tool not found".to_string(), ERROR);
-                return;
+        let binary = match self.selected_tool {
+            SelectedTool::Croc => match self.get_tool_binary(&Tool::Croc) {
+                Some(b) => b,
+                None => {
+                    self.show_toast("Croc not found".to_string(), ERROR);
+                    return;
+                }
+            },
+            SelectedTool::Sendme | SelectedTool::EazySendme => {
+                self.get_tool_binary(&Tool::Sendme).unwrap_or_default()
             }
         };
 
@@ -1665,6 +1708,7 @@ impl DataBeamApp {
             SelectedTool::Sendme => {
                 let opts = SendmeSendOptions {
                     paths: self.send_paths(),
+                    one_shot: self.sendme_one_shot,
                 };
                 let (rx, handle) = sendme_send(opts, &binary);
                 self.transfer_rx = Some(rx);
@@ -1682,6 +1726,7 @@ impl DataBeamApp {
 
                 let opts = SendmeSendOptions {
                     paths: self.send_paths(),
+                    one_shot: true,
                 };
                 let (rx, handle) = sendme_send(opts, &binary);
                 self.transfer_rx = Some(rx);
@@ -1702,16 +1747,16 @@ impl DataBeamApp {
 
         self.reset_transfer();
 
-        let tool = match self.selected_tool {
-            SelectedTool::Croc | SelectedTool::EazySendme => Tool::Croc,
-            SelectedTool::Sendme => Tool::Sendme,
-        };
-        let binary = match self.get_tool_binary(&tool) {
-            Some(b) => b,
-            None => {
-                self.show_toast("Tool not found".to_string(), ERROR);
-                return;
-            }
+        let binary = match self.selected_tool {
+            SelectedTool::Croc | SelectedTool::EazySendme => match self.get_tool_binary(&Tool::Croc)
+            {
+                Some(b) => b,
+                None => {
+                    self.show_toast("Croc not found".to_string(), ERROR);
+                    return;
+                }
+            },
+            SelectedTool::Sendme => self.get_tool_binary(&Tool::Sendme).unwrap_or_default(),
         };
 
         match self.selected_tool {
@@ -2456,31 +2501,42 @@ impl DataBeamApp {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let accent = self.engine_color();
-                    let picker_ready = self.animation_time >= self.picker_block_until;
+                    let picker_ready =
+                        !self.picker_in_flight && self.animation_time >= self.picker_block_until;
+                    let mut picker_used_this_frame = false;
                     // Add buttons specific to folders/files
                     if !send_locked
                         && !croc_text_mode
                         && picker_ready
+                        && !picker_used_this_frame
                         && accent_button_sized(ui, "+ Folder", accent, Vec2::new(70.0, 22.0))
                             .clicked()
                     {
-                        self.picker_block_until = self.animation_time + 0.35;
+                        self.picker_in_flight = true;
+                        self.picker_block_until = self.animation_time + 0.8;
                         if let Some(p) = rfd::FileDialog::new().pick_folder() {
                             self.add_path(p);
                         }
+                        self.picker_in_flight = false;
+                        self.picker_block_until = self.animation_time + 0.5;
+                        picker_used_this_frame = true;
                     }
                     if !send_locked
                         && !croc_text_mode
                         && picker_ready
+                        && !picker_used_this_frame
                         && accent_button_sized(ui, "+ File", accent, Vec2::new(60.0, 22.0))
                             .clicked()
                     {
-                        self.picker_block_until = self.animation_time + 0.35;
+                        self.picker_in_flight = true;
+                        self.picker_block_until = self.animation_time + 0.8;
                         if let Some(paths) = rfd::FileDialog::new().pick_files() {
                             for p in paths {
                                 self.add_path(p);
                             }
                         }
+                        self.picker_in_flight = false;
+                        self.picker_block_until = self.animation_time + 0.5;
                     }
                     match self.send_items.is_empty() {
                         true => {} // No clear button if empty
@@ -2970,13 +3026,7 @@ impl DataBeamApp {
                         );
 
                         let status_text = match self.transfer_phase {
-                            TransferPhase::Preparing => {
-                                if sendme_serve_mode {
-                                    "Waiting for receiver…"
-                                } else {
-                                    "Preparing…"
-                                }
-                            }
+                            TransferPhase::Preparing => "Preparing…",
                             TransferPhase::WaitingForReceiver => "Waiting for receiver…",
                             TransferPhase::Transferring => {
                                 if self.view == AppView::Receive {
@@ -3001,7 +3051,10 @@ impl DataBeamApp {
                     });
                     ui.add_space(4.0);
 
-                    if !sendme_serve_mode || self.transfer_phase == TransferPhase::Transferring {
+                    if !sendme_serve_mode
+                        || self.transfer_phase == TransferPhase::Transferring
+                        || self.transfer_phase == TransferPhase::Preparing
+                    {
                         if self.transfer_phase == TransferPhase::Transferring {
                             animated_progress_bar(ui, effective_progress, accent);
                         } else {
@@ -3825,6 +3878,61 @@ fn is_probable_croc_text_payload_line(line: &str) -> bool {
     !looks_like_status
 }
 
+fn parse_file_uri_list(text: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if !line.starts_with("file://") {
+            continue;
+        }
+        let uri_body = line
+            .strip_prefix("file://")
+            .unwrap_or("")
+            .split('#')
+            .next()
+            .unwrap_or("");
+        if uri_body.is_empty() {
+            continue;
+        }
+        let decoded = percent_decode_uri_component(uri_body);
+        #[cfg(target_os = "windows")]
+        let path = {
+            // file:///C:/path -> C:/path
+            let p = decoded.trim_start_matches('/');
+            PathBuf::from(p)
+        };
+        #[cfg(not(target_os = "windows"))]
+        let path = PathBuf::from(decoded);
+        if path.exists() {
+            out.push(path);
+        }
+    }
+    out
+}
+
+fn percent_decode_uri_component(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let h1 = (bytes[i + 1] as char).to_digit(16);
+            let h2 = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(a), Some(b)) = (h1, h2) {
+                out.push(((a << 4) as u8) | (b as u8));
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
 fn format_file_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
@@ -4416,3 +4524,4 @@ mod parse_tests {
         assert_eq!(app.transfer_state, TransferState::Completed);
     }
 }
+

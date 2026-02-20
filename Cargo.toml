@@ -23,6 +23,8 @@ tar = "0.4"
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
 qrcode = "0.14"
 portable-pty = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+sendme_native = { package = "sendme", path = "third_party/sendme", default-features = false }
 
 [profile.release]
 opt-level = "z"

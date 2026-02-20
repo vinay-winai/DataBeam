@@ -9,9 +9,16 @@ use std::sync::{
     Arc,
 };
 use std::thread;
+use std::time::{Duration, Instant};
 
 use flate2::read::GzDecoder;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use sendme_native::{
+    download as native_sendme_download, start_share as native_sendme_start_share,
+    AddrInfoOptions as NativeAddrInfoOptions, AppHandle as NativeSendmeAppHandle,
+    EventEmitter as NativeSendmeEventEmitter, ReceiveOptions as NativeReceiveOptions,
+    RelayModeOption as NativeRelayModeOption, SendOptions as NativeSendOptions,
+};
 use serde::Deserialize;
 
 #[cfg(target_os = "windows")]
@@ -532,12 +539,126 @@ pub struct CrocReceiveOptions {
 #[derive(Debug, Clone)]
 pub struct SendmeSendOptions {
     pub paths: Vec<PathBuf>,
+    pub one_shot: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct SendmeReceiveOptions {
     pub ticket: String,
     pub output_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+enum NativeSendmeEvent {
+    TransferStarted,
+    TransferProgress {
+        done: u64,
+        total: u64,
+        speed_bps: f64,
+    },
+    TransferCompleted,
+    TransferFailed,
+    ActiveConnectionCount(usize),
+    ReceiveStarted,
+    ReceiveProgress {
+        done: u64,
+        total: u64,
+        speed_bps: f64,
+    },
+    ReceiveCompleted,
+}
+
+#[derive(Clone)]
+struct NativeSendmeEmitter {
+    tx: mpsc::Sender<NativeSendmeEvent>,
+}
+
+impl NativeSendmeEmitter {
+    fn new(tx: mpsc::Sender<NativeSendmeEvent>) -> Self {
+        Self { tx }
+    }
+}
+
+impl NativeSendmeEventEmitter for NativeSendmeEmitter {
+    fn emit_event(&self, event_name: &str) -> Result<(), String> {
+        let evt = match event_name {
+            "transfer-started" => NativeSendmeEvent::TransferStarted,
+            "transfer-completed" => NativeSendmeEvent::TransferCompleted,
+            "transfer-failed" => NativeSendmeEvent::TransferFailed,
+            "receive-started" => NativeSendmeEvent::ReceiveStarted,
+            "receive-completed" => NativeSendmeEvent::ReceiveCompleted,
+            _ => return Ok(()),
+        };
+        self.tx
+            .send(evt)
+            .map_err(|e| format!("native event channel closed: {e}"))
+    }
+
+    fn emit_event_with_payload(&self, event_name: &str, payload: &str) -> Result<(), String> {
+        let evt = match event_name {
+            "transfer-progress" => {
+                let Some((done, total, speed_bps)) = parse_native_progress_payload(payload) else {
+                    return Ok(());
+                };
+                NativeSendmeEvent::TransferProgress {
+                    done,
+                    total,
+                    speed_bps,
+                }
+            }
+            "receive-progress" => {
+                let Some((done, total, speed_bps)) = parse_native_progress_payload(payload) else {
+                    return Ok(());
+                };
+                NativeSendmeEvent::ReceiveProgress {
+                    done,
+                    total,
+                    speed_bps,
+                }
+            }
+            "active-connection-count" => {
+                let count = payload.trim().parse::<usize>().unwrap_or(0);
+                NativeSendmeEvent::ActiveConnectionCount(count)
+            }
+            _ => return Ok(()),
+        };
+        self.tx
+            .send(evt)
+            .map_err(|e| format!("native event channel closed: {e}"))
+    }
+}
+
+fn parse_native_progress_payload(payload: &str) -> Option<(u64, u64, f64)> {
+    let mut parts = payload.split(':');
+    let done = parts.next()?.trim().parse::<u64>().ok()?;
+    let total = parts.next()?.trim().parse::<u64>().ok()?;
+    let speed_scaled = parts.next()?.trim().parse::<i64>().ok()?;
+    let speed_bps = (speed_scaled as f64) / 1000.0;
+    Some((done, total, speed_bps))
+}
+
+fn format_size_unit(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.2} GiB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.2} MiB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.2} KiB", b / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn format_speed_unit(speed_bps: f64) -> String {
+    if speed_bps <= 0.0 {
+        return "0 B/s".to_string();
+    }
+    let speed = speed_bps.round().max(0.0) as u64;
+    format!("{}/s", format_size_unit(speed))
 }
 
 // ── Byte-level reader for \r-delimited progress ────────────────────
@@ -578,6 +699,7 @@ fn read_lines_cr_aware(
     }
 }
 
+#[allow(dead_code)]
 fn run_sendme_with_pty(
     binary: &str,
     args: &[String],
@@ -822,14 +944,12 @@ pub fn croc_receive(
 
 pub fn sendme_send(
     opts: SendmeSendOptions,
-    binary_path: &str,
+    _binary_path: &str,
 ) -> (mpsc::Receiver<TransferMsg>, ProcessHandle) {
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel2 = cancel.clone();
     let child_pid = Arc::new(std::sync::Mutex::new(None));
-    let pid_handle = child_pid.clone();
-    let binary = binary_path.to_string();
 
     let _worker = thread::spawn(move || {
         // Determine what to send: single item directly, multiple items via staging dir
@@ -846,118 +966,282 @@ pub fn sendme_send(
             }
         };
 
-        let temp_dir = std::env::temp_dir().join(format!(
-            "databeam_sendme_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        if let Err(e) = fs::create_dir_all(&temp_dir) {
-            let _ = tx.send(TransferMsg::Error(format!(
-                "Failed to prepare runtime directory: {}",
-                e
-            )));
-            return;
-        }
         let _ = tx.send(TransferMsg::Started);
 
-        let send_args = vec![
-            "send".to_string(),
-            "-v".to_string(),
-            send_path.to_string_lossy().to_string(),
-        ];
-        let pty_result = run_sendme_with_pty(
-            &binary,
-            &send_args,
-            &temp_dir,
-            Some(&temp_dir),
-            &tx,
-            cancel2.clone(),
-            pid_handle.clone(),
-            parse_sendme_send_output,
-        );
-
-        let status = match pty_result {
-            Ok(status) => Some(status),
-            Err(_) => {
-                let mut cmd = new_hidden_command(&binary);
-                cmd.env("RUST_LOG", "info");
-                cmd.env("IROH_DATA_DIR", &temp_dir);
-                cmd.arg("send");
-                cmd.arg("-v");
-                cmd.arg(&send_path);
-                cmd.current_dir(&temp_dir);
-                cmd.stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-
-                match cmd.spawn() {
-                    Ok(mut child) => {
-                        if let Ok(mut guard) = pid_handle.lock() {
-                            *guard = Some(child.id());
-                        }
-
-                        let stderr = child.stderr.take();
-                        let stdout = child.stdout.take();
-
-                        let tx2 = tx.clone();
-                        let c2 = cancel2.clone();
-                        if let Some(stderr) = stderr {
-                            thread::spawn(move || {
-                                read_lines_cr_aware(stderr, tx2, parse_sendme_send_output, c2);
-                            });
-                        }
-
-                        let tx3 = tx.clone();
-                        let c3 = cancel2.clone();
-                        if let Some(stdout) = stdout {
-                            thread::spawn(move || {
-                                read_lines_cr_aware(stdout, tx3, parse_sendme_send_output, c3);
-                            });
-                        }
-
-                        match child.wait() {
-                            Ok(exit) => Some((exit.success(), format!("{exit}"))),
-                            Err(e) => {
-                                let _ =
-                                    tx.send(TransferMsg::Error(format!("Process error: {}", e)));
-                                None
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let _ =
-                            tx.send(TransferMsg::Error(format!("Failed to start sendme: {}", e)));
-                        None
-                    }
-                }
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                let _ = tx.send(TransferMsg::Error(format!(
+                    "Failed to create native sendme runtime: {}",
+                    e
+                )));
+                return;
             }
         };
 
-        if cancel2.load(Ordering::Relaxed) {
-            let _ = tx.send(TransferMsg::Error("Transfer cancelled".to_string()));
-            cleanup_sendme_send_dirs(
-                &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            );
-            cleanup_runtime_dir(&temp_dir);
-            return;
-        }
+        let (evt_tx, evt_rx) = mpsc::channel::<NativeSendmeEvent>();
+        let app_handle: NativeSendmeAppHandle = Some(Arc::new(NativeSendmeEmitter::new(evt_tx)));
+        let share = runtime.block_on(native_sendme_start_share(
+            send_path.clone(),
+            NativeSendOptions {
+                relay_mode: NativeRelayModeOption::Default,
+                ticket_type: NativeAddrInfoOptions::RelayAndAddresses,
+                magic_ipv4_addr: None,
+                magic_ipv6_addr: None,
+            },
+            app_handle,
+        ));
 
-        if let Some((success, status_text)) = status {
-            if success {
-                let _ = tx.send(TransferMsg::PeerDisconnected);
-            } else {
-                let _ = tx.send(TransferMsg::Error(format!(
-                    "Send session ended with status: {}",
-                    status_text
-                )));
+        let share = match share {
+            Ok(result) => result,
+            Err(e) => {
+                let _ = tx.send(TransferMsg::Error(format!("Failed to start sendme: {}", e)));
+                return;
+            }
+        };
+
+        let _ = tx.send(TransferMsg::Code(share.ticket.clone()));
+        let _ = tx.send(TransferMsg::Output(format!("sendme receive {}", share.ticket)));
+        let _ = tx.send(TransferMsg::WaitingForReceiver);
+
+        let mut had_transfer = false;
+        let mut sender_activity_emitted = false;
+        let mut last_progress_emit = Instant::now();
+        let mut sender_progress_max: f32 = 0.0;
+        let mut last_logged_done: u64 = 0;
+        let mut last_seen_total: u64 = 0;
+        let mut last_seen_speed_bps: f64 = 0.0;
+        let mut sender_rollover_base: u64 = 0;
+        let mut sender_prev_done_raw: u64 = 0;
+        let mut sender_segment_max: u64 = 0;
+        let mut waiting_for_new_connection = false;
+        let mut waiting_seen_zero_connections = false;
+        loop {
+            if cancel2.load(Ordering::Relaxed) {
+                let _ = tx.send(TransferMsg::Error("Transfer cancelled".to_string()));
+                break;
+            }
+
+            match evt_rx.recv_timeout(Duration::from_millis(150)) {
+                Ok(NativeSendmeEvent::TransferStarted) => {
+                    if !opts.one_shot && waiting_for_new_connection {
+                        // Wait for an explicit 0 -> >0 connection edge before accepting a new cycle.
+                        continue;
+                    }
+                    had_transfer = true;
+                    if !sender_activity_emitted {
+                        let _ = tx.send(TransferMsg::SenderTransferActivity);
+                        sender_activity_emitted = true;
+                        let _ = tx.send(TransferMsg::Progress(0.0));
+                    }
+                }
+                Ok(NativeSendmeEvent::TransferProgress {
+                    done,
+                    total,
+                    speed_bps,
+                }) => {
+                    if !opts.one_shot && waiting_for_new_connection {
+                        // Ignore late/straggler progress events from a finished serve cycle.
+                        continue;
+                    }
+                    had_transfer = true;
+                    if !sender_activity_emitted {
+                        let _ = tx.send(TransferMsg::SenderTransferActivity);
+                        sender_activity_emitted = true;
+                    }
+                    let raw_done = done.min(total.max(done));
+                    if total > 0 {
+                        if sender_prev_done_raw > 0
+                            && raw_done < sender_prev_done_raw / 2
+                            && sender_segment_max > 0
+                        {
+                            // Per-segment rollover (common for folder/multi-item sends).
+                            sender_rollover_base =
+                                sender_rollover_base.saturating_add(sender_segment_max);
+                            sender_segment_max = raw_done;
+                        } else if raw_done == 0 && sender_prev_done_raw > 0 && sender_segment_max > 0
+                        {
+                            sender_rollover_base =
+                                sender_rollover_base.saturating_add(sender_segment_max);
+                            sender_segment_max = 0;
+                        } else if raw_done > sender_segment_max {
+                            sender_segment_max = raw_done;
+                        }
+                    }
+                    sender_prev_done_raw = raw_done;
+                    let mut shown_done = if total > 0 {
+                        sender_rollover_base.saturating_add(raw_done).min(total)
+                    } else {
+                        raw_done
+                    };
+                    last_seen_total = total.max(shown_done).max(1);
+                    last_seen_speed_bps = speed_bps;
+                    if total > 0 && shown_done >= total {
+                        shown_done = total.saturating_sub(1);
+                    }
+                    if total > 0 {
+                        let progress = (shown_done.min(total) as f32 / total as f32).clamp(0.0, 1.0);
+                        if progress > sender_progress_max {
+                            sender_progress_max = progress;
+                            let _ = tx.send(TransferMsg::Progress(sender_progress_max));
+                        }
+                    }
+
+                    let should_log = shown_done > last_logged_done || shown_done == 0;
+                    if should_log && last_progress_emit.elapsed() >= Duration::from_millis(200) {
+                        let shown_total = total.max(shown_done).max(1);
+                        let pct = if total > 0 {
+                            (shown_done.min(total) as f64 / total as f64 * 100.0).clamp(0.0, 100.0)
+                        } else {
+                            0.0
+                        };
+                        let line = format!(
+                            "Sender progress {:.1}% (done {} total {}) {}",
+                            pct,
+                            shown_done,
+                            shown_total,
+                            format_speed_unit(speed_bps)
+                        );
+                        let _ = tx.send(TransferMsg::Output(line));
+                        last_logged_done = shown_done;
+                        last_progress_emit = Instant::now();
+                    }
+                }
+                Ok(NativeSendmeEvent::ActiveConnectionCount(count)) => {
+                    if !opts.one_shot && waiting_for_new_connection {
+                        if count == 0 {
+                            waiting_seen_zero_connections = true;
+                        } else if waiting_seen_zero_connections {
+                            // Fresh receiver connected after idle.
+                            waiting_for_new_connection = false;
+                            waiting_seen_zero_connections = false;
+                            had_transfer = true;
+                            if !sender_activity_emitted {
+                                let _ = tx.send(TransferMsg::SenderTransferActivity);
+                                sender_activity_emitted = true;
+                            }
+                        }
+                        continue;
+                    }
+                    if count > 0 {
+                        had_transfer = true;
+                        if !sender_activity_emitted {
+                            let _ = tx.send(TransferMsg::SenderTransferActivity);
+                            sender_activity_emitted = true;
+                        }
+                    }
+                }
+                Ok(NativeSendmeEvent::TransferCompleted) => {
+                    if last_seen_total > 0 {
+                        let final_line = format!(
+                            "Sender progress 100.0% (done {} total {}) {}",
+                            last_seen_total,
+                            last_seen_total,
+                            format_speed_unit(last_seen_speed_bps)
+                        );
+                        let _ = tx.send(TransferMsg::Output(final_line));
+                    }
+                    let _ = tx.send(TransferMsg::Progress(1.0));
+                    let _ = tx.send(TransferMsg::Output("finished sending to client".to_string()));
+                    if opts.one_shot {
+                        let _ = tx.send(TransferMsg::PeerDisconnected);
+                        break;
+                    } else {
+                        let _ = tx.send(TransferMsg::WaitingForReceiver);
+                        waiting_for_new_connection = true;
+                        waiting_seen_zero_connections = false;
+                        had_transfer = false;
+                        sender_activity_emitted = false;
+                        sender_progress_max = 0.0;
+                        last_logged_done = 0;
+                        last_seen_total = 0;
+                        last_seen_speed_bps = 0.0;
+                        sender_rollover_base = 0;
+                        sender_prev_done_raw = 0;
+                        sender_segment_max = 0;
+                    }
+                }
+                Ok(NativeSendmeEvent::TransferFailed) => {
+                    if opts.one_shot {
+                        if had_transfer {
+                            let _ = tx.send(TransferMsg::PeerDisconnected);
+                        } else {
+                            let _ = tx.send(TransferMsg::Error(
+                                "Sendme transfer failed on sender side".to_string(),
+                            ));
+                        }
+                        break;
+                    } else {
+                        if waiting_for_new_connection {
+                            // Late abort notification after a completed cycle; keep serving silently.
+                            continue;
+                        }
+                        let _ = tx.send(TransferMsg::Output(
+                            "sender cycle ended unexpectedly; waiting for receiver".to_string(),
+                        ));
+                        let _ = tx.send(TransferMsg::WaitingForReceiver);
+                        waiting_for_new_connection = true;
+                        waiting_seen_zero_connections = false;
+                        had_transfer = false;
+                        sender_activity_emitted = false;
+                        sender_progress_max = 0.0;
+                        last_logged_done = 0;
+                        last_seen_total = 0;
+                        last_seen_speed_bps = 0.0;
+                        sender_rollover_base = 0;
+                        sender_prev_done_raw = 0;
+                        sender_segment_max = 0;
+                        continue;
+                    }
+                }
+                Ok(NativeSendmeEvent::ReceiveStarted)
+                | Ok(NativeSendmeEvent::ReceiveProgress { .. })
+                | Ok(NativeSendmeEvent::ReceiveCompleted) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    if opts.one_shot {
+                        if had_transfer {
+                            let _ = tx.send(TransferMsg::PeerDisconnected);
+                        } else {
+                            let _ = tx.send(TransferMsg::Error(
+                                "Send session ended before transfer started".to_string(),
+                            ));
+                        }
+                        break;
+                    } else {
+                        if waiting_for_new_connection {
+                            // Event channel can close between serve cycles; don't treat as failure.
+                            continue;
+                        }
+                        let _ = tx.send(TransferMsg::Output(
+                            "sender event stream ended; waiting for receiver".to_string(),
+                        ));
+                        let _ = tx.send(TransferMsg::WaitingForReceiver);
+                        waiting_for_new_connection = true;
+                        waiting_seen_zero_connections = false;
+                        had_transfer = false;
+                        sender_activity_emitted = false;
+                        sender_progress_max = 0.0;
+                        last_logged_done = 0;
+                        last_seen_total = 0;
+                        last_seen_speed_bps = 0.0;
+                        sender_rollover_base = 0;
+                        sender_prev_done_raw = 0;
+                        sender_segment_max = 0;
+                        thread::sleep(Duration::from_millis(200));
+                        continue;
+                    }
+                }
             }
         }
 
+        let _ = fs::remove_dir_all(&share.blobs_data_dir);
         cleanup_sendme_send_dirs(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-        cleanup_runtime_dir(&temp_dir);
-        // _staging_dir is dropped here, cleaning up the temp directory
+        cleanup_sendme_temp_artifacts();
+        // _staging_dir is dropped here, cleaning up any temporary staging directory.
     });
 
     (rx, ProcessHandle { cancel, child_pid })
@@ -1009,6 +1293,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn cleanup_runtime_dir(path: &Path) {
     let _ = fs::remove_dir_all(path);
 }
@@ -1032,6 +1317,32 @@ fn cleanup_sendme_send_dirs(base_dir: &Path) {
     }
 }
 
+fn cleanup_sendme_temp_artifacts() {
+    let temp_base = std::env::temp_dir();
+    let Ok(entries) = fs::read_dir(&temp_base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let managed = name.starts_with(".sendme-send-")
+            || name.starts_with(".sendme-recv-")
+            || name.starts_with("databeam_sendme_")
+            || name.starts_with("databeam_sendme_recv_");
+        if !managed {
+            continue;
+        }
+        if path.is_dir() {
+            let _ = fs::remove_dir_all(path);
+        } else {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+#[allow(dead_code)]
 fn cleanup_sendme_receive_artifacts(base_dir: &Path) {
     let Ok(entries) = fs::read_dir(base_dir) else {
         return;
@@ -1058,129 +1369,120 @@ fn cleanup_sendme_receive_artifacts(base_dir: &Path) {
 
 pub fn sendme_receive(
     opts: SendmeReceiveOptions,
-    binary_path: &str,
+    _binary_path: &str,
 ) -> (mpsc::Receiver<TransferMsg>, ProcessHandle) {
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel2 = cancel.clone();
     let child_pid = Arc::new(std::sync::Mutex::new(None));
-    let pid_handle = child_pid.clone();
-    let binary = binary_path.to_string();
 
     let _worker = thread::spawn(move || {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "databeam_sendme_recv_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        if let Err(e) = fs::create_dir_all(&temp_dir) {
-            let _ = tx.send(TransferMsg::Error(format!(
-                "Failed to prepare runtime directory: {}",
-                e
-            )));
-            return;
-        }
         let _ = tx.send(TransferMsg::Started);
 
-        let recv_args = vec!["receive".to_string(), "-v".to_string(), opts.ticket.clone()];
-        let pty_result = run_sendme_with_pty(
-            &binary,
-            &recv_args,
-            &temp_dir,
-            opts.output_dir.as_deref(),
-            &tx,
-            cancel2.clone(),
-            pid_handle.clone(),
-            parse_sendme_receive_output,
-        );
-
-        let status = match pty_result {
-            Ok(status) => Some(status),
-            Err(_) => {
-                let mut cmd = new_hidden_command(&binary);
-                cmd.env("RUST_LOG", "info");
-                cmd.env("IROH_DATA_DIR", &temp_dir);
-                cmd.arg("receive");
-                cmd.arg("-v");
-                cmd.arg(&opts.ticket);
-                if let Some(dir) = &opts.output_dir {
-                    cmd.current_dir(dir);
-                }
-                cmd.stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-
-                match cmd.spawn() {
-                    Ok(mut child) => {
-                        if let Ok(mut guard) = pid_handle.lock() {
-                            *guard = Some(child.id());
-                        }
-
-                        let stderr = child.stderr.take();
-                        let stdout = child.stdout.take();
-
-                        let tx2 = tx.clone();
-                        let c2 = cancel2.clone();
-                        if let Some(stderr) = stderr {
-                            thread::spawn(move || {
-                                read_lines_cr_aware(stderr, tx2, parse_sendme_receive_output, c2);
-                            });
-                        }
-
-                        let tx3 = tx.clone();
-                        let c3 = cancel2.clone();
-                        if let Some(stdout) = stdout {
-                            thread::spawn(move || {
-                                read_lines_cr_aware(stdout, tx3, parse_sendme_receive_output, c3);
-                            });
-                        }
-
-                        match child.wait() {
-                            Ok(exit) => Some((exit.success(), format!("{exit}"))),
-                            Err(e) => {
-                                let _ =
-                                    tx.send(TransferMsg::Error(format!("Process error: {}", e)));
-                                None
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let _ =
-                            tx.send(TransferMsg::Error(format!("Failed to start sendme: {}", e)));
-                        None
-                    }
-                }
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                let _ = tx.send(TransferMsg::Error(format!(
+                    "Failed to create native sendme runtime: {}",
+                    e
+                )));
+                return;
             }
         };
 
-        if cancel2.load(Ordering::Relaxed) {
-            let _ = tx.send(TransferMsg::Error("Transfer cancelled".to_string()));
-            cleanup_runtime_dir(&temp_dir);
-            return;
-        }
+        let (evt_tx, evt_rx) = mpsc::channel::<NativeSendmeEvent>();
+        let app_handle: NativeSendmeAppHandle = Some(Arc::new(NativeSendmeEmitter::new(evt_tx)));
+        let task = runtime.spawn(native_sendme_download(
+            opts.ticket.clone(),
+            NativeReceiveOptions {
+                output_dir: opts.output_dir.clone(),
+                relay_mode: NativeRelayModeOption::Default,
+                magic_ipv4_addr: None,
+                magic_ipv6_addr: None,
+            },
+            app_handle,
+        ));
 
-        if let Some((success, status_text)) = status {
-            if success {
-                let _ = tx.send(TransferMsg::Progress(1.0));
-                let _ = tx.send(TransferMsg::Completed);
-            } else {
-                let _ = tx.send(TransferMsg::Error(format!(
-                    "Receive session ended with status: {}",
-                    status_text
-                )));
+        loop {
+            if cancel2.load(Ordering::Relaxed) {
+                task.abort();
+                let _ = tx.send(TransferMsg::Error("Transfer cancelled".to_string()));
+                cleanup_sendme_temp_artifacts();
+                return;
+            }
+
+            match evt_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(NativeSendmeEvent::ReceiveStarted) => {
+                    let _ = tx.send(TransferMsg::Output("[2/4] Downloading...".to_string()));
+                }
+                Ok(NativeSendmeEvent::ReceiveProgress {
+                    done,
+                    total,
+                    speed_bps,
+                }) => {
+                    if total > 0 {
+                        let progress = (done as f32 / total as f32).clamp(0.0, 1.0);
+                        let _ = tx.send(TransferMsg::Progress(progress));
+                    }
+                    let _ = tx.send(TransferMsg::Output(format!(
+                        "[3/4] Downloading ... {} / {} {}",
+                        format_size_unit(done),
+                        format_size_unit(total.max(done).max(1)),
+                        format_speed_unit(speed_bps)
+                    )));
+                    let _ = tx.send(TransferMsg::Output(format!(
+                        "n native r {}/{} i 0 # recv",
+                        done,
+                        total.max(done).max(1)
+                    )));
+                }
+                Ok(NativeSendmeEvent::ReceiveCompleted) => {
+                    let _ = tx.send(TransferMsg::Progress(1.0));
+                }
+                Ok(NativeSendmeEvent::TransferStarted)
+                | Ok(NativeSendmeEvent::TransferProgress { .. })
+                | Ok(NativeSendmeEvent::TransferCompleted)
+                | Ok(NativeSendmeEvent::TransferFailed)
+                | Ok(NativeSendmeEvent::ActiveConnectionCount(_)) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {}
+            }
+
+            if task.is_finished() {
+                break;
             }
         }
 
-        if let Some(out) = &opts.output_dir {
-            cleanup_sendme_receive_artifacts(&PathBuf::from(out));
-        } else {
-            cleanup_sendme_receive_artifacts(
-                &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            );
+        while let Ok(evt) = evt_rx.try_recv() {
+            if let NativeSendmeEvent::ReceiveProgress { done, total, .. } = evt {
+                if total > 0 {
+                    let progress = (done as f32 / total as f32).clamp(0.0, 1.0);
+                    let _ = tx.send(TransferMsg::Progress(progress));
+                }
+            }
         }
-        cleanup_runtime_dir(&temp_dir);
+
+        let result = runtime.block_on(async move { task.await });
+        match result {
+            Ok(Ok(receive)) => {
+                let _ = tx.send(TransferMsg::Output(receive.message.to_lowercase()));
+                let _ = tx.send(TransferMsg::Progress(1.0));
+                let _ = tx.send(TransferMsg::Completed);
+            }
+            Ok(Err(e)) => {
+                let _ = tx.send(TransferMsg::Error(format!("{e}")));
+            }
+            Err(e) => {
+                let _ = tx.send(TransferMsg::Error(format!(
+                    "Receive task ended unexpectedly: {}",
+                    e
+                )));
+            }
+        }
+        cleanup_sendme_temp_artifacts();
     });
 
     (rx, ProcessHandle { cancel, child_pid })
@@ -1193,21 +1495,6 @@ fn parse_croc_output(line: &str, tx: &mpsc::Sender<TransferMsg>) {
     let trimmed = cleaned.trim();
     if trimmed.is_empty() {
         return;
-    }
-
-    // Detect known errors
-    let lower = trimmed.to_lowercase();
-    if lower.contains("error") || lower.contains("failed") {
-        if lower.contains("could not connect") || lower.contains("connection refused") {
-            let _ = tx.send(TransferMsg::Error(
-                "Connection failed — check your network and ensure the relay is reachable"
-                    .to_string(),
-            ));
-        } else if lower.contains("bad code") || lower.contains("invalid code") {
-            let _ = tx.send(TransferMsg::Error(
-                "Invalid code — double-check the transfer code and try again".to_string(),
-            ));
-        }
     }
 
     if let Some(code) = extract_croc_code(trimmed) {
@@ -1250,6 +1537,7 @@ fn extract_croc_code(trimmed: &str) -> Option<String> {
     None
 }
 
+#[allow(dead_code)]
 fn parse_sendme_common(line: &str, tx: &mpsc::Sender<TransferMsg>) -> Option<(String, String)> {
     // Strip ANSI escape sequences (from pty/script wrapper)
     let cleaned = strip_ansi(line);
@@ -1287,26 +1575,11 @@ fn parse_sendme_common(line: &str, tx: &mpsc::Sender<TransferMsg>) -> Option<(St
     Some((trimmed.to_string(), lower))
 }
 
+#[allow(dead_code)]
 fn parse_sendme_send_output(line: &str, tx: &mpsc::Sender<TransferMsg>) {
     let Some((trimmed, lower)) = parse_sendme_common(line, tx) else {
         return;
     };
-
-    // If it's stderr (heuristic: if line doesn't match standard patterns or is explicitly passed as stderr in future),
-    // actually we are mixing stdout/stderr in the same pipe reader in the caller?
-    // No, we have separate threads for stdout and stderr, but they both call this parser.
-    // For now, let's just log everything.
-
-    if (lower.contains("error") || lower.contains("failed") || lower.contains("aborted"))
-        && (lower.contains("handshake")
-            || lower.contains("incompatible")
-            || lower.contains("certificatetype"))
-    {
-        let _ = tx.send(TransferMsg::Error(
-            "Sendme version mismatch — both peers must run the same sendme version (bundled: v0.31.0)".to_string(),
-        ));
-    }
-
     if sendme_waiting_banner(&lower) {
         let _ = tx.send(TransferMsg::WaitingForReceiver);
     }
@@ -1326,6 +1599,7 @@ fn parse_sendme_send_output(line: &str, tx: &mpsc::Sender<TransferMsg>) {
     }
 }
 
+#[allow(dead_code)]
 fn parse_sendme_receive_output(line: &str, tx: &mpsc::Sender<TransferMsg>) {
     let cleaned = strip_ansi(line);
     let trimmed = cleaned.trim();
@@ -1341,22 +1615,6 @@ fn parse_sendme_receive_output(line: &str, tx: &mpsc::Sender<TransferMsg>) {
         let _ = tx.send(TransferMsg::Error(trimmed.to_string()));
         return;
     }
-
-    if lower.contains("error") || lower.contains("failed") || lower.contains("aborted") {
-        if lower.contains("handshake")
-            || lower.contains("incompatible")
-            || lower.contains("certificatetype")
-        {
-            let _ = tx.send(TransferMsg::Error(
-                "Sendme version mismatch — both peers must run the same sendme version (bundled: v0.31.0)".to_string(),
-            ));
-        } else if lower.contains("connection") || lower.contains("timeout") {
-            let _ = tx.send(TransferMsg::Error(
-                "Connection failed — check network and firewall settings".to_string(),
-            ));
-        }
-    }
-
     // Some sendme builds keep the process alive briefly after this final summary line.
     // Emit completion immediately so UI can transition out of downloading state.
     if lower.contains("downloaded") && lower.contains("files") {
@@ -1365,12 +1623,14 @@ fn parse_sendme_receive_output(line: &str, tx: &mpsc::Sender<TransferMsg>) {
     }
 }
 
+#[allow(dead_code)]
 fn sendme_waiting_banner(lower: &str) -> bool {
     lower.contains("waiting for incoming transfer")
         || lower.contains("waiting for incoming")
         || lower.contains("waiting for receiver")
 }
 
+#[allow(dead_code)]
 fn sendme_sender_activity_line(trimmed: &str, lower: &str) -> bool {
     if (lower.contains("[3/4]") || lower.contains("[4/4]"))
         && (lower.contains("uploading") || lower.contains("downloading"))
@@ -1495,6 +1755,7 @@ mod tests {
         let (rx, handle) = sendme_send(
             SendmeSendOptions {
                 paths: vec![sample],
+                one_shot: true,
             },
             &binary.to_string_lossy(),
         );
@@ -1674,3 +1935,6 @@ mod tests {
         );
     }
 }
+
+
+
