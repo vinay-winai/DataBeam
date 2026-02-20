@@ -10,14 +10,8 @@ permissions:
 
 jobs:
   build-assets:
-    name: Build Assets (${{ matrix.platform }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-22.04
-            platform: linux-x64
+    name: Build Assets (linux-x64)
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout
@@ -51,25 +45,7 @@ jobs:
         # artifact generation resilient here; strict lock checks remain in CI.
         run: cargo build --release
 
-      - name: Package Windows assets
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $version = "${env:GITHUB_REF_NAME}".TrimStart('v')
-          New-Item -ItemType Directory -Force dist | Out-Null
-          $exe = "databeam_v${version}_windows-x64.exe"
-          Copy-Item "target/release/databeam.exe" "dist/$exe" -Force
-          $zipEntries = @("dist/$exe")
-          $pdb = "target/release/databeam.pdb"
-          if (Test-Path $pdb) {
-            $pdbOut = "databeam_v${version}_windows-x64.pdb"
-            Copy-Item $pdb "dist/$pdbOut" -Force
-            $zipEntries += "dist/$pdbOut"
-          }
-          Compress-Archive -Path $zipEntries -DestinationPath "dist/databeam_v${version}_windows-x64.zip" -Force
-
       - name: Package Linux assets
-        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -87,43 +63,10 @@ jobs:
           fi
           cp "$deb_path" "dist/databeam_v${version}_linux-x64.deb"
 
-      - name: Package macOS assets
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          platform="${{ matrix.platform }}"
-          mkdir -p dist
-          cp target/release/databeam "dist/databeam_v${version}_${platform}"
-          tar -C dist -czf "dist/databeam_v${version}_${platform}.tar.gz" "databeam_v${version}_${platform}"
-          cargo install cargo-bundle --locked
-          cargo bundle --release --format osx
-          app_path="$(find target/release/bundle/osx -maxdepth 1 -name '*.app' -print -quit)"
-          if [ -z "${app_path}" ]; then
-            echo "No .app produced under target/release/bundle/osx"
-            find target/release -maxdepth 4 -type d | sort
-            exit 1
-          fi
-          # Ad-hoc sign to avoid corrupted/"damaged" bundle warnings caused by invalid signatures.
-          codesign --force --deep --sign - "$app_path"
-          codesign --verify --deep --strict "$app_path"
-          ditto -c -k --sequesterRsrc --keepParent "$app_path" "dist/databeam_v${version}_${platform}.app.zip"
-          dmg_stage_dir="$(mktemp -d)"
-          cp -R "$app_path" "$dmg_stage_dir/"
-          ln -s /Applications "$dmg_stage_dir/Applications"
-          hdiutil create \
-            -volname "DataBeam" \
-            -srcfolder "$dmg_stage_dir" \
-            -ov \
-            -format UDZO \
-            "dist/databeam_v${version}_${platform}.dmg"
-          rm -rf "$dmg_stage_dir"
-
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: release-${{ matrix.platform }}
+          name: release-linux-x64
           path: dist/*
           if-no-files-found: error
 
