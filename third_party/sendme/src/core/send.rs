@@ -573,34 +573,8 @@ async fn show_provide_progress_with_logging(
 
                                             request_completed = true;
 
-                                            // Some requests may not emit full Progress updates.
-                                            // Top up from final per-request transfer stats.
-                                            let payload_sent = m.stats.payload_bytes_sent;
-                                            let topup = payload_sent.saturating_sub(accounted_offset);
-                                            if topup > 0 {
-                                                let cumulative_done = total_sent_bytes_task
-                                                    .fetch_add(topup, Ordering::SeqCst)
-                                                    .saturating_add(topup)
-                                                    .min(total_file_size);
-                                                let speed_bps = {
-                                                    let started_at = transfer_started_at_task.lock().await;
-                                                    let elapsed = started_at
-                                                        .as_ref()
-                                                        .map(|t| t.elapsed().as_secs_f64())
-                                                        .unwrap_or(0.0);
-                                                    if elapsed > 0.0 {
-                                                        cumulative_done as f64 / elapsed
-                                                    } else {
-                                                        0.0
-                                                    }
-                                                };
-                                                emit_progress_event(
-                                                    &app_handle_task,
-                                                    cumulative_done,
-                                                    total_file_size,
-                                                    speed_bps,
-                                                );
-                                            }
+                                            request_completed = true;
+
 
                                             let completed = completed_requests_task.fetch_add(1, Ordering::SeqCst) + 1;
                                             let active = active_requests_task.load(Ordering::SeqCst);
@@ -612,39 +586,24 @@ async fn show_provide_progress_with_logging(
                                             if completed >= active
                                                 && completed >= min_required
                                                 && has_any_transfer_task.load(Ordering::SeqCst) {
-                                                let active_before_wait = active;
+                                                // Remove 2 second sleep logic
 
-                                                // Give late request updates time to arrive before
-                                                // declaring a cycle complete in serve mode.
-                                                tokio::time::sleep(Duration::from_secs(2)).await;
-
-                                                let completed_after = completed_requests_task.load(Ordering::SeqCst);
-                                                let active_after = active_requests_task.load(Ordering::SeqCst);
-
-                                                let new_requests_arrived = active_after > active_before_wait;
-
-                                                let has_active_transfers = {
-                                                    let states = transfer_states_task.lock().await;
-                                                    !states.is_empty()
-                                                };
-
-                                                let last_request_recent = {
-                                                    let last_time = last_request_time_task.lock().await;
-                                                    if let Some(time) = *last_time {
-                                                        time.elapsed() < Duration::from_secs(2)
-                                                    } else {
-                                                        false
-                                                    }
-                                                };
-
-                                                if completed_after >= active_after
-                                                    && completed_after >= min_required
-                                                    && !new_requests_arrived
-                                                    && !has_active_transfers
-                                                    && !last_request_recent {
+                                                if completed >= active
+                                                    && completed >= min_required
+                                                {
                                                     if !cycle_terminal_emitted_task.swap(true, Ordering::SeqCst) {
                                                         emit_event(&app_handle_task, "transfer-completed");
                                                         has_emitted_started_task.store(false, Ordering::SeqCst);
+                                                        
+                                                        // Reset all state for the next serve cycle
+                                                        active_requests_task.store(0, Ordering::SeqCst);
+                                                        completed_requests_task.store(0, Ordering::SeqCst);
+                                                        total_sent_bytes_task.store(0, Ordering::SeqCst);
+                                                        has_any_transfer_task.store(false, Ordering::SeqCst);
+                                                        {
+                                                            let mut started_at = transfer_started_at_task.lock().await;
+                                                            *started_at = None;
+                                                        }
                                                     }
                                                 }
                                             }
@@ -672,6 +631,16 @@ async fn show_provide_progress_with_logging(
                                             {
                                                 emit_event(&app_handle_task, "transfer-failed");
                                                 has_emitted_started_task.store(false, Ordering::SeqCst);
+                                                
+                                                // Reset all state for the next serve cycle
+                                                active_requests_task.store(0, Ordering::SeqCst);
+                                                completed_requests_task.store(0, Ordering::SeqCst);
+                                                total_sent_bytes_task.store(0, Ordering::SeqCst);
+                                                has_any_transfer_task.store(false, Ordering::SeqCst);
+                                                {
+                                                    let mut started_at = transfer_started_at_task.lock().await;
+                                                    *started_at = None;
+                                                }
                                             }
                                         }
                                     }
@@ -689,39 +658,23 @@ async fn show_provide_progress_with_logging(
                                 if completed >= active
                                     && completed >= min_required
                                     && has_any_transfer_task.load(Ordering::SeqCst) {
-                                    let active_before_wait = active;
-
-                                    // Give late request updates time to arrive before
-                                    // declaring a cycle complete in serve mode.
-                                    tokio::time::sleep(Duration::from_secs(2)).await;
-
-                                    let completed_after = completed_requests_task.load(Ordering::SeqCst);
-                                    let active_after = active_requests_task.load(Ordering::SeqCst);
-
-                                    let new_requests_arrived = active_after > active_before_wait;
-
-                                    let has_active_transfers = {
-                                        let states = transfer_states_task.lock().await;
-                                        !states.is_empty()
-                                    };
-
-                                    let last_request_recent = {
-                                        let last_time = last_request_time_task.lock().await;
-                                        if let Some(time) = *last_time {
-                                            time.elapsed() < Duration::from_secs(2)
-                                        } else {
-                                            false
-                                        }
-                                    };
-
-                                    if completed_after >= active_after
-                                        && completed_after >= min_required
-                                        && !new_requests_arrived
-                                        && !has_active_transfers
-                                        && !last_request_recent {
+                                    // Removed 2-sec delay logic
+                                    if completed >= active
+                                        && completed >= min_required
+                                    {
                                         if !cycle_terminal_emitted_task.swap(true, Ordering::SeqCst) {
                                             emit_event(&app_handle_task, "transfer-completed");
                                             has_emitted_started_task.store(false, Ordering::SeqCst);
+
+                                            // Reset all state for the next serve cycle
+                                            active_requests_task.store(0, Ordering::SeqCst);
+                                            completed_requests_task.store(0, Ordering::SeqCst);
+                                            total_sent_bytes_task.store(0, Ordering::SeqCst);
+                                            has_any_transfer_task.store(false, Ordering::SeqCst);
+                                            {
+                                                let mut started_at = transfer_started_at_task.lock().await;
+                                                *started_at = None;
+                                            }
                                         }
                                     }
                                 }

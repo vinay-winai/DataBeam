@@ -1410,7 +1410,6 @@ pub fn sendme_receive(
             if cancel2.load(Ordering::Relaxed) {
                 task.abort();
                 let _ = tx.send(TransferMsg::Error("Transfer cancelled".to_string()));
-                cleanup_sendme_temp_artifacts();
                 return;
             }
 
@@ -1482,7 +1481,6 @@ pub fn sendme_receive(
                 )));
             }
         }
-        cleanup_sendme_temp_artifacts();
     });
 
     (rx, ProcessHandle { cancel, child_pid })
