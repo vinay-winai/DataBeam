@@ -1014,9 +1014,6 @@ pub fn sendme_send(
         let mut last_logged_done: u64 = 0;
         let mut last_seen_total: u64 = 0;
         let mut last_seen_speed_bps: f64 = 0.0;
-        let mut sender_rollover_base: u64 = 0;
-        let mut sender_prev_done_raw: u64 = 0;
-        let mut sender_segment_max: u64 = 0;
         let mut waiting_for_new_connection = false;
         let mut waiting_seen_zero_connections = false;
         loop {
@@ -1053,30 +1050,7 @@ pub fn sendme_send(
                         sender_activity_emitted = true;
                     }
                     let raw_done = done.min(total.max(done));
-                    if total > 0 {
-                        if sender_prev_done_raw > 0
-                            && raw_done < sender_prev_done_raw / 2
-                            && sender_segment_max > 0
-                        {
-                            // Per-segment rollover (common for folder/multi-item sends).
-                            sender_rollover_base =
-                                sender_rollover_base.saturating_add(sender_segment_max);
-                            sender_segment_max = raw_done;
-                        } else if raw_done == 0 && sender_prev_done_raw > 0 && sender_segment_max > 0
-                        {
-                            sender_rollover_base =
-                                sender_rollover_base.saturating_add(sender_segment_max);
-                            sender_segment_max = 0;
-                        } else if raw_done > sender_segment_max {
-                            sender_segment_max = raw_done;
-                        }
-                    }
-                    sender_prev_done_raw = raw_done;
-                    let mut shown_done = if total > 0 {
-                        sender_rollover_base.saturating_add(raw_done).min(total)
-                    } else {
-                        raw_done
-                    };
+                    let mut shown_done = raw_done;
                     last_seen_total = total.max(shown_done).max(1);
                     last_seen_speed_bps = speed_bps;
                     if total > 0 && shown_done >= total {
@@ -1159,9 +1133,6 @@ pub fn sendme_send(
                         last_logged_done = 0;
                         last_seen_total = 0;
                         last_seen_speed_bps = 0.0;
-                        sender_rollover_base = 0;
-                        sender_prev_done_raw = 0;
-                        sender_segment_max = 0;
                     }
                 }
                 Ok(NativeSendmeEvent::TransferFailed) => {
@@ -1191,9 +1162,6 @@ pub fn sendme_send(
                         last_logged_done = 0;
                         last_seen_total = 0;
                         last_seen_speed_bps = 0.0;
-                        sender_rollover_base = 0;
-                        sender_prev_done_raw = 0;
-                        sender_segment_max = 0;
                         continue;
                     }
                 }
@@ -1228,9 +1196,6 @@ pub fn sendme_send(
                         last_logged_done = 0;
                         last_seen_total = 0;
                         last_seen_speed_bps = 0.0;
-                        sender_rollover_base = 0;
-                        sender_prev_done_raw = 0;
-                        sender_segment_max = 0;
                         thread::sleep(Duration::from_millis(200));
                         continue;
                     }
@@ -1328,7 +1293,6 @@ fn cleanup_sendme_temp_artifacts() {
             continue;
         };
         let managed = name.starts_with(".sendme-send-")
-            || name.starts_with(".sendme-recv-")
             || name.starts_with("databeam_sendme_")
             || name.starts_with("databeam_sendme_recv_");
         if !managed {

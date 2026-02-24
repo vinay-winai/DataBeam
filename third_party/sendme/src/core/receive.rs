@@ -14,7 +14,7 @@ use iroh_blobs::{
 use n0_future::StreamExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::select;
 
 // Helper function to emit events through the app handle
@@ -148,6 +148,7 @@ pub async fn download(
             let mut stream = get.stream();
             let mut last_log_offset = 0u64;
             let transfer_start_time = Instant::now();
+            let mut download_completed = false;
 
             while let Some(item) = stream.next().await {
                 match item {
@@ -174,6 +175,7 @@ pub async fn download(
                     }
                     GetProgressItem::Done(value) => {
                         stats = value;
+                        download_completed = true;
 
                         // Emit final progress event
                         let elapsed = transfer_start_time.elapsed().as_secs_f64();
@@ -192,6 +194,11 @@ pub async fn download(
                     }
                 }
             }
+
+            if !download_completed {
+                anyhow::bail!("Download stream ended before completion - sender may have disconnected");
+            }
+
             (stats, total_files, payload_size)
         } else {
             let total_files = local.children().unwrap() - 1;
@@ -261,46 +268,82 @@ pub async fn download(
     })
 }
 
-async fn export(db: &Store, collection: Collection, output_dir: &Path, app_handle: &AppHandle) -> anyhow::Result<()> {
+async fn export(
+    db: &Store,
+    collection: Collection,
+    output_dir: &Path,
+    app_handle: &AppHandle,
+) -> anyhow::Result<()> {
     for (_i, (name, hash)) in collection.iter().enumerate() {
         let target = get_export_path(output_dir, name)?;
         if target.exists() {
             anyhow::bail!("target {} already exists", target.display());
         }
-        let mut stream = db
-            .export_with_opts(ExportOptions {
-                hash: *hash,
-                target,
-                mode: ExportMode::Copy,
-            })
-            .stream()
-            .await;
+        let mut last_error: Option<String> = None;
+        const MAX_ATTEMPTS: u32 = 5;
+        for attempt in 1..=MAX_ATTEMPTS {
+            if let Some(parent) = target.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            let mut stream = db
+                .export_with_opts(ExportOptions {
+                    hash: *hash,
+                    target: target.clone(),
+                    mode: ExportMode::Copy,
+                })
+                .stream()
+                .await;
 
-        let mut current_size = 0u64;
-        let mut last_log_offset = 0u64;
+            let mut current_size = 0u64;
+            let mut last_log_offset = 0u64;
+            let mut failed: Option<String> = None;
 
-        while let Some(item) = stream.next().await {
-            match item {
-                ExportProgressItem::Size(size) => {
-                    current_size = size;
-                }
-                ExportProgressItem::CopyProgress(offset) => {
-                    if offset - last_log_offset > 1_000_000 {
-                        last_log_offset = offset;
-                        let payload = format!("{}:{}", offset, current_size);
-                        emit_event_with_payload(app_handle, "receive-export-progress", &payload);
+            while let Some(item) = stream.next().await {
+                match item {
+                    ExportProgressItem::Size(size) => {
+                        current_size = size;
                     }
-                }
-                ExportProgressItem::Done => {
-                    if current_size > 0 {
-                        let payload = format!("{}:{}", current_size, current_size);
-                        emit_event_with_payload(app_handle, "receive-export-progress", &payload);
+                    ExportProgressItem::CopyProgress(offset) => {
+                        if offset - last_log_offset > 1_000_000 {
+                            last_log_offset = offset;
+                            let payload = format!("{}:{}", offset, current_size);
+                            emit_event_with_payload(app_handle, "receive-export-progress", &payload);
+                        }
                     }
-                }
-                ExportProgressItem::Error(cause) => {
-                    anyhow::bail!("error exporting {}: {}", name, cause);
+                    ExportProgressItem::Done => {
+                        if current_size > 0 {
+                            let payload = format!("{}:{}", current_size, current_size);
+                            emit_event_with_payload(app_handle, "receive-export-progress", &payload);
+                        }
+                    }
+                    ExportProgressItem::Error(cause) => {
+                        failed = Some(cause.to_string());
+                        break;
+                    }
                 }
             }
+
+            if let Some(err) = failed {
+                let retryable = attempt < MAX_ATTEMPTS
+                    && (err.to_lowercase().contains("os error 2")
+                        || err.to_lowercase().contains("os error 3")
+                        || err.to_lowercase().contains("os error 32"));
+                last_error = Some(err.clone());
+                if retryable {
+                    let _ = tokio::fs::remove_file(&target).await;
+                    // Exponential backoff: 250ms, 500ms, 750ms, 1000ms
+                    tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
+                    continue;
+                }
+                anyhow::bail!("error exporting {}: {}", name, err);
+            }
+
+            last_error = None;
+            break;
+        }
+
+        if let Some(err) = last_error {
+            anyhow::bail!("error exporting {}: {}", name, err);
         }
     }
     Ok(())
@@ -313,7 +356,26 @@ fn get_export_path(root: &Path, name: &str) -> anyhow::Result<PathBuf> {
         validate_path_component(part)?;
         path.push(part);
     }
+    #[cfg(windows)]
+    {
+        path = to_windows_extended_path(path);
+    }
     Ok(path)
+}
+
+#[cfg(windows)]
+fn to_windows_extended_path(path: PathBuf) -> PathBuf {
+    let raw = path.to_string_lossy().to_string();
+    if raw.starts_with(r"\\?\") || raw.starts_with(r"\\.\") {
+        return path;
+    }
+    if let Some(unc_tail) = raw.strip_prefix(r"\\") {
+        return PathBuf::from(format!(r"\\?\UNC\{}", unc_tail));
+    }
+    if path.is_absolute() {
+        return PathBuf::from(format!(r"\\?\{}", raw));
+    }
+    path
 }
 
 fn validate_path_component(component: &str) -> anyhow::Result<()> {

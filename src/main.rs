@@ -1,4 +1,4 @@
-﻿#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod backend;
 mod theme;
 mod widgets;
@@ -52,6 +52,20 @@ enum TransferPhase {
     // EazySendme specific phases
     EazySharingTicket,
     EazyWaitingForPeer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickerRequest {
+    SendFolder,
+    SendFiles,
+    ReceiveFolder,
+}
+
+#[derive(Debug)]
+enum PickerResult {
+    SendFolder(Option<PathBuf>),
+    SendFiles(Option<Vec<PathBuf>>),
+    ReceiveFolder(Option<PathBuf>),
 }
 
 /// A file/folder entry with its cached size
@@ -146,6 +160,7 @@ struct DataBeamApp {
     drag_hover: bool,
     picker_block_until: f64,
     picker_in_flight: bool,
+    picker_rx: Option<mpsc::Receiver<PickerResult>>,
     sendme_one_shot: bool,
     sendme_peer_connected: bool,
     sendme_had_transfer: bool,
@@ -219,6 +234,7 @@ impl Default for DataBeamApp {
             drag_hover: false,
             picker_block_until: 0.0,
             picker_in_flight: false,
+            picker_rx: None,
             sendme_one_shot: true,
             sendme_peer_connected: false,
             sendme_had_transfer: false,
@@ -438,6 +454,66 @@ impl DataBeamApp {
         self.reset_transfer();
     }
 
+    fn launch_picker(&mut self, request: PickerRequest) {
+        if self.picker_in_flight {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.picker_in_flight = true;
+        self.picker_rx = Some(rx);
+        self.picker_block_until = self.animation_time + 0.15;
+        thread::spawn(move || {
+            let result = match request {
+                PickerRequest::SendFolder => {
+                    PickerResult::SendFolder(rfd::FileDialog::new().pick_folder())
+                }
+                PickerRequest::SendFiles => {
+                    PickerResult::SendFiles(rfd::FileDialog::new().pick_files())
+                }
+                PickerRequest::ReceiveFolder => {
+                    PickerResult::ReceiveFolder(rfd::FileDialog::new().pick_folder())
+                }
+            };
+            let _ = tx.send(result);
+        });
+    }
+
+    fn poll_picker_results(&mut self) {
+        let Some(rx) = self.picker_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.picker_in_flight = false;
+                self.picker_block_until = self.animation_time + 0.2;
+                match result {
+                    PickerResult::SendFolder(Some(path)) => {
+                        self.add_path(path);
+                    }
+                    PickerResult::SendFiles(Some(paths)) => {
+                        for path in paths {
+                            self.add_path(path);
+                        }
+                    }
+                    PickerResult::ReceiveFolder(Some(path)) => {
+                        self.receive_output_dir = Some(path);
+                        self.persist_user_settings();
+                    }
+                    PickerResult::SendFolder(None)
+                    | PickerResult::SendFiles(None)
+                    | PickerResult::ReceiveFolder(None) => {}
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.picker_rx = Some(rx);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.picker_in_flight = false;
+                self.picker_block_until = self.animation_time + 0.2;
+            }
+        }
+    }
+
     fn add_path(&mut self, path: PathBuf) {
         if self.selected_tool == SelectedTool::Croc && self.croc_text_mode {
             self.show_toast(
@@ -523,6 +599,7 @@ impl DataBeamApp {
         self.sendme_last_activity = None;
         self.picker_block_until = 0.0;
         self.picker_in_flight = false;
+        self.picker_rx = None;
         self.sendme_total_items = None;
         self.sendme_done_bytes_est = 0;
         self.sendme_item_progress.clear();
@@ -754,23 +831,19 @@ impl DataBeamApp {
                 }
                 if let Some(total_bytes) = self.transfer_total_bytes {
                     if total_bytes > 0 {
-                        let stream_done =
-                            if let (Some(cur_done), Some(cur_total)) =
-                                (self.sendme_stream_last_done, self.sendme_stream_last_total)
-                            {
-                                if cur_total > 0 {
-                                    self.sendme_stream_done_base
-                                        .saturating_add(cur_done.min(cur_total))
-                                } else {
-                                    self.sendme_stream_done_base
-                                }
+                        let stream_done = if let (Some(cur_done), Some(cur_total)) =
+                            (self.sendme_stream_last_done, self.sendme_stream_last_total)
+                        {
+                            if cur_total > 0 {
+                                self.sendme_stream_done_base
+                                    .saturating_add(cur_done.min(cur_total))
                             } else {
                                 self.sendme_stream_done_base
-                            };
-                        let est_done = self
-                            .sendme_done_bytes_est
-                            .max(stream_done)
-                            .min(total_bytes);
+                            }
+                        } else {
+                            self.sendme_stream_done_base
+                        };
+                        let est_done = self.sendme_done_bytes_est.max(stream_done).min(total_bytes);
                         if est_done > self.transfer_done_bytes.unwrap_or(0) {
                             self.transfer_done_bytes = Some(est_done);
                             self.transfer_progress =
@@ -1005,19 +1078,6 @@ impl DataBeamApp {
                                 if self.transfer_state == TransferState::Running {
                                     self.update_transfer_metrics_from_log(&line);
                                 }
-                                if (self.selected_tool == SelectedTool::Sendme
-                                    || self.selected_tool == SelectedTool::EazySendme)
-                                    && self.view == AppView::Send
-                                    && self.transfer_state == TransferState::Running
-                                    && self.sendme_had_transfer
-                                    && self.sendme_sender_payload_complete
-                                {
-                                    if self.sendme_one_shot {
-                                        self.mark_sendme_one_shot_completed();
-                                    } else {
-                                        self.mark_sendme_sender_waiting();
-                                    }
-                                }
                                 let mut skip_log_line = false;
                                 if (self.selected_tool == SelectedTool::Croc
                                     || self.selected_tool == SelectedTool::EazySendme)
@@ -1032,25 +1092,8 @@ impl DataBeamApp {
                                         || self.selected_tool == SelectedTool::EazySendme)
                                         && lower.contains("sendme receive ")
                                     {
-                                        if self.sendme_had_transfer {
-                                            if self.sendme_one_shot {
-                                                self.mark_sendme_one_shot_completed();
-                                            } else {
-                                                self.mark_sendme_sender_waiting();
-                                            }
-                                        } else if self.transfer_phase == TransferPhase::Preparing {
+                                        if self.transfer_phase == TransferPhase::Preparing {
                                             self.transfer_phase = TransferPhase::WaitingForReceiver;
-                                        }
-                                    }
-                                    if (self.selected_tool == SelectedTool::Sendme
-                                        || self.selected_tool == SelectedTool::EazySendme)
-                                        && lower.contains("to get this data, use")
-                                        && self.sendme_had_transfer
-                                    {
-                                        if self.sendme_one_shot {
-                                            self.mark_sendme_one_shot_completed();
-                                        } else {
-                                            self.mark_sendme_sender_waiting();
                                         }
                                     }
                                     if self.selected_tool == SelectedTool::Croc
@@ -1099,16 +1142,9 @@ impl DataBeamApp {
                                             && self.sendme_had_transfer
                                             && sendme_waiting_signal);
 
-                                    if sendme_sender
-                                        && self.sendme_one_shot
-                                        && sendme_cycle_finished
-                                    {
-                                        self.mark_sendme_one_shot_completed();
-                                    } else if sendme_sender
-                                        && !self.sendme_one_shot
-                                        && sendme_cycle_finished
-                                    {
-                                        self.mark_sendme_sender_waiting();
+                                    if !sendme_sender && sendme_cycle_finished {
+                                        // Receiver side still uses log hints for UX; sender-side
+                                        // cycle transitions are driven by explicit backend events.
                                     }
                                     // Transition to Transferring only on actual connection acceptance or data flow
                                     if lower.contains("disco_in{endpoint=")
@@ -1253,9 +1289,7 @@ impl DataBeamApp {
                                     && self.transfer_state == TransferState::Running;
                                 if sendme_sender {
                                     if self.sendme_had_transfer {
-                                        if self.sendme_one_shot {
-                                            self.mark_sendme_one_shot_completed();
-                                        } else {
+                                        if !self.sendme_one_shot {
                                             self.mark_sendme_sender_waiting();
                                         }
                                     } else {
@@ -1270,11 +1304,7 @@ impl DataBeamApp {
                                     && self.view == AppView::Send
                                     && self.transfer_state == TransferState::Running
                                 {
-                                    if self.sendme_waiting_after_cycle
-                                        && !self.sendme_peer_connected
-                                    {
-                                        continue;
-                                    }
+                                    self.sendme_peer_connected = true;
                                     self.sendme_had_transfer = true;
                                     self.sendme_waiting_after_cycle = false;
                                     self.sendme_last_activity = Some(self.animation_time);
@@ -1596,7 +1626,9 @@ impl DataBeamApp {
                 i.events
                     .iter()
                     .filter_map(|e| match e {
-                        egui::Event::Paste(s) if s.contains("file://") => Some(s.as_str()),
+                        egui::Event::Paste(s) | egui::Event::Text(s) if s.contains("file://") => {
+                            Some(s.as_str())
+                        }
                         _ => None,
                     })
                     .flat_map(parse_file_uri_list)
@@ -1748,14 +1780,15 @@ impl DataBeamApp {
         self.reset_transfer();
 
         let binary = match self.selected_tool {
-            SelectedTool::Croc | SelectedTool::EazySendme => match self.get_tool_binary(&Tool::Croc)
-            {
-                Some(b) => b,
-                None => {
-                    self.show_toast("Croc not found".to_string(), ERROR);
-                    return;
+            SelectedTool::Croc | SelectedTool::EazySendme => {
+                match self.get_tool_binary(&Tool::Croc) {
+                    Some(b) => b,
+                    None => {
+                        self.show_toast("Croc not found".to_string(), ERROR);
+                        return;
+                    }
                 }
-            },
+            }
             SelectedTool::Sendme => self.get_tool_binary(&Tool::Sendme).unwrap_or_default(),
         };
 
@@ -1972,6 +2005,7 @@ impl eframe::App for DataBeamApp {
             }
         }
 
+        self.poll_picker_results();
         self.handle_dropped_files(ctx);
         self.poll_size_updates();
         self.poll_transfer();
@@ -2512,13 +2546,7 @@ impl DataBeamApp {
                         && accent_button_sized(ui, "+ Folder", accent, Vec2::new(70.0, 22.0))
                             .clicked()
                     {
-                        self.picker_in_flight = true;
-                        self.picker_block_until = self.animation_time + 0.8;
-                        if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                            self.add_path(p);
-                        }
-                        self.picker_in_flight = false;
-                        self.picker_block_until = self.animation_time + 0.5;
+                        self.launch_picker(PickerRequest::SendFolder);
                         picker_used_this_frame = true;
                     }
                     if !send_locked
@@ -2528,15 +2556,7 @@ impl DataBeamApp {
                         && accent_button_sized(ui, "+ File", accent, Vec2::new(60.0, 22.0))
                             .clicked()
                     {
-                        self.picker_in_flight = true;
-                        self.picker_block_until = self.animation_time + 0.8;
-                        if let Some(paths) = rfd::FileDialog::new().pick_files() {
-                            for p in paths {
-                                self.add_path(p);
-                            }
-                        }
-                        self.picker_in_flight = false;
-                        self.picker_block_until = self.animation_time + 0.5;
+                        self.launch_picker(PickerRequest::SendFiles);
                     }
                     match self.send_items.is_empty() {
                         true => {} // No clear button if empty
@@ -2843,10 +2863,7 @@ impl DataBeamApp {
                     if accent_button_sized(ui, "📂", self.engine_color(), Vec2::new(32.0, 22.0))
                         .clicked()
                     {
-                        if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                            self.receive_output_dir = Some(p);
-                            self.persist_user_settings();
-                        }
+                        self.launch_picker(PickerRequest::ReceiveFolder);
                     }
                     if self.receive_output_dir.is_some()
                         && accent_button_sized(
@@ -4009,11 +4026,11 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod parse_tests {
     use super::{
-        extract_croc_received_text, extract_croc_received_text_from_logs,
-        normalize_sendme_ticket, parse_croc_file_counter_progress, parse_croc_total_size_hint,
-        parse_payload_progress, parse_sendme_imported_size_hint, parse_sendme_item_index,
-        parse_sendme_total_files_hint, parse_stage_progress, AppView, DataBeamApp, SelectedTool,
-        TransferMsg, TransferPhase, TransferState,
+        extract_croc_received_text, extract_croc_received_text_from_logs, normalize_sendme_ticket,
+        parse_croc_file_counter_progress, parse_croc_total_size_hint, parse_payload_progress,
+        parse_sendme_imported_size_hint, parse_sendme_item_index, parse_sendme_total_files_hint,
+        parse_stage_progress, AppView, DataBeamApp, SelectedTool, TransferMsg, TransferPhase,
+        TransferState,
     };
     use std::sync::mpsc;
 
@@ -4323,7 +4340,7 @@ mod parse_tests {
     }
 
     #[test]
-    fn sendme_one_shot_waiting_banner_marks_complete() {
+    fn sendme_one_shot_waiting_banner_does_not_mark_complete() {
         let mut app = DataBeamApp::default();
         app.selected_tool = SelectedTool::Sendme;
         app.view = AppView::Send;
@@ -4342,13 +4359,13 @@ mod parse_tests {
 
         app.poll_transfer();
 
-        assert_eq!(app.transfer_state, TransferState::Completed);
-        assert!((app.transfer_progress - 1.0).abs() < f32::EPSILON);
-        assert_eq!(app.transfer_done_bytes, Some(2048));
+        assert_eq!(app.transfer_state, TransferState::Running);
+        assert!((app.transfer_progress - 0.42).abs() < f32::EPSILON);
+        assert_eq!(app.transfer_done_bytes, Some(1024));
     }
 
     #[test]
-    fn sendme_one_shot_waiting_banner_marks_complete_after_seen_transfer_flag() {
+    fn sendme_one_shot_waiting_banner_keeps_running_after_seen_transfer_flag() {
         let mut app = DataBeamApp::default();
         app.selected_tool = SelectedTool::Sendme;
         app.view = AppView::Send;
@@ -4364,8 +4381,8 @@ mod parse_tests {
 
         app.poll_transfer();
 
-        assert_eq!(app.transfer_state, TransferState::Completed);
-        assert!((app.transfer_progress - 1.0).abs() < f32::EPSILON);
+        assert_eq!(app.transfer_state, TransferState::Running);
+        assert_eq!(app.transfer_phase, TransferPhase::WaitingForReceiver);
     }
 
     #[test]
@@ -4417,15 +4434,11 @@ mod parse_tests {
         app.transfer_phase = TransferPhase::Transferring;
         app.transfer_total_bytes = Some((500_f64 * 1024.0 * 1024.0) as u64);
 
-        app.update_transfer_metrics_from_log(
-            "n deadbeef r 1/1 i 0 # abc [] 150.00 MiB/200.00 MiB",
-        );
+        app.update_transfer_metrics_from_log("n deadbeef r 1/1 i 0 # abc [] 150.00 MiB/200.00 MiB");
         let first = app.transfer_done_bytes.unwrap_or(0);
         assert!(first > 149 * 1024 * 1024);
 
-        app.update_transfer_metrics_from_log(
-            "n deadbeef r 1/1 i 0 # abc [] 10.00 MiB/100.00 MiB",
-        );
+        app.update_transfer_metrics_from_log("n deadbeef r 1/1 i 0 # abc [] 10.00 MiB/100.00 MiB");
         let second = app.transfer_done_bytes.unwrap_or(0);
         assert!(
             second >= (210_f64 * 1024.0 * 1024.0) as u64,
@@ -4434,7 +4447,7 @@ mod parse_tests {
     }
 
     #[test]
-    fn sendme_sender_payload_complete_marks_one_shot_complete() {
+    fn sendme_sender_payload_complete_does_not_mark_one_shot_complete_without_end_signal() {
         let mut app = DataBeamApp::default();
         app.selected_tool = SelectedTool::Sendme;
         app.view = AppView::Send;
@@ -4456,7 +4469,7 @@ mod parse_tests {
 
         app.poll_transfer();
 
-        assert_eq!(app.transfer_state, TransferState::Completed);
+        assert_eq!(app.transfer_state, TransferState::Running);
         assert_eq!(
             app.transfer_done_bytes,
             Some((300_f64 * 1024.0 * 1024.0) as u64)
@@ -4488,7 +4501,7 @@ mod parse_tests {
     }
 
     #[test]
-    fn sendme_repeat_ticket_line_finishes_serve_cycle() {
+    fn sendme_repeat_ticket_line_does_not_finish_serve_cycle_without_backend_event() {
         let mut app = DataBeamApp::default();
         app.selected_tool = SelectedTool::Sendme;
         app.view = AppView::Send;
@@ -4505,11 +4518,11 @@ mod parse_tests {
         app.poll_transfer();
 
         assert_eq!(app.transfer_state, TransferState::Running);
-        assert_eq!(app.transfer_phase, TransferPhase::WaitingForReceiver);
+        assert_eq!(app.transfer_phase, TransferPhase::Transferring);
     }
 
     #[test]
-    fn sendme_repeat_ticket_line_finishes_one_shot_cycle() {
+    fn sendme_repeat_ticket_line_does_not_finish_one_shot_cycle_without_disconnect() {
         let mut app = DataBeamApp::default();
         app.selected_tool = SelectedTool::Sendme;
         app.view = AppView::Send;
@@ -4525,7 +4538,29 @@ mod parse_tests {
 
         app.poll_transfer();
 
+        assert_eq!(app.transfer_state, TransferState::Running);
+    }
+
+    #[test]
+    fn sendme_one_shot_completes_on_peer_disconnected_signal() {
+        let mut app = DataBeamApp::default();
+        app.selected_tool = SelectedTool::Sendme;
+        app.view = AppView::Send;
+        app.transfer_state = TransferState::Running;
+        app.sendme_one_shot = true;
+        app.transfer_phase = TransferPhase::Transferring;
+        app.sendme_had_transfer = true;
+        app.transfer_total_bytes = Some(4096);
+        app.transfer_done_bytes = Some(2048);
+        let (tx, rx) = mpsc::channel();
+        app.transfer_rx = Some(rx);
+        tx.send(TransferMsg::PeerDisconnected)
+            .expect("send peer disconnected");
+        drop(tx);
+
+        app.poll_transfer();
+
         assert_eq!(app.transfer_state, TransferState::Completed);
+        assert_eq!(app.transfer_done_bytes, Some(4096));
     }
 }
-

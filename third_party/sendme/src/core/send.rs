@@ -586,10 +586,34 @@ async fn show_provide_progress_with_logging(
                                             if completed >= active
                                                 && completed >= min_required
                                                 && has_any_transfer_task.load(Ordering::SeqCst) {
-                                                // Remove 2 second sleep logic
+                                                let active_before_wait = active;
 
-                                                if completed >= active
-                                                    && completed >= min_required
+                                                tokio::time::sleep(Duration::from_millis(500)).await;
+
+                                                let completed_after = completed_requests_task.load(Ordering::SeqCst);
+                                                let active_after = active_requests_task.load(Ordering::SeqCst);
+
+                                                let new_requests_arrived = active_after > active_before_wait;
+
+                                                let has_active_transfers = {
+                                                    let states = transfer_states_task.lock().await;
+                                                    !states.is_empty()
+                                                };
+
+                                                let last_request_recent = {
+                                                    let last_time = last_request_time_task.lock().await;
+                                                    if let Some(time) = *last_time {
+                                                        time.elapsed() < Duration::from_millis(500)
+                                                    } else {
+                                                        false
+                                                    }
+                                                };
+
+                                                if completed_after >= active_after
+                                                    && completed_after >= min_required
+                                                    && !new_requests_arrived
+                                                    && !has_active_transfers
+                                                    && !last_request_recent
                                                 {
                                                     if !cycle_terminal_emitted_task.swap(true, Ordering::SeqCst) {
                                                         emit_event(&app_handle_task, "transfer-completed");
@@ -658,9 +682,34 @@ async fn show_provide_progress_with_logging(
                                 if completed >= active
                                     && completed >= min_required
                                     && has_any_transfer_task.load(Ordering::SeqCst) {
-                                    // Removed 2-sec delay logic
-                                    if completed >= active
-                                        && completed >= min_required
+                                    let active_before_wait = active;
+
+                                    tokio::time::sleep(Duration::from_millis(500)).await;
+
+                                    let completed_after = completed_requests_task.load(Ordering::SeqCst);
+                                    let active_after = active_requests_task.load(Ordering::SeqCst);
+
+                                    let new_requests_arrived = active_after > active_before_wait;
+
+                                    let has_active_transfers = {
+                                        let states = transfer_states_task.lock().await;
+                                        !states.is_empty()
+                                    };
+
+                                    let last_request_recent = {
+                                        let last_time = last_request_time_task.lock().await;
+                                        if let Some(time) = *last_time {
+                                            time.elapsed() < Duration::from_millis(500)
+                                        } else {
+                                            false
+                                        }
+                                    };
+
+                                    if completed_after >= active_after
+                                        && completed_after >= min_required
+                                        && !new_requests_arrived
+                                        && !has_active_transfers
+                                        && !last_request_recent
                                     {
                                         if !cycle_terminal_emitted_task.swap(true, Ordering::SeqCst) {
                                             emit_event(&app_handle_task, "transfer-completed");
