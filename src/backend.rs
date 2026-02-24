@@ -883,6 +883,8 @@ pub fn croc_receive(
         }
 
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        // Use temp dir for execution to ensure croc can write/remove its internal temp files safely
+        cmd.current_dir(std::env::temp_dir());
 
         let _ = tx.send(TransferMsg::Started);
 
@@ -897,21 +899,27 @@ pub fn croc_receive(
 
                 let tx2 = tx.clone();
                 let c2 = cancel2.clone();
-                if let Some(stderr) = stderr {
+                let stderr_thread = stderr.map(|stderr| {
                     thread::spawn(move || {
                         read_lines_cr_aware(stderr, tx2, parse_croc_output, c2);
-                    });
-                }
+                    })
+                });
 
                 let tx3 = tx.clone();
                 let c3 = cancel2.clone();
-                if let Some(stdout) = stdout {
+                let stdout_thread = stdout.map(|stdout| {
                     thread::spawn(move || {
                         read_lines_cr_aware(stdout, tx3, parse_croc_output, c3);
-                    });
-                }
+                    })
+                });
 
                 let status = child.wait();
+                if let Some(h) = stderr_thread {
+                    let _ = h.join();
+                }
+                if let Some(h) = stdout_thread {
+                    let _ = h.join();
+                }
                 if cancel2.load(Ordering::Relaxed) {
                     let _ = tx.send(TransferMsg::Error("Transfer cancelled".to_string()));
                     return;

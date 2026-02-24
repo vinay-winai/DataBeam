@@ -1541,9 +1541,12 @@ impl DataBeamApp {
                         processed += 1;
                         match msg {
                             TransferMsg::Output(line) => {
-                                self.transfer_log.push(format!("[Croc] {}", line));
-                                if self.transfer_log.len() > 500 {
-                                    self.transfer_log.drain(0..100);
+                                let skip = self.update_croc_received_text_from_log(&line);
+                                if !skip {
+                                    self.transfer_log.push(format!("[Croc] {}", line));
+                                    if self.transfer_log.len() > 500 {
+                                        self.transfer_log.drain(0..100);
+                                    }
                                 }
                             }
                             TransferMsg::Code(code) => {

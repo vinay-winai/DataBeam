@@ -15,6 +15,7 @@ on:
           - macos-arm64
           - windows-x64
           - linux-x64
+          - macos-linux
           - all
       tag:
         description: "Release tag to publish to (for example: v0.1.13)"
@@ -62,7 +63,7 @@ jobs:
 
   build-macos-arm64:
     name: Build Assets (macos-arm64)
-    if: github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == 'macos-arm64'
+    if: github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == 'macos-arm64' || github.event.inputs.target == 'macos-linux'
     runs-on: macos-14
 
     steps:
@@ -112,7 +113,7 @@ jobs:
 
   build-linux-x64:
     name: Build Assets (linux-x64)
-    if: github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == 'linux-x64'
+    if: github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == 'linux-x64' || github.event.inputs.target == 'macos-linux'
     runs-on: ubuntu-22.04
 
     steps:
