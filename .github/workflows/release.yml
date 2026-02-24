@@ -10,8 +10,21 @@ permissions:
 
 jobs:
   build-assets:
-    name: Build Assets (linux-x64)
-    runs-on: ubuntu-22.04
+    name: Build Assets (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-2022
+            artifact_name: release-windows-x64
+          - name: macos-arm64
+            os: macos-14
+            artifact_name: release-macos-arm64
+          - name: linux-x64
+            os: ubuntu-22.04
+            artifact_name: release-linux-x64
 
     steps:
       - name: Checkout
@@ -30,6 +43,7 @@ jobs:
           sudo apt-get install -y \
             libasound2-dev \
             libglib2.0-dev \
+            libgtk-3-dev \
             libudev-dev \
             libwayland-dev \
             libx11-dev \
@@ -40,33 +54,55 @@ jobs:
             mesa-common-dev
 
       - name: Build release binary
-        # Release tags are occasionally cut from commits where Cargo.lock is not
-        # perfectly in sync across OS-specific dependency resolution. Keep release
-        # artifact generation resilient here; strict lock checks remain in CI.
         run: cargo build --release
 
-      - name: Package Linux assets
+      - name: Install cargo-bundle
+        run: cargo install cargo-bundle --locked
+
+      - name: Package Windows x64 executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/release/databeam.exe" "dist/databeam_v${version}_windows-x64.exe"
+
+      - name: Package macOS arm64 app bundle
+        if: runner.os == 'macOS'
         shell: bash
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           mkdir -p dist
-          cp target/release/databeam "dist/databeam_v${version}_linux-x64"
-          tar -C dist -czf "dist/databeam_v${version}_linux-x64.tar.gz" "databeam_v${version}_linux-x64"
-          cargo install cargo-bundle --locked
+          cargo bundle --release --format osx
+          app_path="target/release/bundle/osx/DataBeam.app"
+          if [ ! -d "${app_path}" ]; then
+            echo "No macOS app bundle produced at ${app_path}"
+            find target/release -maxdepth 5 -type d -name '*.app' | sort
+            exit 1
+          fi
+          ditto -c -k --sequesterRsrc --keepParent "${app_path}" "dist/databeam_v${version}_macos-arm64.app.zip"
+
+      - name: Package Linux x64 deb
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
           cargo bundle --release --format deb
           deb_path="$(find target/release/bundle/deb -maxdepth 1 -name '*.deb' -print -quit)"
           if [ -z "${deb_path}" ]; then
             echo "No .deb produced under target/release/bundle/deb"
-            find target/release -maxdepth 4 -type f | sort
+            find target/release -maxdepth 5 -type f | sort
             exit 1
           fi
-          cp "$deb_path" "dist/databeam_v${version}_linux-x64.deb"
+          cp "${deb_path}" "dist/databeam_v${version}_linux-x64.deb"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: release-linux-x64
+          name: ${{ matrix.artifact_name }}
           path: dist/*
           if-no-files-found: error
 

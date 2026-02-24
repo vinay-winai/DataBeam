@@ -401,7 +401,6 @@ async fn show_provide_progress_with_logging(
     #[derive(Clone)]
     struct TransferState {
         start_time: Instant,
-        last_offset: u64,
     }
 
     let transfer_states: Arc<Mutex<std::collections::HashMap<(u64, u64), TransferState>>> =
@@ -409,13 +408,9 @@ async fn show_provide_progress_with_logging(
 
     let active_requests = Arc::new(AtomicUsize::new(0));
     let completed_requests = Arc::new(AtomicUsize::new(0));
-    let total_sent_bytes = Arc::new(AtomicU64::new(0));
     let has_emitted_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let cycle_terminal_emitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let has_any_transfer = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let last_request_time: Arc<tokio::sync::Mutex<Option<Instant>>> =
-        Arc::new(tokio::sync::Mutex::new(None));
-    let transfer_started_at: Arc<tokio::sync::Mutex<Option<Instant>>> =
         Arc::new(tokio::sync::Mutex::new(None));
 
     loop {
@@ -444,12 +439,9 @@ async fn show_provide_progress_with_logging(
                         let transfer_states_task = transfer_states.clone();
                         let active_requests_task = active_requests.clone();
                         let completed_requests_task = completed_requests.clone();
-                        let total_sent_bytes_task = total_sent_bytes.clone();
                         let has_emitted_started_task = has_emitted_started.clone();
-                        let cycle_terminal_emitted_task = cycle_terminal_emitted.clone();
                         let has_any_transfer_task = has_any_transfer.clone();
                         let last_request_time_task = last_request_time.clone();
-                        let transfer_started_at_task = transfer_started_at.clone();
                         let entry_type_task = entry_type.clone();
 
                         let mut rx = msg.rx;
@@ -463,10 +455,8 @@ async fn show_provide_progress_with_logging(
                                         {
                                             let mut states = transfer_states_task.lock().await;
                                             states.entry((connection_id, request_id))
-                                                .and_modify(|s| s.last_offset = 0)
                                                 .or_insert(TransferState {
                                                     start_time: Instant::now(),
-                                                    last_offset: 0,
                                                 });
                                         }
 
@@ -479,14 +469,7 @@ async fn show_provide_progress_with_logging(
                                             emit_active_connection_count(&app_handle_task, active_count);
 
                                             if !has_emitted_started_task.swap(true, Ordering::SeqCst) {
-                                                cycle_terminal_emitted_task.store(false, Ordering::SeqCst);
                                                 emit_event(&app_handle_task, "transfer-started");
-                                            }
-                                            {
-                                                let mut started_at = transfer_started_at_task.lock().await;
-                                                if started_at.is_none() {
-                                                    *started_at = Some(Instant::now());
-                                                }
                                             }
 
                                             transfer_started = true;
@@ -501,7 +484,6 @@ async fn show_provide_progress_with_logging(
                                                     (connection_id, request_id),
                                                     TransferState {
                                                         start_time: Instant::now(),
-                                                        last_offset: 0,
                                                     }
                                                 );
                                                 states.len()
@@ -510,71 +492,40 @@ async fn show_provide_progress_with_logging(
                                             emit_active_connection_count(&app_handle_task, active_count);
 
                                             if !has_emitted_started_task.swap(true, Ordering::SeqCst) {
-                                                cycle_terminal_emitted_task.store(false, Ordering::SeqCst);
                                                 emit_event(&app_handle_task, "transfer-started");
                                             }
-                                            {
-                                                let mut started_at = transfer_started_at_task.lock().await;
-                                                if started_at.is_none() {
-                                                    *started_at = Some(Instant::now());
-                                                }
-                                            }
+
                                             transfer_started = true;
                                             has_any_transfer_task.store(true, Ordering::SeqCst);
                                         }
 
-                                        let (cumulative_done, speed_bps) = {
-                                            let mut states = transfer_states_task.lock().await;
-                                            let state = states.entry((connection_id, request_id)).or_insert(TransferState {
-                                                start_time: Instant::now(),
-                                                last_offset: 0,
-                                            });
-                                            let end_offset = m.end_offset;
-                                            let delta = end_offset.saturating_sub(state.last_offset);
-                                            state.last_offset = end_offset.max(state.last_offset);
-
-                                            let cumulative = total_sent_bytes_task.fetch_add(delta, Ordering::SeqCst)
-                                                .saturating_add(delta)
-                                                .min(total_file_size);
-
-                                            let started_at = transfer_started_at_task.lock().await;
-                                            let elapsed = started_at
-                                                .as_ref()
-                                                .map(|t| t.elapsed().as_secs_f64())
-                                                .unwrap_or_else(|| state.start_time.elapsed().as_secs_f64());
-                                            let speed = if elapsed > 0.0 {
-                                                cumulative as f64 / elapsed
+                                        if let Some(state) = transfer_states_task.lock().await.get(&(connection_id, request_id)) {
+                                            let elapsed = state.start_time.elapsed().as_secs_f64();
+                                            let speed_bps = if elapsed > 0.0 {
+                                                m.end_offset as f64 / elapsed
                                             } else {
                                                 0.0
                                             };
-                                            (cumulative, speed)
-                                        };
 
-                                        emit_progress_event(
-                                            &app_handle_task,
-                                            cumulative_done,
-                                            total_file_size,
-                                            speed_bps,
-                                        );
+                                            emit_progress_event(
+                                                &app_handle_task,
+                                                m.end_offset.min(total_file_size),
+                                                total_file_size,
+                                                speed_bps,
+                                            );
+                                        }
                                     }
-                                    iroh_blobs::provider::events::RequestUpdate::Completed(m) => {
+                                    iroh_blobs::provider::events::RequestUpdate::Completed(_m) => {
                                         if transfer_started && !request_completed {
-                                            let (active_count, accounted_offset) = {
+                                            let active_count = {
                                                 let mut states = transfer_states_task.lock().await;
-                                                let accounted_offset = states
-                                                    .get(&(connection_id, request_id))
-                                                    .map(|s| s.last_offset)
-                                                    .unwrap_or(0);
                                                 states.remove(&(connection_id, request_id));
-                                                (states.len(), accounted_offset)
+                                                states.len()
                                             };
 
                                             emit_active_connection_count(&app_handle_task, active_count);
 
                                             request_completed = true;
-
-                                            request_completed = true;
-
 
                                             let completed = completed_requests_task.fetch_add(1, Ordering::SeqCst) + 1;
                                             let active = active_requests_task.load(Ordering::SeqCst);
@@ -615,20 +566,13 @@ async fn show_provide_progress_with_logging(
                                                     && !has_active_transfers
                                                     && !last_request_recent
                                                 {
-                                                    if !cycle_terminal_emitted_task.swap(true, Ordering::SeqCst) {
-                                                        emit_event(&app_handle_task, "transfer-completed");
-                                                        has_emitted_started_task.store(false, Ordering::SeqCst);
-                                                        
-                                                        // Reset all state for the next serve cycle
-                                                        active_requests_task.store(0, Ordering::SeqCst);
-                                                        completed_requests_task.store(0, Ordering::SeqCst);
-                                                        total_sent_bytes_task.store(0, Ordering::SeqCst);
-                                                        has_any_transfer_task.store(false, Ordering::SeqCst);
-                                                        {
-                                                            let mut started_at = transfer_started_at_task.lock().await;
-                                                            *started_at = None;
-                                                        }
-                                                    }
+                                                    emit_event(&app_handle_task, "transfer-completed");
+                                                    has_emitted_started_task.store(false, Ordering::SeqCst);
+                                                    
+                                                    // Reset all state for the next serve cycle
+                                                    active_requests_task.store(0, Ordering::SeqCst);
+                                                    completed_requests_task.store(0, Ordering::SeqCst);
+                                                    has_any_transfer_task.store(false, Ordering::SeqCst);
                                                 }
                                             }
                                         }
@@ -650,21 +594,14 @@ async fn show_provide_progress_with_logging(
                                             let completed = completed_requests_task.fetch_add(1, Ordering::SeqCst) + 1;
                                             let active = active_requests_task.load(Ordering::SeqCst);
 
-                                            if completed >= active
-                                                && !cycle_terminal_emitted_task.swap(true, Ordering::SeqCst)
-                                            {
+                                            if completed >= active {
                                                 emit_event(&app_handle_task, "transfer-failed");
                                                 has_emitted_started_task.store(false, Ordering::SeqCst);
                                                 
                                                 // Reset all state for the next serve cycle
                                                 active_requests_task.store(0, Ordering::SeqCst);
                                                 completed_requests_task.store(0, Ordering::SeqCst);
-                                                total_sent_bytes_task.store(0, Ordering::SeqCst);
                                                 has_any_transfer_task.store(false, Ordering::SeqCst);
-                                                {
-                                                    let mut started_at = transfer_started_at_task.lock().await;
-                                                    *started_at = None;
-                                                }
                                             }
                                         }
                                     }
@@ -711,20 +648,7 @@ async fn show_provide_progress_with_logging(
                                         && !has_active_transfers
                                         && !last_request_recent
                                     {
-                                        if !cycle_terminal_emitted_task.swap(true, Ordering::SeqCst) {
-                                            emit_event(&app_handle_task, "transfer-completed");
-                                            has_emitted_started_task.store(false, Ordering::SeqCst);
-
-                                            // Reset all state for the next serve cycle
-                                            active_requests_task.store(0, Ordering::SeqCst);
-                                            completed_requests_task.store(0, Ordering::SeqCst);
-                                            total_sent_bytes_task.store(0, Ordering::SeqCst);
-                                            has_any_transfer_task.store(false, Ordering::SeqCst);
-                                            {
-                                                let mut started_at = transfer_started_at_task.lock().await;
-                                                *started_at = None;
-                                            }
-                                        }
+                                        emit_event(&app_handle_task, "transfer-completed");
                                     }
                                 }
                             }
@@ -749,11 +673,7 @@ async fn show_provide_progress_with_logging(
         // to avoid false completion from metadata transfer
         let min_required = if entry_type == "directory" { 2 } else { 1 };
 
-        if completed >= active
-            && completed >= min_required
-            && completed > 0
-            && !cycle_terminal_emitted.swap(true, Ordering::SeqCst)
-        {
+        if completed >= active && completed >= min_required && completed > 0 {
             emit_event(&app_handle, "transfer-completed");
         }
     }
