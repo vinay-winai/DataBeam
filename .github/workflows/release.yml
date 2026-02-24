@@ -24,26 +24,14 @@ on:
 permissions:
   contents: write
 
+env:
+  RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
+
 jobs:
-  build-assets:
-    name: Build Assets (${{ matrix.name }})
-    if: github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == matrix.name
-    runs-on: ${{ matrix.os }}
-    env:
-      RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: windows-x64
-            os: windows-2022
-            artifact_name: release-windows-x64
-          - name: macos-arm64
-            os: macos-14
-            artifact_name: release-macos-arm64
-          - name: linux-x64
-            os: ubuntu-22.04
-            artifact_name: release-linux-x64
+  build-windows-x64:
+    name: Build Assets (windows-x64)
+    if: github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == 'windows-x64'
+    runs-on: windows-2022
 
     steps:
       - name: Checkout
@@ -55,22 +43,37 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Install Linux build dependencies
-        if: runner.os == 'Linux'
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package Windows x64 executable
+        shell: pwsh
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libasound2-dev \
-            libglib2.0-dev \
-            libgtk-3-dev \
-            libudev-dev \
-            libwayland-dev \
-            libx11-dev \
-            libxcursor-dev \
-            libxi-dev \
-            libxkbcommon-dev \
-            libxrandr-dev \
-            mesa-common-dev
+          $version = "${env:RELEASE_TAG}".TrimStart('v')
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/release/databeam.exe" "dist/databeam_v${version}_windows-x64.exe"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-x64
+          path: dist/*
+          if-no-files-found: error
+
+  build-macos-arm64:
+    name: Build Assets (macos-arm64)
+    if: github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == 'macos-arm64'
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
         run: cargo build --release
@@ -78,16 +81,7 @@ jobs:
       - name: Install cargo-bundle
         run: cargo install cargo-bundle --locked
 
-      - name: Package Windows x64 executable
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $version = "${env:RELEASE_TAG}".TrimStart('v')
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "target/release/databeam.exe" "dist/databeam_v${version}_windows-x64.exe"
-
       - name: Package macOS arm64 app bundle
-        if: runner.os == 'macOS'
         shell: bash
         run: |
           set -euo pipefail
@@ -109,8 +103,51 @@ jobs:
           dmg_path="dist/databeam_v${version}_macos-arm64.dmg"
           hdiutil create -volname "DataBeam" -srcfolder "${app_path}" -ov -format UDZO "${dmg_path}"
 
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-arm64
+          path: dist/*
+          if-no-files-found: error
+
+  build-linux-x64:
+    name: Build Assets (linux-x64)
+    if: github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == 'linux-x64'
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libudev-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxkbcommon-dev \
+            libxrandr-dev \
+            mesa-common-dev
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Install cargo-bundle
+        run: cargo install cargo-bundle --locked
+
       - name: Package Linux x64 deb
-        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -128,17 +165,21 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
+          name: release-linux-x64
           path: dist/*
           if-no-files-found: error
 
   publish-release:
     name: Publish GitHub Release
     runs-on: ubuntu-22.04
-    needs: build-assets
-    if: always() && needs.build-assets.result == 'success'
-    env:
-      RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
+    needs:
+      - build-windows-x64
+      - build-macos-arm64
+      - build-linux-x64
+    if: |
+      always() &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled')
 
     steps:
       - name: Download all artifacts
