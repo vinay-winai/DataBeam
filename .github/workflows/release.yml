@@ -4,6 +4,22 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Which release target to build"
+        type: choice
+        required: true
+        default: macos-arm64
+        options:
+          - macos-arm64
+          - windows-x64
+          - linux-x64
+          - all
+      tag:
+        description: "Release tag to publish to (for example: v0.1.13)"
+        type: string
+        required: true
 
 permissions:
   contents: write
@@ -11,7 +27,10 @@ permissions:
 jobs:
   build-assets:
     name: Build Assets (${{ matrix.name }})
+    if: github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == matrix.name
     runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
     strategy:
       fail-fast: false
       matrix:
@@ -63,7 +82,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}".TrimStart('v')
+          $version = "${env:RELEASE_TAG}".TrimStart('v')
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item "target/release/databeam.exe" "dist/databeam_v${version}_windows-x64.exe"
 
@@ -72,23 +91,30 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           mkdir -p dist
           cargo bundle --release --format osx
+
           app_path="target/release/bundle/osx/DataBeam.app"
           if [ ! -d "${app_path}" ]; then
             echo "No macOS app bundle produced at ${app_path}"
-            find target/release -maxdepth 5 -type d -name '*.app' | sort
+            find target/release -maxdepth 6 -type d -name '*.app' | sort
             exit 1
           fi
-          ditto -c -k --sequesterRsrc --keepParent "${app_path}" "dist/databeam_v${version}_macos-arm64.app.zip"
+
+          # Ad-hoc sign to avoid invalid-signature Gatekeeper errors after packaging.
+          codesign --force --deep --sign - "${app_path}"
+          codesign --verify --deep --strict --verbose=2 "${app_path}"
+
+          dmg_path="dist/databeam_v${version}_macos-arm64.dmg"
+          hdiutil create -volname "DataBeam" -srcfolder "${app_path}" -ov -format UDZO "${dmg_path}"
 
       - name: Package Linux x64 deb
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           mkdir -p dist
           cargo bundle --release --format deb
           deb_path="$(find target/release/bundle/deb -maxdepth 1 -name '*.deb' -print -quit)"
@@ -110,6 +136,9 @@ jobs:
     name: Publish GitHub Release
     runs-on: ubuntu-22.04
     needs: build-assets
+    if: always() && needs.build-assets.result == 'success'
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
 
     steps:
       - name: Download all artifacts
@@ -128,7 +157,7 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: DataBeam ${{ github.ref_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: DataBeam ${{ env.RELEASE_TAG }}
           generate_release_notes: true
           files: dist/*
