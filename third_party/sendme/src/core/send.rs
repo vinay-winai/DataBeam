@@ -392,7 +392,7 @@ async fn show_provide_progress_with_logging(
     entry_type: String,
 ) -> anyhow::Result<()> {
     use n0_future::FuturesUnordered;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -401,6 +401,7 @@ async fn show_provide_progress_with_logging(
     #[derive(Clone)]
     struct TransferState {
         start_time: Instant,
+        total_size: u64,
     }
 
     let transfer_states: Arc<Mutex<std::collections::HashMap<(u64, u64), TransferState>>> =
@@ -452,17 +453,16 @@ async fn show_provide_progress_with_logging(
                             while let Ok(Some(update)) = rx.recv().await {
                                 match update {
                                     iroh_blobs::provider::events::RequestUpdate::Started(_m) => {
-                                        {
-                                            let mut states = transfer_states_task.lock().await;
-                                            states.entry((connection_id, request_id))
-                                                .or_insert(TransferState {
-                                                    start_time: Instant::now(),
-                                                });
-                                        }
-
                                         if !transfer_started {
                                             let active_count = {
-                                                let states = transfer_states_task.lock().await;
+                                                let mut states = transfer_states_task.lock().await;
+                                                states.insert(
+                                                    (connection_id, request_id),
+                                                    TransferState {
+                                                        start_time: Instant::now(),
+                                                        total_size: total_file_size,
+                                                    }
+                                                );
                                                 states.len()
                                             };
 
@@ -484,6 +484,7 @@ async fn show_provide_progress_with_logging(
                                                     (connection_id, request_id),
                                                     TransferState {
                                                         start_time: Instant::now(),
+                                                        total_size: total_file_size,
                                                     }
                                                 );
                                                 states.len()
@@ -494,7 +495,6 @@ async fn show_provide_progress_with_logging(
                                             if !has_emitted_started_task.swap(true, Ordering::SeqCst) {
                                                 emit_event(&app_handle_task, "transfer-started");
                                             }
-
                                             transfer_started = true;
                                             has_any_transfer_task.store(true, Ordering::SeqCst);
                                         }
@@ -507,12 +507,7 @@ async fn show_provide_progress_with_logging(
                                                 0.0
                                             };
 
-                                            emit_progress_event(
-                                                &app_handle_task,
-                                                m.end_offset.min(total_file_size),
-                                                total_file_size,
-                                                speed_bps,
-                                            );
+                                            emit_progress_event(&app_handle_task, m.end_offset.min(state.total_size), state.total_size, speed_bps);
                                         }
                                     }
                                     iroh_blobs::provider::events::RequestUpdate::Completed(_m) => {
@@ -564,15 +559,8 @@ async fn show_provide_progress_with_logging(
                                                     && completed_after >= min_required
                                                     && !new_requests_arrived
                                                     && !has_active_transfers
-                                                    && !last_request_recent
-                                                {
+                                                    && !last_request_recent {
                                                     emit_event(&app_handle_task, "transfer-completed");
-                                                    has_emitted_started_task.store(false, Ordering::SeqCst);
-                                                    
-                                                    // Reset all state for the next serve cycle
-                                                    active_requests_task.store(0, Ordering::SeqCst);
-                                                    completed_requests_task.store(0, Ordering::SeqCst);
-                                                    has_any_transfer_task.store(false, Ordering::SeqCst);
                                                 }
                                             }
                                         }
@@ -596,12 +584,6 @@ async fn show_provide_progress_with_logging(
 
                                             if completed >= active {
                                                 emit_event(&app_handle_task, "transfer-failed");
-                                                has_emitted_started_task.store(false, Ordering::SeqCst);
-                                                
-                                                // Reset all state for the next serve cycle
-                                                active_requests_task.store(0, Ordering::SeqCst);
-                                                completed_requests_task.store(0, Ordering::SeqCst);
-                                                has_any_transfer_task.store(false, Ordering::SeqCst);
                                             }
                                         }
                                     }
@@ -646,8 +628,7 @@ async fn show_provide_progress_with_logging(
                                         && completed_after >= min_required
                                         && !new_requests_arrived
                                         && !has_active_transfers
-                                        && !last_request_recent
-                                    {
+                                        && !last_request_recent {
                                         emit_event(&app_handle_task, "transfer-completed");
                                     }
                                 }
@@ -680,3 +661,4 @@ async fn show_provide_progress_with_logging(
 
     Ok(())
 }
+

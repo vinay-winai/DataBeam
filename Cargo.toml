@@ -26,6 +26,9 @@ portable-pty = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 sendme_native = { package = "sendme", path = "third_party/sendme", default-features = false }
 
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
+
 [profile.release]
 opt-level = "z"
 lto = true
@@ -41,6 +44,11 @@ name = "DataBeam"
 identifier = "com.vinaywinai.databeam"
 short_description = "Secure GUI wrapper for croc and sendme"
 category = "Productivity"
+icon = [
+  "assets/icons/icon-512.png",
+  "assets/icons/icon.ico",
+  "assets/icons/icon.icns",
+]
 copyright = "Copyright (c) DataBeam"
 linux_use_terminal = false
 deb_depends = [

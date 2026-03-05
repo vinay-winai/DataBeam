@@ -117,7 +117,6 @@ struct DataBeamApp {
     croc_custom_code: String,
     croc_use_custom_code: bool,
     croc_recent_codes: Vec<String>,
-    croc_show_qr: bool,
     croc_text_mode: bool,
     croc_text_value: String,
 
@@ -203,7 +202,6 @@ impl Default for DataBeamApp {
             croc_custom_code: String::new(),
             croc_use_custom_code: false,
             croc_recent_codes: Vec::new(),
-            croc_show_qr: false,
             croc_text_mode: false,
             croc_text_value: String::new(),
             receive_code: String::new(),
@@ -1267,13 +1265,7 @@ impl DataBeamApp {
                                         self.transfer_code = Some(code);
                                     }
                                 }
-                                if self.selected_tool == SelectedTool::Croc
-                                    && self.view == AppView::Send
-                                    && self.croc_show_qr
-                                    && self.transfer_code.is_some()
-                                {
-                                    self.croc_qr_popup_open = true;
-                                }
+
                                 if self.selected_tool == SelectedTool::Sendme
                                     && self.view == AppView::Send
                                     && self.transfer_phase == TransferPhase::Preparing
@@ -1617,31 +1609,40 @@ impl DataBeamApp {
             }
         });
 
-        let dropped: Vec<PathBuf> = ctx.input(|i| {
-            i.raw
-                .dropped_files
-                .iter()
-                .filter_map(|f| f.path.clone())
-                .collect()
+        let (mut dropped, fallback_payloads): (Vec<PathBuf>, Vec<String>) = ctx.input(|i| {
+            let mut direct_paths = Vec::new();
+            let mut payloads = Vec::new();
+
+            for file in &i.raw.dropped_files {
+                if let Some(path) = file.path.clone() {
+                    direct_paths.push(path);
+                } else if !file.name.trim().is_empty() {
+                    payloads.push(file.name.clone());
+                }
+            }
+
+            for event in &i.events {
+                let text = match event {
+                    egui::Event::Paste(s) | egui::Event::Text(s) => s,
+                    _ => continue,
+                };
+                if looks_like_file_drop_payload(text) {
+                    payloads.push(text.clone());
+                }
+            }
+
+            (direct_paths, payloads)
         });
-        let dropped = if dropped.is_empty() {
-            ctx.input(|i| {
-                i.events
-                    .iter()
-                    .filter_map(|e| match e {
-                        egui::Event::Paste(s) | egui::Event::Text(s) if s.contains("file://") => {
-                            Some(s.as_str())
-                        }
-                        _ => None,
-                    })
-                    .flat_map(parse_file_uri_list)
-                    .collect::<Vec<PathBuf>>()
-            })
-        } else {
-            dropped
-        };
+
+        if dropped.is_empty() {
+            for payload in fallback_payloads {
+                dropped.extend(parse_file_drop_payload(&payload));
+            }
+        }
 
         if !dropped.is_empty() {
+            dropped.sort();
+            dropped.dedup();
             if self.view != AppView::Send {
                 self.view = AppView::Send;
             }
@@ -1692,8 +1693,7 @@ impl DataBeamApp {
 
         match self.selected_tool {
             SelectedTool::Croc => {
-                let wants_custom =
-                    self.croc_use_custom_code || !self.croc_custom_code.trim().is_empty();
+                let wants_custom = self.croc_use_custom_code;
                 let custom_code = if wants_custom {
                     let trimmed = self.croc_custom_code.trim();
                     if trimmed.is_empty() {
@@ -1717,9 +1717,6 @@ impl DataBeamApp {
                         return;
                     }
                     self.transfer_code = Some(code.clone());
-                    if self.croc_show_qr {
-                        self.croc_qr_popup_open = true;
-                    }
                 }
                 let opts = CrocSendOptions {
                     paths: self.send_paths(),
@@ -2386,10 +2383,6 @@ impl DataBeamApp {
                 ui.horizontal(|ui| {
                     ui.radio_value(&mut self.croc_use_custom_code, false, "Random code");
                     ui.radio_value(&mut self.croc_use_custom_code, true, "Custom code");
-                    ui.checkbox(
-                        &mut self.croc_show_qr,
-                        RichText::new("Show QR popup").size(11.0),
-                    );
                 });
 
                 if self.croc_use_custom_code
@@ -3056,7 +3049,7 @@ impl DataBeamApp {
                                         "Downloading…"
                                     }
                                 } else {
-                                    "Transferring…"
+                                    "Uploading on sender..."
                                 }
                             }
                             TransferPhase::EazySharingTicket => "Sharing ticket via Croc…",
@@ -3132,16 +3125,26 @@ impl DataBeamApp {
                                 }
                             }
                             TransferPhase::Transferring => {
-                                let progress_label = format!("Progress: {}", pct_text);
+                                let progress_label = if self.view == AppView::Send {
+                                    format!("Upload progress (sender): {}", pct_text)
+                                } else {
+                                    format!("Download progress: {}", pct_text)
+                                };
                                 ui.label(
                                     RichText::new(progress_label)
                                         .size(10.0)
                                         .color(TEXT_SECONDARY),
                                 );
                                 if total > 0 {
+                                    let data_label = if self.view == AppView::Send {
+                                        "Uploaded (sender)"
+                                    } else {
+                                        "Downloaded"
+                                    };
                                     ui.label(
                                         RichText::new(format!(
-                                            "Data: {}/{}",
+                                            "{}: {}/{}",
+                                            data_label,
                                             format_file_size(done),
                                             format_file_size(total)
                                         ))
@@ -3150,9 +3153,15 @@ impl DataBeamApp {
                                     );
                                 }
                                 if let Some(speed) = self.transfer_speed_bps {
+                                    let speed_label = if self.view == AppView::Send {
+                                        "Upload speed"
+                                    } else {
+                                        "Download speed"
+                                    };
                                     ui.label(
                                         RichText::new(format!(
-                                            "Speed: {}/s",
+                                            "{}: {}/s",
+                                            speed_label,
                                             format_file_size(speed as u64)
                                         ))
                                         .size(10.0)
@@ -3207,8 +3216,13 @@ impl DataBeamApp {
                                 ui.label(RichText::new(label).size(10.0).color(TEXT_SECONDARY));
                             }
                             TransferPhase::Transferring => {
+                                let transferring_label = if self.view == AppView::Send {
+                                    "Uploading on sender..."
+                                } else {
+                                    "Downloading..."
+                                };
                                 ui.label(
-                                    RichText::new("Transferring...")
+                                    RichText::new(transferring_label)
                                         .size(10.0)
                                         .color(TEXT_SECONDARY),
                                 );
@@ -3243,18 +3257,30 @@ impl DataBeamApp {
                     let total = self.transfer_total_bytes.unwrap_or(0);
                     ui.horizontal_wrapped(|ui| {
                         if total > 0 {
+                            let data_label = if self.view == AppView::Send {
+                                "Uploaded (sender)"
+                            } else {
+                                "Downloaded"
+                            };
                             ui.label(
                                 RichText::new(format!(
-                                    "Data: {}/{}",
+                                    "{}: {}/{}",
+                                    data_label,
                                     format_file_size(done),
                                     format_file_size(total)
                                 ))
                                 .size(10.0)
                                 .color(TEXT_MUTED),
                             );
+                            let progress_label = if self.view == AppView::Send {
+                                "Upload progress (sender)"
+                            } else {
+                                "Download progress"
+                            };
                             ui.label(
                                 RichText::new(format!(
-                                    "Progress: {:.1}%",
+                                    "{}: {:.1}%",
+                                    progress_label,
                                     if total > 0 {
                                         (done as f64 / total as f64 * 100.0).clamp(0.0, 100.0)
                                     } else {
@@ -3266,9 +3292,15 @@ impl DataBeamApp {
                             );
                         }
                         if let Some(speed) = self.transfer_speed_bps {
+                            let speed_label = if self.view == AppView::Send {
+                                "Upload speed"
+                            } else {
+                                "Download speed"
+                            };
                             ui.label(
                                 RichText::new(format!(
-                                    "Speed: {}/s",
+                                    "{}: {}/s",
+                                    speed_label,
                                     format_file_size(speed as u64)
                                 ))
                                 .size(10.0)
@@ -3378,53 +3410,14 @@ fn is_masked_croc_code(code: &str) -> bool {
 }
 
 fn databeam_icon() -> egui::IconData {
-    let width = 64u32;
-    let height = 64u32;
-    let mut rgba = vec![0u8; (width * height * 4) as usize];
-
-    let set_px = |buf: &mut [u8], x: u32, y: u32, r: u8, g: u8, b: u8, a: u8| {
-        let idx = ((y * width + x) * 4) as usize;
-        buf[idx] = r;
-        buf[idx + 1] = g;
-        buf[idx + 2] = b;
-        buf[idx + 3] = a;
-    };
-
-    let cx = 32.0f32;
-    let cy = 32.0f32;
-    for y in 0..height {
-        for x in 0..width {
-            let dx = x as f32 - cx;
-            let dy = y as f32 - cy;
-            let d2 = dx * dx + dy * dy;
-            if d2 <= 30.0 * 30.0 {
-                set_px(&mut rgba, x, y, 214, 66, 36, 255);
-            }
-            if d2 <= 26.0 * 26.0 {
-                set_px(&mut rgba, x, y, 20, 20, 20, 255);
-            }
-            if d2 <= 22.0 * 22.0 {
-                set_px(&mut rgba, x, y, 214, 66, 36, 255);
-            }
-        }
-    }
-
-    for y in 12..52 {
-        for x in 18..46 {
-            let p1 = (x as i32) - (y as i32) + 8;
-            let p2 = (x as i32) - (y as i32) - 6;
-            let p3 = (x as i32) + (y as i32) - 54;
-            let p4 = (x as i32) + (y as i32) - 70;
-            let in_top = p1 >= 0 && p2 <= 0 && y <= 34;
-            let in_bottom = p3 >= 0 && p4 <= 0 && y >= 28;
-            if in_top || in_bottom {
-                set_px(&mut rgba, x, y, 12, 12, 12, 255);
-            }
-        }
-    }
+    let png = include_bytes!("../assets/icons/icon-256.png");
+    let image = image::load_from_memory(png)
+        .expect("embedded app icon must decode")
+        .into_rgba8();
+    let (width, height) = image.dimensions();
 
     egui::IconData {
-        rgba,
+        rgba: image.into_raw(),
         width,
         height,
     }
@@ -3902,39 +3895,103 @@ fn is_probable_croc_text_payload_line(line: &str) -> bool {
     !looks_like_status
 }
 
-fn parse_file_uri_list(text: &str) -> Vec<PathBuf> {
+fn looks_like_file_drop_payload(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.contains("file://") {
+        return true;
+    }
+    if !trimmed.contains('\n') && !trimmed.contains('\r') {
+        return false;
+    }
+
+    for raw in trimmed.lines() {
+        let line = raw.trim().trim_matches('"');
+        if line.eq_ignore_ascii_case("copy") || line.eq_ignore_ascii_case("cut") {
+            return true;
+        }
+        if PathBuf::from(line).is_absolute() {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn parse_file_drop_payload(text: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for raw in text.lines() {
-        let line = raw.trim();
+        let line = raw.trim().trim_matches('\0').trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if !line.starts_with("file://") {
+        if line.eq_ignore_ascii_case("copy") || line.eq_ignore_ascii_case("cut") {
             continue;
         }
-        let uri_body = line
-            .strip_prefix("file://")
-            .unwrap_or("")
-            .split('#')
-            .next()
-            .unwrap_or("");
-        if uri_body.is_empty() {
+        if line.starts_with("file://") {
+            if let Some(path) = path_from_file_uri(line) {
+                if path.exists() {
+                    out.push(path);
+                }
+            }
             continue;
         }
-        let decoded = percent_decode_uri_component(uri_body);
-        #[cfg(target_os = "windows")]
-        let path = {
-            // file:///C:/path -> C:/path
-            let p = decoded.trim_start_matches('/');
-            PathBuf::from(p)
-        };
-        #[cfg(not(target_os = "windows"))]
-        let path = PathBuf::from(decoded);
-        if path.exists() {
+
+        let path = PathBuf::from(line.trim_matches('"'));
+        if path.is_absolute() && path.exists() {
             out.push(path);
         }
     }
+
     out
+}
+
+fn path_from_file_uri(uri: &str) -> Option<PathBuf> {
+    let uri_body = uri
+        .strip_prefix("file://")?
+        .split('#')
+        .next()
+        .unwrap_or("")
+        .split('?')
+        .next()
+        .unwrap_or("");
+    if uri_body.is_empty() {
+        return None;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // file:///C:/path -> C:/path
+        // file://localhost/C:/path -> C:/path
+        let decoded = percent_decode_uri_component(uri_body);
+        let cleaned = decoded.strip_prefix("localhost/").unwrap_or(&decoded);
+        let trimmed = cleaned.trim_start_matches('/');
+        if trimmed.is_empty() {
+            return None;
+        }
+        return Some(PathBuf::from(trimmed));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // file:///path or file://localhost/path or file://host/path
+        let normalized = if uri_body.starts_with('/') {
+            uri_body.to_string()
+        } else if let Some(rest) = uri_body.strip_prefix("localhost/") {
+            format!("/{rest}")
+        } else if let Some((_host, rest)) = uri_body.split_once('/') {
+            format!("/{rest}")
+        } else {
+            return None;
+        };
+        let decoded = percent_decode_uri_component(&normalized);
+        if decoded.is_empty() {
+            return None;
+        }
+        return Some(PathBuf::from(decoded));
+    }
 }
 
 fn percent_decode_uri_component(input: &str) -> String {

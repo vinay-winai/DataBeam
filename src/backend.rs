@@ -29,7 +29,6 @@ use std::os::windows::process::CommandExt;
 // DataBeam uses managed downloads or system-installed binaries.
 
 const CROC_GZ: &[u8] = &[];
-const SENDME_GZ: &[u8] = &[];
 
 /// Get the cache directory for extracted binaries
 fn bundled_bin_dir() -> PathBuf {
@@ -128,6 +127,44 @@ struct GitHubRelease {
 struct GitHubAsset {
     name: String,
     browser_download_url: String,
+}
+
+fn native_sendme_version() -> Option<&'static str> {
+    let mut in_package = false;
+    for line in include_str!("../third_party/sendme/Cargo.toml").lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_package = trimmed == "[package]";
+            continue;
+        }
+        if !in_package || trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "version" {
+            continue;
+        }
+        let version = value.trim().trim_matches('"');
+        if !version.is_empty() {
+            return Some(version);
+        }
+    }
+    None
+}
+
+fn detect_native_sendme() -> ToolStatus {
+    let version = native_sendme_version()
+        .map(|version| format!("sendme {version} (native)"))
+        .or_else(|| Some("sendme (native)".to_string()));
+
+    ToolStatus {
+        tool: Tool::Sendme,
+        available: true,
+        path: None,
+        version,
+    }
 }
 
 fn managed_binary_name(tool: &Tool) -> String {
@@ -404,16 +441,16 @@ fn install_managed_binary(tool: &Tool) -> Option<PathBuf> {
 /// 2) Otherwise download platform-specific binaries from official GitHub releases.
 pub fn init_bundled_binaries() -> (Option<PathBuf>, Option<PathBuf>) {
     let mut croc_path = extract_bundled_binary(&managed_binary_name(&Tool::Croc), CROC_GZ);
-    let mut sendme_path = extract_bundled_binary(&managed_binary_name(&Tool::Sendme), SENDME_GZ);
 
-    // Prefer managed binaries on every platform to keep versions consistent across peers.
+    // Prefer managed Croc binaries on every platform for consistent behavior.
     // If managed download is unavailable, detection later falls back to system PATH.
     if croc_path.is_none() {
         croc_path = install_managed_binary(&Tool::Croc);
     }
-    if sendme_path.is_none() {
-        sendme_path = install_managed_binary(&Tool::Sendme);
-    }
+
+    // Sendme is linked as a native Rust library (third_party/sendme), so no external
+    // sendme binary is required for transfers.
+    let sendme_path = None;
 
     (croc_path, sendme_path)
 }
@@ -489,11 +526,11 @@ fn detect_tool_with_bundled(tool: &Tool, bundled_path: Option<&PathBuf>) -> Tool
 
 pub fn detect_all_tools(
     bundled_croc: Option<&PathBuf>,
-    bundled_sendme: Option<&PathBuf>,
+    _bundled_sendme: Option<&PathBuf>,
 ) -> Vec<ToolStatus> {
     vec![
         detect_tool_with_bundled(&Tool::Croc, bundled_croc),
-        detect_tool_with_bundled(&Tool::Sendme, bundled_sendme),
+        detect_native_sendme(),
     ]
 }
 
@@ -1012,7 +1049,10 @@ pub fn sendme_send(
         };
 
         let _ = tx.send(TransferMsg::Code(share.ticket.clone()));
-        let _ = tx.send(TransferMsg::Output(format!("sendme receive {}", share.ticket)));
+        let _ = tx.send(TransferMsg::Output(format!(
+            "sendme receive {}",
+            share.ticket
+        )));
         let _ = tx.send(TransferMsg::WaitingForReceiver);
 
         let mut had_transfer = false;
@@ -1022,6 +1062,9 @@ pub fn sendme_send(
         let mut last_logged_done: u64 = 0;
         let mut last_seen_total: u64 = 0;
         let mut last_seen_speed_bps: f64 = 0.0;
+        let mut sender_cycle_done_base: u64 = 0;
+        let mut sender_last_file_done: Option<u64> = None;
+        let mut sender_last_file_total: Option<u64> = None;
         let mut waiting_for_new_connection = false;
         let mut waiting_seen_zero_connections = false;
         loop {
@@ -1057,38 +1100,51 @@ pub fn sendme_send(
                         let _ = tx.send(TransferMsg::SenderTransferActivity);
                         sender_activity_emitted = true;
                     }
+
                     let raw_done = done.min(total.max(done));
-                    let mut shown_done = raw_done;
-                    last_seen_total = total.max(shown_done).max(1);
-                    last_seen_speed_bps = speed_bps;
-                    if total > 0 && shown_done >= total {
-                        shown_done = total.saturating_sub(1);
+                    let current_total = total.max(raw_done).max(1);
+                    if let (Some(prev_done), Some(prev_total)) =
+                        (sender_last_file_done, sender_last_file_total)
+                    {
+                        // Native sender progress is request-scoped. Detect rollover to the next
+                        // request and accumulate prior request bytes into a transfer-wide counter.
+                        let rollover = raw_done.saturating_add(256 * 1024) < prev_done;
+                        let changed_total_rollover =
+                            current_total != prev_total && raw_done <= prev_done;
+                        if rollover || changed_total_rollover {
+                            sender_cycle_done_base =
+                                sender_cycle_done_base.saturating_add(prev_done.min(prev_total));
+                        }
                     }
-                    if total > 0 {
-                        let progress = (shown_done.min(total) as f32 / total as f32).clamp(0.0, 1.0);
-                        if progress > sender_progress_max {
-                            sender_progress_max = progress;
+                    sender_last_file_done = Some(raw_done);
+                    sender_last_file_total = Some(current_total);
+
+                    let aggregate_done = sender_cycle_done_base
+                        .saturating_add(raw_done.min(current_total))
+                        .min(current_total);
+                    last_seen_total = current_total;
+                    last_seen_speed_bps = speed_bps;
+
+                    if current_total > 0 {
+                        let progress = (aggregate_done.min(current_total) as f32
+                            / current_total as f32)
+                            .clamp(0.0, 1.0);
+                        if progress > sender_progress_max || progress >= 0.999 {
+                            sender_progress_max = sender_progress_max.max(progress);
                             let _ = tx.send(TransferMsg::Progress(sender_progress_max));
                         }
                     }
 
-                    let should_log = shown_done > last_logged_done || shown_done == 0;
+                    let should_log = aggregate_done > last_logged_done || aggregate_done == 0;
                     if should_log && last_progress_emit.elapsed() >= Duration::from_millis(200) {
-                        let shown_total = total.max(shown_done).max(1);
-                        let pct = if total > 0 {
-                            (shown_done.min(total) as f64 / total as f64 * 100.0).clamp(0.0, 100.0)
-                        } else {
-                            0.0
-                        };
                         let line = format!(
-                            "Sender progress {:.1}% (done {} total {}) {}",
-                            pct,
-                            shown_done,
-                            shown_total,
+                            "[3/4] Uploading ... {} / {} {}",
+                            format_size_unit(aggregate_done),
+                            format_size_unit(current_total),
                             format_speed_unit(speed_bps)
                         );
                         let _ = tx.send(TransferMsg::Output(line));
-                        last_logged_done = shown_done;
+                        last_logged_done = aggregate_done;
                         last_progress_emit = Instant::now();
                     }
                 }
@@ -1119,15 +1175,17 @@ pub fn sendme_send(
                 Ok(NativeSendmeEvent::TransferCompleted) => {
                     if last_seen_total > 0 {
                         let final_line = format!(
-                            "Sender progress 100.0% (done {} total {}) {}",
-                            last_seen_total,
-                            last_seen_total,
+                            "[3/4] Uploading ... {} / {} {}",
+                            format_size_unit(last_seen_total),
+                            format_size_unit(last_seen_total),
                             format_speed_unit(last_seen_speed_bps)
                         );
                         let _ = tx.send(TransferMsg::Output(final_line));
                     }
                     let _ = tx.send(TransferMsg::Progress(1.0));
-                    let _ = tx.send(TransferMsg::Output("finished sending to client".to_string()));
+                    let _ = tx.send(TransferMsg::Output(
+                        "finished sending to client".to_string(),
+                    ));
                     if opts.one_shot {
                         let _ = tx.send(TransferMsg::PeerDisconnected);
                         break;
@@ -1141,6 +1199,9 @@ pub fn sendme_send(
                         last_logged_done = 0;
                         last_seen_total = 0;
                         last_seen_speed_bps = 0.0;
+                        sender_cycle_done_base = 0;
+                        sender_last_file_done = None;
+                        sender_last_file_total = None;
                     }
                 }
                 Ok(NativeSendmeEvent::TransferFailed) => {
@@ -1170,6 +1231,9 @@ pub fn sendme_send(
                         last_logged_done = 0;
                         last_seen_total = 0;
                         last_seen_speed_bps = 0.0;
+                        sender_cycle_done_base = 0;
+                        sender_last_file_done = None;
+                        sender_last_file_total = None;
                         continue;
                     }
                 }
@@ -1204,6 +1268,9 @@ pub fn sendme_send(
                         last_logged_done = 0;
                         last_seen_total = 0;
                         last_seen_speed_bps = 0.0;
+                        sender_cycle_done_base = 0;
+                        sender_last_file_done = None;
+                        sender_last_file_total = None;
                         thread::sleep(Duration::from_millis(200));
                         continue;
                     }
@@ -1905,6 +1972,3 @@ mod tests {
         );
     }
 }
-
-
-
