@@ -1,6 +1,6 @@
 [package]
 name = "databeam"
-version = "0.1.11"
+version = "0.1.15"
 edition = "2021"
 description = "A beautiful GUI wrapper for croc and sendme file transfer tools"
 authors = ["DataBeam <databeam@users.noreply.github.com>"]
@@ -25,6 +25,9 @@ qrcode = "0.14"
 portable-pty = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 sendme_native = { package = "sendme", path = "third_party/sendme", default-features = false }
+
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+single-instance = "0.3"
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"

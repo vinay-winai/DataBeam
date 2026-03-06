@@ -289,7 +289,7 @@ fn download_bytes(url: &str) -> Result<Vec<u8>, String> {
 
     let script = format!(
         "$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -UseBasicParsing -Headers @{{'User-Agent'='Mozilla/5.0 (Windows NT 10.0; Win64; x64) DataBeam/{}'; 'Accept'='application/vnd.github+json, application/octet-stream'}} -Uri '{}' -OutFile '{}'",
-        "0.1.0",
+        env!("CARGO_PKG_VERSION"),
         escape_ps_single_quote(url),
         escape_ps_single_quote(&tmp_path_str)
     );

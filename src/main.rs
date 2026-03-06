@@ -4060,7 +4060,27 @@ fn dir_size_capped(path: &std::path::Path, depth: u32, max_depth: u32) -> u64 {
 
 // ── Entry Point ────────────────────────────────────────────────────
 
+#[cfg(all(not(debug_assertions), any(target_os = "windows", target_os = "linux")))]
+fn enforce_single_instance_release() -> Option<single_instance::SingleInstance> {
+    match single_instance::SingleInstance::new("com.vinaywinai.databeam.release") {
+        Ok(instance) => {
+            if !instance.is_single() {
+                eprintln!("DataBeam is already running; exiting duplicate release instance.");
+                std::process::exit(0);
+            }
+            Some(instance)
+        }
+        Err(err) => {
+            eprintln!("Failed to create single-instance lock: {err}");
+            None
+        }
+    }
+}
+
 fn main() -> eframe::Result {
+    #[cfg(all(not(debug_assertions), any(target_os = "windows", target_os = "linux")))]
+    let _single_instance_guard = enforce_single_instance_release();
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([600.0, 640.0])
