@@ -1332,29 +1332,17 @@ impl DataBeamApp {
                                             let normalized_ticket =
                                                 normalize_sendme_ticket(&ticket).unwrap_or(ticket);
                                             self.eazysendme_ticket =
-                                                Some(normalized_ticket.clone());
-
-                                            // Start sendme_receive
-                                            if let Some(binary) =
-                                                self.get_tool_binary(&Tool::Sendme)
-                                            {
-                                                let opts = SendmeReceiveOptions {
-                                                    ticket: normalized_ticket,
-                                                    output_dir: self.receive_output_dir.clone(),
-                                                };
-                                                let (new_rx, new_handle) =
-                                                    sendme_receive(opts, &binary);
-                                                self.transfer_rx = Some(new_rx);
-                                                self.transfer_handle = Some(new_handle);
-                                                self.transfer_phase = TransferPhase::Preparing;
-                                                self.transfer_start_time =
-                                                    Some(self.animation_time);
-                                                return; // Exit poll_transfer, will resume next frame with new_rx
-                                            } else {
-                                                self.transfer_state = TransferState::Failed(
-                                                    "Sendme binary not found".to_string(),
-                                                );
-                                            }
+                                                Some(normalized_ticket.clone()); // Start native sendme_receive
+                                            let opts = SendmeReceiveOptions {
+                                                ticket: normalized_ticket,
+                                                output_dir: self.receive_output_dir.clone(),
+                                            };
+                                            let (new_rx, new_handle) = sendme_receive(opts, "");
+                                            self.transfer_rx = Some(new_rx);
+                                            self.transfer_handle = Some(new_handle);
+                                            self.transfer_phase = TransferPhase::Preparing;
+                                            self.transfer_start_time = Some(self.animation_time);
+                                            return; // Exit poll_transfer, will resume next frame with new_rx
                                         } else {
                                             self.transfer_state = TransferState::Failed(
                                                 "Croc finished but no ticket found".to_string(),
