@@ -701,7 +701,9 @@ impl DataBeamApp {
         };
         let sendme_raw_progress_line =
             sendme_like && self.view == AppView::Receive && sendme_r_counter.is_some();
-        if is_cli_progress_line(line) || sendme_raw_progress_line {
+        let sendme_sender_request_line =
+            sendme_like && self.view == AppView::Send && is_sendme_sender_request_line(line);
+        if is_cli_progress_line(line) || sendme_raw_progress_line || sendme_sender_request_line {
             if !(self.selected_tool == SelectedTool::Croc && croc_counter_any.is_some()) {
                 self.latest_cli_progress_line = Some(compact_cli_progress_line(line));
             }
@@ -781,7 +783,7 @@ impl DataBeamApp {
                     }
                 }
             }
-            if self.view == AppView::Send {
+            if self.view == AppView::Send && !sendme_sender_request_line {
                 let item_index = parse_sendme_item_index(line);
                 let sender_payload = parse_payload_progress(line);
                 if let (Some((item_done, item_total)), Some(idx)) = (sender_payload, item_index) {
@@ -799,8 +801,6 @@ impl DataBeamApp {
                                 .sendme_done_bytes_est
                                 .saturating_add(done.saturating_sub(prev_done));
                         } else if item_total != prev_total {
-                            // Progress reset for a reused item slot: count prior file as complete,
-                            // then start accumulating the next file from its new done value.
                             self.sendme_done_bytes_est = self
                                 .sendme_done_bytes_est
                                 .saturating_sub(prev_done)
@@ -811,8 +811,6 @@ impl DataBeamApp {
                         self.sendme_item_totals.insert(key, item_total);
                     }
                 } else if let Some((item_done, item_total)) = sender_payload {
-                    // Fallback for noisy/truncated sender lines that miss `i <idx>` tokens:
-                    // treat a done drop as rollover into the next file in a sequential stream.
                     let done = item_done.min(item_total);
                     if item_total > 0 && line.contains(" r ") && line.contains(" # ") {
                         if let (Some(prev_done), Some(prev_total)) =
@@ -3565,6 +3563,15 @@ fn parse_sendme_r_payload_progress(line: &str) -> Option<(u64, u64)> {
         return None;
     }
     Some((done, total))
+}
+
+fn is_sendme_sender_request_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with("n ")
+        && trimmed.contains(" r ")
+        && trimmed.contains(" i ")
+        && trimmed.contains(" # ")
+        && parse_payload_progress(trimmed).is_some()
 }
 
 fn is_cli_progress_line(line: &str) -> bool {

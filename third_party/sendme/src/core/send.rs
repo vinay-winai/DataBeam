@@ -18,6 +18,7 @@ use iroh_blobs::{
 use n0_future::StreamExt;
 use n0_future::{task::AbortOnDropHandle, BufferedStreamExt};
 use rand::Rng;
+use serde::Serialize;
 use std::{
     path::{Component, Path, PathBuf},
     time::{Duration, Instant},
@@ -64,6 +65,43 @@ fn emit_active_connection_count(app_handle: &AppHandle, count: usize) {
     }
 }
 
+#[derive(Serialize)]
+struct SenderRequestStartedPayload {
+    endpoint_id: String,
+    connection_id: u64,
+    request_id: u64,
+    item_index: u64,
+    hash_short: String,
+    total_bytes: u64,
+}
+
+#[derive(Serialize)]
+struct SenderRequestProgressPayload {
+    connection_id: u64,
+    request_id: u64,
+    done_bytes: u64,
+}
+
+#[derive(Serialize)]
+struct SenderRequestCompletedPayload {
+    connection_id: u64,
+    request_id: u64,
+}
+
+fn emit_event_with_payload<T: Serialize>(app_handle: &AppHandle, event_name: &str, payload: &T) {
+    if let Some(handle) = app_handle {
+        match serde_json::to_string(payload) {
+            Ok(json) => {
+                if let Err(e) = handle.emit_event_with_payload(event_name, &json) {
+                    tracing::warn!("Failed to emit event {}: {}", event_name, e);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to serialize event {}: {}", event_name, e);
+            }
+        }
+    }
+}
 pub async fn start_share(
     path: PathBuf,
     options: SendOptions,
@@ -397,16 +435,44 @@ async fn show_provide_progress_with_logging(
     use tokio::sync::Mutex;
 
     let mut tasks = FuturesUnordered::new();
+    let connections: Arc<Mutex<std::collections::HashMap<u64, String>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let total_bytes = total_file_size.max(1);
 
     #[derive(Clone)]
     struct TransferState {
-        start_time: Instant,
+        started: bool,
+        count_toward_payload: bool,
         total_size: u64,
+        last_offset: u64,
     }
 
-    let transfer_states: Arc<Mutex<std::collections::HashMap<(u64, u64), TransferState>>> =
-        Arc::new(Mutex::new(std::collections::HashMap::new()));
+    #[derive(Default)]
+    struct ProgressTracker {
+        transfers: std::collections::HashMap<(u64, u64), TransferState>,
+        completed_bytes: u64,
+        started_at: Option<Instant>,
+    }
 
+    fn snapshot_progress(tracker: &ProgressTracker, total_bytes: u64) -> (u64, f64) {
+        let active_done = tracker
+            .transfers
+            .values()
+            .filter(|state| state.count_toward_payload)
+            .map(|state| state.last_offset.min(state.total_size))
+            .sum::<u64>();
+        let done_bytes = tracker.completed_bytes.saturating_add(active_done).min(total_bytes);
+        let speed_bps = tracker
+            .started_at
+            .and_then(|started_at| {
+                let elapsed = started_at.elapsed().as_secs_f64();
+                (elapsed > 0.0).then_some(done_bytes as f64 / elapsed)
+            })
+            .unwrap_or(0.0);
+        (done_bytes, speed_bps)
+    }
+
+    let progress_tracker = Arc::new(Mutex::new(ProgressTracker::default()));
     let active_requests = Arc::new(AtomicUsize::new(0));
     let completed_requests = Arc::new(AtomicUsize::new(0));
     let has_emitted_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -423,9 +489,15 @@ async fn show_provide_progress_with_logging(
                 };
 
                 match item {
-                    iroh_blobs::provider::events::ProviderMessage::ClientConnectedNotify(_msg) => {
+                    iroh_blobs::provider::events::ProviderMessage::ClientConnectedNotify(msg) => {
+                        let endpoint_id = msg
+                            .endpoint_id
+                            .map(|id| id.fmt_short().to_string())
+                            .unwrap_or_else(|| "?".to_string());
+                        connections.lock().await.insert(msg.connection_id, endpoint_id);
                     }
-                    iroh_blobs::provider::events::ProviderMessage::ConnectionClosed(_msg) => {
+                    iroh_blobs::provider::events::ProviderMessage::ConnectionClosed(msg) => {
+                        connections.lock().await.remove(&msg.connection_id);
                     }
                     iroh_blobs::provider::events::ProviderMessage::GetRequestReceivedNotify(msg) => {
                         let connection_id = msg.connection_id;
@@ -435,9 +507,11 @@ async fn show_provide_progress_with_logging(
 
                         let mut last_time = last_request_time.lock().await;
                         *last_time = Some(Instant::now());
+                        drop(last_time);
 
                         let app_handle_task = app_handle.clone();
-                        let transfer_states_task = transfer_states.clone();
+                        let connections_task = connections.clone();
+                        let progress_tracker_task = progress_tracker.clone();
                         let active_requests_task = active_requests.clone();
                         let completed_requests_task = completed_requests.clone();
                         let has_emitted_started_task = has_emitted_started.clone();
@@ -452,20 +526,78 @@ async fn show_provide_progress_with_logging(
 
                             while let Ok(Some(update)) = rx.recv().await {
                                 match update {
-                                    iroh_blobs::provider::events::RequestUpdate::Started(_m) => {
-                                        if !transfer_started {
-                                            let active_count = {
-                                                let mut states = transfer_states_task.lock().await;
-                                                states.insert(
-                                                    (connection_id, request_id),
-                                                    TransferState {
-                                                        start_time: Instant::now(),
-                                                        total_size: total_file_size,
-                                                    }
-                                                );
-                                                states.len()
-                                            };
+                                    iroh_blobs::provider::events::RequestUpdate::Started(msg) => {
+                                        let endpoint_id = connections_task
+                                            .lock()
+                                            .await
+                                            .get(&connection_id)
+                                            .cloned()
+                                            .unwrap_or_else(|| "?".to_string());
+                                        let hash_short = msg.hash.fmt_short().to_string();
+                                        let total_size = msg.size.max(1);
+                                        let count_toward_payload = request_id > 0 && msg.index > 0;
 
+                                        let (active_count, done_bytes, speed_bps) = {
+                                            let mut tracker = progress_tracker_task.lock().await;
+                                            if tracker.started_at.is_none() {
+                                                tracker.started_at = Some(Instant::now());
+                                            }
+                                            let key = (connection_id, request_id);
+                                            match tracker.transfers.remove(&key) {
+                                                Some(state) if state.started => {
+                                                    if state.count_toward_payload {
+                                                        tracker.completed_bytes = tracker
+                                                            .completed_bytes
+                                                            .saturating_add(state.total_size);
+                                                    }
+                                                    tracker.transfers.insert(
+                                                        key,
+                                                        TransferState {
+                                                            started: true,
+                                                            count_toward_payload,
+                                                            total_size,
+                                                            last_offset: 0,
+                                                        },
+                                                    );
+                                                }
+                                                Some(mut state) => {
+                                                    state.started = true;
+                                                    state.count_toward_payload = count_toward_payload;
+                                                    state.total_size = total_size.max(state.last_offset).max(1);
+                                                    tracker.transfers.insert(key, state);
+                                                }
+                                                None => {
+                                                    tracker.transfers.insert(
+                                                        key,
+                                                        TransferState {
+                                                            started: true,
+                                                            count_toward_payload,
+                                                            total_size,
+                                                            last_offset: 0,
+                                                        },
+                                                    );
+                                                }
+                                            }
+                                            let (done_bytes, speed_bps) =
+                                                snapshot_progress(&tracker, total_bytes);
+                                            (tracker.transfers.len(), done_bytes, speed_bps)
+                                        };
+
+                                        emit_event_with_payload(
+                                            &app_handle_task,
+                                            "sender-request-started",
+                                            &SenderRequestStartedPayload {
+                                                endpoint_id,
+                                                connection_id,
+                                                request_id,
+                                                item_index: msg.index,
+                                                hash_short,
+                                                total_bytes: total_size,
+                                            },
+                                        );
+                                        emit_progress_event(&app_handle_task, done_bytes, total_bytes, speed_bps);
+
+                                        if !transfer_started {
                                             emit_active_connection_count(&app_handle_task, active_count);
 
                                             if !has_emitted_started_task.swap(true, Ordering::SeqCst) {
@@ -476,18 +608,11 @@ async fn show_provide_progress_with_logging(
                                             has_any_transfer_task.store(true, Ordering::SeqCst);
                                         }
                                     }
-                                    iroh_blobs::provider::events::RequestUpdate::Progress(m) => {
+                                    iroh_blobs::provider::events::RequestUpdate::Progress(msg) => {
                                         if !transfer_started {
                                             let active_count = {
-                                                let mut states = transfer_states_task.lock().await;
-                                                states.insert(
-                                                    (connection_id, request_id),
-                                                    TransferState {
-                                                        start_time: Instant::now(),
-                                                        total_size: total_file_size,
-                                                    }
-                                                );
-                                                states.len()
+                                                let tracker = progress_tracker_task.lock().await;
+                                                tracker.transfers.len()
                                             };
 
                                             emit_active_connection_count(&app_handle_task, active_count);
@@ -499,25 +624,66 @@ async fn show_provide_progress_with_logging(
                                             has_any_transfer_task.store(true, Ordering::SeqCst);
                                         }
 
-                                        if let Some(state) = transfer_states_task.lock().await.get(&(connection_id, request_id)) {
-                                            let elapsed = state.start_time.elapsed().as_secs_f64();
-                                            let speed_bps = if elapsed > 0.0 {
-                                                m.end_offset as f64 / elapsed
-                                            } else {
-                                                0.0
+                                        let (payload, done_bytes, speed_bps) = {
+                                            let mut tracker = progress_tracker_task.lock().await;
+                                            if tracker.started_at.is_none() {
+                                                tracker.started_at = Some(Instant::now());
+                                            }
+                                            let state = tracker
+                                                .transfers
+                                                .entry((connection_id, request_id))
+                                                .or_insert(TransferState {
+                                                    started: false,
+                                                    count_toward_payload: false,
+                                                    total_size: msg.end_offset.max(1),
+                                                    last_offset: 0,
+                                                });
+                                            state.total_size = state.total_size.max(msg.end_offset).max(1);
+                                            state.last_offset = state
+                                                .last_offset
+                                                .max(msg.end_offset.min(state.total_size));
+                                            let payload = SenderRequestProgressPayload {
+                                                connection_id,
+                                                request_id,
+                                                done_bytes: state.last_offset,
                                             };
+                                            let (done_bytes, speed_bps) =
+                                                snapshot_progress(&tracker, total_bytes);
+                                            (payload, done_bytes, speed_bps)
+                                        };
 
-                                            emit_progress_event(&app_handle_task, m.end_offset.min(state.total_size), state.total_size, speed_bps);
-                                        }
+                                        emit_event_with_payload(
+                                            &app_handle_task,
+                                            "sender-request-progress",
+                                            &payload,
+                                        );
+                                        emit_progress_event(&app_handle_task, done_bytes, total_bytes, speed_bps);
                                     }
-                                    iroh_blobs::provider::events::RequestUpdate::Completed(_m) => {
+                                    iroh_blobs::provider::events::RequestUpdate::Completed(_msg) => {
                                         if transfer_started && !request_completed {
-                                            let active_count = {
-                                                let mut states = transfer_states_task.lock().await;
-                                                states.remove(&(connection_id, request_id));
-                                                states.len()
+                                            let (active_count, done_bytes, speed_bps) = {
+                                                let mut tracker = progress_tracker_task.lock().await;
+                                                if let Some(state) = tracker.transfers.remove(&(connection_id, request_id)) {
+                                                    if state.count_toward_payload {
+                                                        tracker.completed_bytes = tracker
+                                                            .completed_bytes
+                                                            .saturating_add(state.total_size);
+                                                    }
+                                                }
+                                                let (done_bytes, speed_bps) =
+                                                    snapshot_progress(&tracker, total_bytes);
+                                                (tracker.transfers.len(), done_bytes, speed_bps)
                                             };
 
+                                            emit_event_with_payload(
+                                                &app_handle_task,
+                                                "sender-request-completed",
+                                                &SenderRequestCompletedPayload {
+                                                    connection_id,
+                                                    request_id,
+                                                },
+                                            );
+                                            emit_progress_event(&app_handle_task, done_bytes, total_bytes, speed_bps);
                                             emit_active_connection_count(&app_handle_task, active_count);
 
                                             request_completed = true;
@@ -525,8 +691,6 @@ async fn show_provide_progress_with_logging(
                                             let completed = completed_requests_task.fetch_add(1, Ordering::SeqCst) + 1;
                                             let active = active_requests_task.load(Ordering::SeqCst);
 
-                                            // For directories, require at least 2 completed requests
-                                            // to avoid false completion from metadata transfer
                                             let min_required = if entry_type_task == "directory" { 2 } else { 1 };
 
                                             if completed >= active
@@ -542,8 +706,8 @@ async fn show_provide_progress_with_logging(
                                                 let new_requests_arrived = active_after > active_before_wait;
 
                                                 let has_active_transfers = {
-                                                    let states = transfer_states_task.lock().await;
-                                                    !states.is_empty()
+                                                    let tracker = progress_tracker_task.lock().await;
+                                                    !tracker.transfers.is_empty()
                                                 };
 
                                                 let last_request_recent = {
@@ -559,22 +723,28 @@ async fn show_provide_progress_with_logging(
                                                     && completed_after >= min_required
                                                     && !new_requests_arrived
                                                     && !has_active_transfers
-                                                    && !last_request_recent {
+                                                    && !last_request_recent
+                                                {
                                                     emit_event(&app_handle_task, "transfer-completed");
+                                                    has_emitted_started_task.store(false, Ordering::SeqCst);
+
+                                                    active_requests_task.store(0, Ordering::SeqCst);
+                                                    completed_requests_task.store(0, Ordering::SeqCst);
+                                                    has_any_transfer_task.store(false, Ordering::SeqCst);
                                                 }
                                             }
                                         }
                                     }
-                                    iroh_blobs::provider::events::RequestUpdate::Aborted(_m) => {
-                                        tracing::warn!("Request aborted: conn {} req {}",
-                                            connection_id, request_id);
+                                    iroh_blobs::provider::events::RequestUpdate::Aborted(_msg) => {
+                                        tracing::warn!("Request aborted: conn {} req {}", connection_id, request_id);
                                         if transfer_started && !request_completed {
-                                            let active_count = {
-                                                let mut states = transfer_states_task.lock().await;
-                                                states.remove(&(connection_id, request_id));
-                                                states.len()
+                                            let (active_count, done_bytes, speed_bps) = {
+                                                let mut tracker = progress_tracker_task.lock().await;
+                                                tracker.transfers.remove(&(connection_id, request_id));
+                                                let (done_bytes, speed_bps) = snapshot_progress(&tracker, total_bytes);
+                                                (tracker.transfers.len(), done_bytes, speed_bps)
                                             };
-
+                                            emit_progress_event(&app_handle_task, done_bytes, total_bytes, speed_bps);
                                             emit_active_connection_count(&app_handle_task, active_count);
 
                                             request_completed = true;
@@ -584,6 +754,11 @@ async fn show_provide_progress_with_logging(
 
                                             if completed >= active {
                                                 emit_event(&app_handle_task, "transfer-failed");
+                                                has_emitted_started_task.store(false, Ordering::SeqCst);
+
+                                                active_requests_task.store(0, Ordering::SeqCst);
+                                                completed_requests_task.store(0, Ordering::SeqCst);
+                                                has_any_transfer_task.store(false, Ordering::SeqCst);
                                             }
                                         }
                                     }
@@ -591,11 +766,31 @@ async fn show_provide_progress_with_logging(
                             }
 
                             if transfer_started && !request_completed {
+                                let (done_bytes, speed_bps) = {
+                                    let mut tracker = progress_tracker_task.lock().await;
+                                    if let Some(state) = tracker.transfers.remove(&(connection_id, request_id)) {
+                                        if state.count_toward_payload {
+                                            tracker.completed_bytes = tracker
+                                                .completed_bytes
+                                                .saturating_add(state.total_size);
+                                        }
+                                    }
+                                    snapshot_progress(&tracker, total_bytes)
+                                };
+
+                                emit_event_with_payload(
+                                    &app_handle_task,
+                                    "sender-request-completed",
+                                    &SenderRequestCompletedPayload {
+                                        connection_id,
+                                        request_id,
+                                    },
+                                );
+                                emit_progress_event(&app_handle_task, done_bytes, total_bytes, speed_bps);
+
                                 let completed = completed_requests_task.fetch_add(1, Ordering::SeqCst) + 1;
                                 let active = active_requests_task.load(Ordering::SeqCst);
 
-                                // For directories, require at least 2 completed requests
-                                // to avoid false completion from metadata transfer
                                 let min_required = if entry_type_task == "directory" { 2 } else { 1 };
 
                                 if completed >= active
@@ -611,8 +806,8 @@ async fn show_provide_progress_with_logging(
                                     let new_requests_arrived = active_after > active_before_wait;
 
                                     let has_active_transfers = {
-                                        let states = transfer_states_task.lock().await;
-                                        !states.is_empty()
+                                        let tracker = progress_tracker_task.lock().await;
+                                        !tracker.transfers.is_empty()
                                     };
 
                                     let last_request_recent = {
@@ -628,19 +823,18 @@ async fn show_provide_progress_with_logging(
                                         && completed_after >= min_required
                                         && !new_requests_arrived
                                         && !has_active_transfers
-                                        && !last_request_recent {
+                                        && !last_request_recent
+                                    {
                                         emit_event(&app_handle_task, "transfer-completed");
                                     }
                                 }
                             }
                         });
                     }
-                    _ => {
-                    }
+                    _ => {}
                 }
             }
-            Some(_) = tasks.next(), if !tasks.is_empty() => {
-            }
+            Some(_) = tasks.next(), if !tasks.is_empty() => {}
         }
     }
 
@@ -650,8 +844,6 @@ async fn show_provide_progress_with_logging(
         let completed = completed_requests.load(Ordering::SeqCst);
         let active = active_requests.load(Ordering::SeqCst);
 
-        // For directories, require at least 2 completed requests
-        // to avoid false completion from metadata transfer
         let min_required = if entry_type == "directory" { 2 } else { 1 };
 
         if completed >= active && completed >= min_required && completed > 0 {
@@ -661,4 +853,3 @@ async fn show_provide_progress_with_logging(
 
     Ok(())
 }
-

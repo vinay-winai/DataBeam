@@ -9,3 +9,4 @@ dist/*.zip
 dist/*.tar.gz
 dist/*
 !dist/.gitkeep
+temp_*

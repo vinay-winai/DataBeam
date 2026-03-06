@@ -1,4 +1,5 @@
 use crate::core::types::{get_or_create_secret, AppHandle, ReceiveOptions, ReceiveResult};
+use data_encoding::HEXLOWER;
 use iroh::{discovery::dns::DnsDiscovery, Endpoint};
 use iroh_blobs::{
     api::{
@@ -12,6 +13,7 @@ use iroh_blobs::{
     ticket::BlobTicket,
 };
 use n0_future::StreamExt;
+use rand::Rng;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -88,7 +90,13 @@ pub async fn download(
 
     // Use system temp directory instead of current_dir for GUI app
     // This avoids polluting user directories and OS manages cleanup automatically
-    let dir_name = format!(".sendme-recv-{}", ticket.hash().to_hex());
+        let mut suffix = [0u8; 5];
+    rand::rng().fill(&mut suffix);
+    let dir_name = format!(
+        ".sendme-recv-{}-{}",
+        ticket.hash().to_hex(),
+        HEXLOWER.encode(&suffix)
+    );
     let temp_base = std::env::temp_dir();
     let iroh_data_dir = temp_base.join(&dir_name);
     let db = FsStore::load(&iroh_data_dir).await?;
@@ -488,6 +496,7 @@ fn show_get_error(e: GetError) -> GetError {
     }
     e
 }
+
 
 
 

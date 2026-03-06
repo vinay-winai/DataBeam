@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{BufReader, Cursor, Read, Write};
@@ -585,6 +586,29 @@ pub struct SendmeReceiveOptions {
     pub output_dir: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct NativeSenderRequestStarted {
+    endpoint_id: String,
+    connection_id: u64,
+    request_id: u64,
+    item_index: u64,
+    hash_short: String,
+    total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct NativeSenderRequestProgress {
+    connection_id: u64,
+    request_id: u64,
+    done_bytes: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct NativeSenderRequestCompleted {
+    connection_id: u64,
+    request_id: u64,
+}
+
 #[derive(Debug, Clone)]
 enum NativeSendmeEvent {
     TransferStarted,
@@ -593,6 +617,9 @@ enum NativeSendmeEvent {
         total: u64,
         speed_bps: f64,
     },
+    SenderRequestStarted(NativeSenderRequestStarted),
+    SenderRequestProgress(NativeSenderRequestProgress),
+    SenderRequestCompleted(NativeSenderRequestCompleted),
     TransferCompleted,
     TransferFailed,
     ActiveConnectionCount(usize),
@@ -643,6 +670,27 @@ impl NativeSendmeEventEmitter for NativeSendmeEmitter {
                     speed_bps,
                 }
             }
+            "sender-request-started" => {
+                let Ok(payload) = serde_json::from_str::<NativeSenderRequestStarted>(payload)
+                else {
+                    return Ok(());
+                };
+                NativeSendmeEvent::SenderRequestStarted(payload)
+            }
+            "sender-request-progress" => {
+                let Ok(payload) = serde_json::from_str::<NativeSenderRequestProgress>(payload)
+                else {
+                    return Ok(());
+                };
+                NativeSendmeEvent::SenderRequestProgress(payload)
+            }
+            "sender-request-completed" => {
+                let Ok(payload) = serde_json::from_str::<NativeSenderRequestCompleted>(payload)
+                else {
+                    return Ok(());
+                };
+                NativeSendmeEvent::SenderRequestCompleted(payload)
+            }
             "receive-progress" => {
                 let Some((done, total, speed_bps)) = parse_native_progress_payload(payload) else {
                     return Ok(());
@@ -674,6 +722,18 @@ fn parse_native_progress_payload(payload: &str) -> Option<(u64, u64, f64)> {
     Some((done, total, speed_bps))
 }
 
+#[derive(Debug, Clone)]
+struct SenderRequestRenderState {
+    endpoint_id: String,
+    connection_id: u64,
+    request_id: u64,
+    item_index: u64,
+    hash_short: String,
+    total_bytes: u64,
+    done_bytes: u64,
+    started_at: Instant,
+}
+
 fn format_size_unit(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = 1024.0 * 1024.0;
@@ -696,6 +756,59 @@ fn format_speed_unit(speed_bps: f64) -> String {
     }
     let speed = speed_bps.round().max(0.0) as u64;
     format!("{}/s", format_size_unit(speed))
+}
+
+fn format_elapsed_precise(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    let hours = secs / 3600;
+    let minutes = (secs % 3600) / 60;
+    let seconds = secs % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
+fn format_sender_request_bar(done: u64, total: u64, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let total = total.max(1);
+    let done = done.min(total);
+    if done >= total {
+        return "#".repeat(width);
+    }
+    let filled = ((done as f64 / total as f64) * width as f64).floor() as usize;
+    let mut bar = String::with_capacity(width);
+    for idx in 0..width {
+        if idx < filled {
+            bar.push('#');
+        } else if idx == filled {
+            bar.push('>');
+        } else {
+            bar.push('-');
+        }
+    }
+    bar
+}
+
+fn format_sender_request_line(state: &SenderRequestRenderState) -> String {
+    let spinner = match (state.done_bytes / (256 * 1024)).wrapping_rem(4) {
+        0 => '-',
+        1 => '\\',
+        2 => '|',
+        _ => '/',
+    };
+    format!(
+        "n {} r {}/{} i {} # {}{} [{}] [{}] {}/{}",
+        state.endpoint_id,
+        state.connection_id,
+        state.request_id,
+        state.item_index,
+        state.hash_short,
+        spinner,
+        format_elapsed_precise(state.started_at.elapsed()),
+        format_sender_request_bar(state.done_bytes, state.total_bytes, 36),
+        format_size_unit(state.done_bytes),
+        format_size_unit(state.total_bytes),
+    )
 }
 
 // ── Byte-level reader for \r-delimited progress ────────────────────
@@ -997,11 +1110,9 @@ pub fn sendme_send(
     let child_pid = Arc::new(std::sync::Mutex::new(None));
 
     let _worker = thread::spawn(move || {
-        // Determine what to send: single item directly, multiple items via staging dir
         let (send_path, _staging_dir) = if opts.paths.len() == 1 {
             (opts.paths[0].clone(), None)
         } else {
-            // Create staging directory and copy/link all items into it
             match create_staging_dir(&opts.paths) {
                 Ok((path, dir)) => (path, Some(dir)),
                 Err(e) => {
@@ -1050,6 +1161,11 @@ pub fn sendme_send(
 
         let _ = tx.send(TransferMsg::Code(share.ticket.clone()));
         let _ = tx.send(TransferMsg::Output(format!(
+            "imported {} native, {}",
+            share.entry_type,
+            format_size_unit(share.size)
+        )));
+        let _ = tx.send(TransferMsg::Output(format!(
             "sendme receive {}",
             share.ticket
         )));
@@ -1058,15 +1174,15 @@ pub fn sendme_send(
         let mut had_transfer = false;
         let mut sender_activity_emitted = false;
         let mut last_progress_emit = Instant::now();
+        let mut last_request_emit = Instant::now();
         let mut sender_progress_max: f32 = 0.0;
         let mut last_logged_done: u64 = 0;
         let mut last_seen_total: u64 = 0;
         let mut last_seen_speed_bps: f64 = 0.0;
-        let mut sender_cycle_done_base: u64 = 0;
-        let mut sender_last_file_done: Option<u64> = None;
-        let mut sender_last_file_total: Option<u64> = None;
         let mut waiting_for_new_connection = false;
         let mut waiting_seen_zero_connections = false;
+        let mut sender_requests: HashMap<(u64, u64), SenderRequestRenderState> = HashMap::new();
+
         loop {
             if cancel2.load(Ordering::Relaxed) {
                 let _ = tx.send(TransferMsg::Error("Transfer cancelled".to_string()));
@@ -1076,7 +1192,6 @@ pub fn sendme_send(
             match evt_rx.recv_timeout(Duration::from_millis(150)) {
                 Ok(NativeSendmeEvent::TransferStarted) => {
                     if !opts.one_shot && waiting_for_new_connection {
-                        // Wait for an explicit 0 -> >0 connection edge before accepting a new cycle.
                         continue;
                     }
                     had_transfer = true;
@@ -1092,7 +1207,6 @@ pub fn sendme_send(
                     speed_bps,
                 }) => {
                     if !opts.one_shot && waiting_for_new_connection {
-                        // Ignore late/straggler progress events from a finished serve cycle.
                         continue;
                     }
                     had_transfer = true;
@@ -1101,38 +1215,15 @@ pub fn sendme_send(
                         sender_activity_emitted = true;
                     }
 
-                    let raw_done = done.min(total.max(done));
-                    let current_total = total.max(raw_done).max(1);
-                    if let (Some(prev_done), Some(prev_total)) =
-                        (sender_last_file_done, sender_last_file_total)
-                    {
-                        // Native sender progress is request-scoped. Detect rollover to the next
-                        // request and accumulate prior request bytes into a transfer-wide counter.
-                        let rollover = raw_done.saturating_add(256 * 1024) < prev_done;
-                        let changed_total_rollover =
-                            current_total != prev_total && raw_done <= prev_done;
-                        if rollover || changed_total_rollover {
-                            sender_cycle_done_base =
-                                sender_cycle_done_base.saturating_add(prev_done.min(prev_total));
-                        }
-                    }
-                    sender_last_file_done = Some(raw_done);
-                    sender_last_file_total = Some(current_total);
-
-                    let aggregate_done = sender_cycle_done_base
-                        .saturating_add(raw_done.min(current_total))
-                        .min(current_total);
+                    let current_total = total.max(1);
+                    let aggregate_done = done.min(current_total);
                     last_seen_total = current_total;
                     last_seen_speed_bps = speed_bps;
 
-                    if current_total > 0 {
-                        let progress = (aggregate_done.min(current_total) as f32
-                            / current_total as f32)
-                            .clamp(0.0, 1.0);
-                        if progress > sender_progress_max || progress >= 0.999 {
-                            sender_progress_max = sender_progress_max.max(progress);
-                            let _ = tx.send(TransferMsg::Progress(sender_progress_max));
-                        }
+                    let progress = (aggregate_done as f32 / current_total as f32).clamp(0.0, 1.0);
+                    if progress > sender_progress_max || progress >= 0.999 {
+                        sender_progress_max = sender_progress_max.max(progress);
+                        let _ = tx.send(TransferMsg::Progress(sender_progress_max));
                     }
 
                     let should_log = aggregate_done > last_logged_done || aggregate_done == 0;
@@ -1148,12 +1239,85 @@ pub fn sendme_send(
                         last_progress_emit = Instant::now();
                     }
                 }
+                Ok(NativeSendmeEvent::SenderRequestStarted(started)) => {
+                    if !opts.one_shot && waiting_for_new_connection {
+                        continue;
+                    }
+                    had_transfer = true;
+                    if !sender_activity_emitted {
+                        let _ = tx.send(TransferMsg::SenderTransferActivity);
+                        sender_activity_emitted = true;
+                    }
+
+                    let key = (started.connection_id, started.request_id);
+                    if let Some(mut prev) = sender_requests.remove(&key) {
+                        prev.done_bytes = prev.total_bytes;
+                        let _ = tx.send(TransferMsg::Output(format_sender_request_line(&prev)));
+                    }
+                    let state = SenderRequestRenderState {
+                        endpoint_id: started.endpoint_id,
+                        connection_id: started.connection_id,
+                        request_id: started.request_id,
+                        item_index: started.item_index,
+                        hash_short: started.hash_short,
+                        total_bytes: started.total_bytes.max(1),
+                        done_bytes: 0,
+                        started_at: Instant::now(),
+                    };
+                    let line = format_sender_request_line(&state);
+                    sender_requests.insert(key, state);
+                    let _ = tx.send(TransferMsg::Output(line));
+                }
+                Ok(NativeSendmeEvent::SenderRequestProgress(progress_evt)) => {
+                    if !opts.one_shot && waiting_for_new_connection {
+                        continue;
+                    }
+                    had_transfer = true;
+                    if !sender_activity_emitted {
+                        let _ = tx.send(TransferMsg::SenderTransferActivity);
+                        sender_activity_emitted = true;
+                    }
+
+                    let key = (progress_evt.connection_id, progress_evt.request_id);
+                    let state =
+                        sender_requests
+                            .entry(key)
+                            .or_insert_with(|| SenderRequestRenderState {
+                                endpoint_id: "?".to_string(),
+                                connection_id: progress_evt.connection_id,
+                                request_id: progress_evt.request_id,
+                                item_index: 0,
+                                hash_short: "?".to_string(),
+                                total_bytes: progress_evt.done_bytes.max(1),
+                                done_bytes: 0,
+                                started_at: Instant::now(),
+                            });
+                    let next_done = progress_evt.done_bytes.min(state.total_bytes);
+                    state.done_bytes = state.done_bytes.max(next_done);
+
+                    if state.done_bytes == state.total_bytes
+                        || state.done_bytes == 0
+                        || last_request_emit.elapsed() >= Duration::from_millis(90)
+                    {
+                        let _ = tx.send(TransferMsg::Output(format_sender_request_line(state)));
+                        last_request_emit = Instant::now();
+                    }
+                }
+                Ok(NativeSendmeEvent::SenderRequestCompleted(completed_evt)) => {
+                    if !opts.one_shot && waiting_for_new_connection {
+                        continue;
+                    }
+                    let key = (completed_evt.connection_id, completed_evt.request_id);
+                    if let Some(mut state) = sender_requests.remove(&key) {
+                        state.done_bytes = state.total_bytes;
+                        let _ = tx.send(TransferMsg::Output(format_sender_request_line(&state)));
+                    }
+                }
                 Ok(NativeSendmeEvent::ActiveConnectionCount(count)) => {
                     if !opts.one_shot && waiting_for_new_connection {
                         if count == 0 {
                             waiting_seen_zero_connections = true;
                         } else if waiting_seen_zero_connections {
-                            // Fresh receiver connected after idle.
                             waiting_for_new_connection = false;
                             waiting_seen_zero_connections = false;
                             had_transfer = true;
@@ -1199,9 +1363,7 @@ pub fn sendme_send(
                         last_logged_done = 0;
                         last_seen_total = 0;
                         last_seen_speed_bps = 0.0;
-                        sender_cycle_done_base = 0;
-                        sender_last_file_done = None;
-                        sender_last_file_total = None;
+                        sender_requests.clear();
                     }
                 }
                 Ok(NativeSendmeEvent::TransferFailed) => {
@@ -1216,7 +1378,6 @@ pub fn sendme_send(
                         break;
                     } else {
                         if waiting_for_new_connection {
-                            // Late abort notification after a completed cycle; keep serving silently.
                             continue;
                         }
                         let _ = tx.send(TransferMsg::Output(
@@ -1231,9 +1392,7 @@ pub fn sendme_send(
                         last_logged_done = 0;
                         last_seen_total = 0;
                         last_seen_speed_bps = 0.0;
-                        sender_cycle_done_base = 0;
-                        sender_last_file_done = None;
-                        sender_last_file_total = None;
+                        sender_requests.clear();
                         continue;
                     }
                 }
@@ -1253,7 +1412,6 @@ pub fn sendme_send(
                         break;
                     } else {
                         if waiting_for_new_connection {
-                            // Event channel can close between serve cycles; don't treat as failure.
                             continue;
                         }
                         let _ = tx.send(TransferMsg::Output(
@@ -1268,9 +1426,7 @@ pub fn sendme_send(
                         last_logged_done = 0;
                         last_seen_total = 0;
                         last_seen_speed_bps = 0.0;
-                        sender_cycle_done_base = 0;
-                        sender_last_file_done = None;
-                        sender_last_file_total = None;
+                        sender_requests.clear();
                         thread::sleep(Duration::from_millis(200));
                         continue;
                     }
@@ -1281,12 +1437,10 @@ pub fn sendme_send(
         let _ = fs::remove_dir_all(&share.blobs_data_dir);
         cleanup_sendme_send_dirs(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         cleanup_sendme_temp_artifacts();
-        // _staging_dir is dropped here, cleaning up any temporary staging directory.
     });
 
     (rx, ProcessHandle { cancel, child_pid })
 }
-
 /// Create a staging directory with all items copied/linked into it for sendme
 fn create_staging_dir(paths: &[PathBuf]) -> Result<(PathBuf, tempfile::TempDir), String> {
     let staging = tempfile::Builder::new()
@@ -1482,6 +1636,9 @@ pub fn sendme_receive(
                 }
                 Ok(NativeSendmeEvent::TransferStarted)
                 | Ok(NativeSendmeEvent::TransferProgress { .. })
+                | Ok(NativeSendmeEvent::SenderRequestStarted(_))
+                | Ok(NativeSendmeEvent::SenderRequestProgress(_))
+                | Ok(NativeSendmeEvent::SenderRequestCompleted(_))
                 | Ok(NativeSendmeEvent::TransferCompleted)
                 | Ok(NativeSendmeEvent::TransferFailed)
                 | Ok(NativeSendmeEvent::ActiveConnectionCount(_)) => {}
