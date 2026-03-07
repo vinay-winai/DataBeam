@@ -20,21 +20,25 @@
     <div class="container">
         <header class="header">
             <div class="logo">
-                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <path d="M12 2L2 7L12 12L22 7L12 2Z" stroke="#8884FF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                    <path d="M2 17L12 22L22 17" stroke="#8884FF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                    <path d="M2 12L12 17L22 12" stroke="#8884FF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                <svg width="32" height="32" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <!-- Black background -->
+                    <circle cx="50" cy="50" r="48" fill="#000000" />
+                    <!-- Orange circle border -->
+                    <circle cx="50" cy="50" r="42" stroke="#ff4500" stroke-width="6" fill="none" />
+                    <!-- Orange Arrow -->
+                    <path d="M40 60 L65 35 M65 35 L45 35 M65 35 L65 55" stroke="#ff4500" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
                 </svg>
                 <span>DataBeam</span>
             </div>
             <nav class="nav">
                 <a href="#features">Features</a>
+                <a href="#comparison">Compare</a>
                 <a href="https://github.com/vinay-winai/DataBeam" target="_blank">GitHub</a>
             </nav>
         </header>
 
         <main class="hero">
-            <div class="badge">v1.0.0 Now Available</div>
+            <div class="badge" id="version-badge">Loading version...</div>
             <h1 class="hero-title">Fast File Transfer,<br><span class="gradient-text">Without the Terminal.</span></h1>
             <p class="hero-subtitle">
                 The ultimate desktop GUI combining the convenience of <strong>Croc</strong> with the modern transfer speeds of <strong>Sendme</strong>. Send files anywhere instantly.
@@ -57,30 +61,6 @@
                     </div>
                 </div>
             </div>
-
-            <div class="preview-mockup">
-                <div class="window-bar">
-                    <div class="dots">
-                        <span class="dot red"></span>
-                        <span class="dot yellow"></span>
-                        <span class="dot green"></span>
-                    </div>
-                </div>
-                <div class="mockup-content">
-                    <div class="mock-sidebar"></div>
-                    <div class="mock-main">
-                        <div class="mock-header"></div>
-                        <div class="mock-transfer-card">
-                            <div class="mock-icon"></div>
-                            <div class="mock-bars">
-                                <div class="mock-bar full"></div>
-                                <div class="mock-bar half"></div>
-                            </div>
-                        </div>
-                        <div class="mock-logs"></div>
-                    </div>
-                </div>
-            </div>
         </main>
 
         <section id="features" class="features">
@@ -89,18 +69,130 @@
                 <div class="feature-card">
                     <div class="feature-icon">⚡</div>
                     <h3>EasySendMe Mode</h3>
-                    <p>Combines Croc-style convenience (short custom codes) with modern Sendme transfer speeds under the hood.</p>
+                    <p>Combines Croc-style convenience with the modern improvements and raw speed of Sendme.</p>
                 </div>
                 <div class="feature-card">
-                    <div class="feature-icon">📱</div>
-                    <h3>QR Code Handoff</h3>
-                    <p>Instantly generate QR codes for your transfer tickets. Makes scanning and sharing with other devices completely frictionless.</p>
+                    <div class="feature-icon">🪶</div>
+                    <h3>Tiny Footprint</h3>
+                    <p>Enjoy small, highly optimized executables, typically in the single-digit MB range.</p>
                 </div>
                 <div class="feature-card">
                     <div class="feature-icon">✨</div>
                     <h3>Native UI</h3>
-                    <p>A beautifully clear desktop-first workflow. No browser runtime needed, small executables in the single-digit MB range.</p>
+                    <p>A beautifully clear desktop-first workflow. No browser runtime needed.</p>
                 </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🛠️</div>
+                    <h3>Standalone Modes</h3>
+                    <p>Need pure Croc or pure Sendme for a specific situation? Both are available cleanly inside.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">💬</div>
+                    <h3>Text Transfer</h3>
+                    <p>Want to send a snippet across devices? Sending text is fully supported in Croc mode.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🔑</div>
+                    <h3>Short Codes</h3>
+                    <p>Create completely custom transfer codes as short as 7 characters in Croc and EasySendMe modes.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">📁</div>
+                    <h3>Multi-File Support</h3>
+                    <p>Easily select and transfer multiple files or entire folders at once in a single transaction.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">📱</div>
+                    <h3>QR Code Handoff</h3>
+                    <p>Instantly generate QR codes for your transfer codes/tickets for frictionless mobile scanning.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">📜</div>
+                    <h3>Visible Logs</h3>
+                    <p>Never guess what's happening. Live transfer state and detailed logs are visible right inside the app.</p>
+                </div>
+            </div>
+        </section>
+
+        <section id="comparison" class="comparison-section">
+            <h2>DataBeam vs AltSendme</h2>
+            <div class="table-container">
+                <table class="comparison-table">
+                    <thead>
+                        <tr>
+                            <th>Feature</th>
+                            <th>DataBeam</th>
+                            <th>AltSendme</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>Account Required</td>
+                            <td>No</td>
+                            <td>No</td>
+                        </tr>
+                        <tr>
+                            <td>File Size Limit</td>
+                            <td>Unlimited</td>
+                            <td>Unlimited</td>
+                        </tr>
+                        <tr>
+                            <td>Privacy</td>
+                            <td>Encrypted Direct Transfer</td>
+                            <td>Encrypted Direct Transfer</td>
+                        </tr>
+                        <tr>
+                            <td>Speed</td>
+                            <td>Up to 4Gbps</td>
+                            <td>Up to 4Gbps</td>
+                        </tr>
+                        <tr>
+                            <td>Cost</td>
+                            <td>Free</td>
+                            <td>Free</td>
+                        </tr>
+                        <tr>
+                            <td>Multi Files/Folders Upload</td>
+                            <td class="highlight">Yes</td>
+                            <td class="dim">No</td>
+                        </tr>
+                        <tr>
+                            <td>Sending Text</td>
+                            <td class="highlight">Yes (with Croc)</td>
+                            <td class="dim">No</td>
+                        </tr>
+                        <tr>
+                            <td>Ease of Use</td>
+                            <td class="highlight">Can make small memorable code</td>
+                            <td class="dim">Huge text code</td>
+                        </tr>
+                        <tr>
+                            <td>Share via QR Code</td>
+                            <td class="highlight">Yes</td>
+                            <td class="dim">No</td>
+                        </tr>
+                        <tr>
+                            <td>Progress Logs</td>
+                            <td class="highlight">Yes</td>
+                            <td class="dim">No</td>
+                        </tr>
+                        <tr>
+                            <td>Desktop Output</td>
+                            <td>Yes</td>
+                            <td>Yes</td>
+                        </tr>
+                        <tr>
+                            <td>Mobile Support</td>
+                            <td class="highlight">Third-Party Croc (In Development)</td>
+                            <td class="dim">No</td>
+                        </tr>
+                        <tr>
+                            <td>App Size</td>
+                            <td class="highlight">Smaller</td>
+                            <td>Small</td>
+                        </tr>
+                    </tbody>
+                </table>
             </div>
         </section>
 

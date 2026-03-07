@@ -10,6 +10,13 @@ async function fetchLatestRelease() {
         if (!response.ok) throw new Error("Failed to fetch GitHub API");
         const data = await response.json();
         gReleaseData = data;
+        
+        // Update version badge if exists
+        const badge = document.getElementById("version-badge");
+        if (badge && data.tag_name) {
+            badge.textContent = `${data.tag_name} Now Available`;
+        }
+        
         updateDownloadLinks();
     } catch (error) {
         console.error("Error fetching release:", error);
