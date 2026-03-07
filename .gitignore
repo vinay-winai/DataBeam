@@ -1,4 +1,4 @@
-/target
+/target*
 *.swp
 *.swo
 .DS_Store
@@ -10,3 +10,5 @@ dist/*.tar.gz
 dist/*
 !dist/.gitkeep
 temp_*
+_alt_sendme_inspect/
+_official_sendme_inspect/
