@@ -1,124 +1,89 @@
-# DataBeam ⚡
+# DataBeam
 
-**A premium GUI wrapper for [croc](https://github.com/schollz/croc) and [sendme](https://github.com/n0-computer/sendme) — fast, secure, cross-platform file transfer.**
+DataBeam is a compact desktop GUI for `croc` and `sendme`.
 
-> Single executable. No runtime dependencies. GPU-accelerated UI.
+It gives you:
+- the convenience of Croc
+- the modern transfer model of Sendme
+- an EasySendMe mode that combines both ideas
+
+## What It Does
+
+DataBeam is built for people who want fast file transfer without living in the terminal.
+
+You can:
+- use Croc directly
+- use Sendme directly
+- use EasySendMe, where Sendme handles the transfer but user shares a short croc code (can even create 7 length custom code) instead of the super long sendme ticket
 
 ## Features
 
-- 🐊 **Croc integration** — E2E encrypted relay-based transfer with multi-file/folder support
-- 📡 **Sendme integration** — Iroh-powered P2P with NAT traversal and blake3 verification
-- 📦 **Multi-file transfers** — Send multiple files and folders in a single transfer (Croc)
-- 🔐 **End-to-end encryption** — All transfers encrypted in transit
-- 🌐 **Cross-platform** — Linux, macOS, and Windows from a single codebase
-- ⚡ **Lightweight** — ~5MB single binary, GPU-accelerated immediate-mode GUI
-- 🎨 **Premium dark UI** — Modern design with smooth animations and intuitive UX
+- EasySendMe mode: Croc-style convenience with the modern improvements of Sendme
+- small executables, typically in the single-digit MB range
+- standalone `croc` and `sendme` are still available if you want to use them for specific situations
+- sending text in Croc mode
+- support for custom code as short as 7 characters in croc and easysendme modes
+- support for transferring multiple files/folders at once
+- QR code generation for transfer codes/tickets
+- modern native desktop UI with no browser runtime
+- visible transfer logs inside the app
 
-## Prerequisites
+## Modes
 
-You need at least one of these CLI tools installed:
+### Croc
 
-- **croc**: `brew install croc` / `scoop install croc` / [releases](https://github.com/schollz/croc/releases)
-- **sendme**: `cargo install sendme` / [releases](https://github.com/n0-computer/sendme/releases)
+Use Croc when you want:
+- simple code-based sharing
+- text sending
+- a familiar relay-based workflow
 
-DataBeam auto-detects which tools are available and shows their status on the home screen.
+### Sendme
 
-## Building
+Use Sendme when you want:
+- modern peer-to-peer transfer behavior
+- native in-app Sendme support
+- reusable server-style sending when one-shot mode is disabled
 
-### Quick build (current platform)
+### EasySendMe
+
+EasySendMe is the convenience mode.
+
+It is meant to feel closer to Croc from a user-flow perspective while still using Sendme for the actual file transfer.
+
+In short:
+- Croc helps share the code more conveniently
+- Sendme does the transfer work
+
+## Build
 
 ```bash
 cargo build --release
 ```
 
-The binary will be at `target/release/databeam`.
+Release binary:
+- `target/release/databeam`
+- on Windows: `target/release/databeam.exe`
 
-### Release build (optimized for size)
+## Why DataBeam
 
-The `Cargo.toml` is already configured with aggressive optimizations:
-- `opt-level = "z"` — optimize for binary size
-- `lto = true` — link-time optimization
-- `strip = true` — strip debug symbols
-- `codegen-units = 1` — single codegen unit for better optimization
+DataBeam is for users who want:
+- one app for both Croc and Sendme
+- a desktop-first workflow
+- lightweight binaries
+- logs and transfer state visible in the UI
+- QR-based handoff available when sharing codes or tickets
 
-```bash
-cargo build --release
-# Binary: target/release/databeam (~5-8MB)
-```
+## Issues And Future Improvements(not ordered by priority)
 
-### Cross-compile targets
+- a website to download this app
+- proper support for multi broadcasting in Sendme server mode
+- refining UX/UI after gathering user feedback
+- adding helpful pointers
+- locking app launch to a single instance
+- fixing drag/drop in Linux
+- fixing progress bar state on repeated transfers in Sendme server mode
+- more target os/arch binary releases
 
-```bash
-# Linux (from macOS, needs cross-compiler)
-rustup target add x86_64-unknown-linux-gnu
-cargo build --release --target x86_64-unknown-linux-gnu
+## Notes
 
-# Windows (from macOS, needs cross-compiler)
-rustup target add x86_64-pc-windows-msvc
-cargo build --release --target x86_64-pc-windows-msvc
-```
-
-> **Tip:** Use [cross](https://github.com/cross-rs/cross) for hassle-free cross-compilation:
-> ```bash
-> cargo install cross
-> cross build --release --target x86_64-unknown-linux-gnu
-> cross build --release --target x86_64-pc-windows-gnu
-> ```
-
-## Usage
-
-1. Launch `databeam`
-2. Select your preferred transfer engine (Croc or Sendme) on the home screen
-3. **To send:** Navigate to Send → choose files/folders → click Send → share the generated code
-4. **To receive:** Navigate to Receive → paste the code/ticket → choose save location → click Receive
-
-## Architecture
-
-```
-src/
-├── main.rs        # App structure, views, navigation
-├── backend.rs     # CLI process management, output parsing, channels
-├── widgets.rs     # Custom egui widgets (buttons, cards, progress, etc.)
-└── theme.rs       # Color palette, styling, typography
-```
-
-- **Rust + egui/eframe** — Immediate-mode GPU-accelerated GUI
-- **Process channels** — Background threads with `mpsc` for non-blocking CLI interaction
-- **Zero web dependencies** — Pure native rendering, no Electron/browser overhead
-
-## GitHub Releases
-
-Prebuilt binaries are published in the GitHub Releases page on every version tag (`v*`):
-
-- `databeam_vX.Y.Z_windows-x64.zip`
-- `databeam_vX.Y.Z_linux-x64.deb` (one-click install on Ubuntu/Debian desktops)
-- `databeam_vX.Y.Z_linux-x64.tar.gz`
-- `databeam_vX.Y.Z_macos-arm64.dmg` (one-click install on macOS)
-- `databeam_vX.Y.Z_macos-arm64.app.zip`
-- `databeam_vX.Y.Z_macos-arm64.tar.gz`
-- `SHA256SUMS.txt`
-
-Release assets are produced by `.github/workflows/release.yml`.
-
-## Managed Tool Binaries
-
-DataBeam now uses one uniform strategy on all platforms:
-- If `croc` / `sendme` are already on PATH, it uses them.
-- If missing, it downloads the correct official release binary at runtime and caches it.
-
-No platform-specific embedded `binaries/` payloads are required in the repo.
-
-### Create a release
-
-```bash
-# 1) bump version in Cargo.toml
-# 2) commit and push to main
-git tag vX.Y.Z
-git push origin vX.Y.Z
-```
-
-This triggers the release workflow and uploads cross-platform artifacts automatically.
-
-## License
-
-MIT
+DataBeam is a GUI wrapper and workflow layer around Croc and Sendme for people not comfortable with cli apps.
