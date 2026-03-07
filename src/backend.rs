@@ -556,6 +556,7 @@ pub enum TransferMsg {
     PeerDisconnected,
     WaitingForReceiver,
     SenderTransferActivity,
+    ActiveTransfers(usize),
 }
 
 // ── Transfer Options ───────────────────────────────────────────────
@@ -1314,6 +1315,7 @@ pub fn sendme_send(
                     }
                 }
                 Ok(NativeSendmeEvent::ActiveConnectionCount(count)) => {
+                    let _ = tx.send(TransferMsg::ActiveTransfers(count));
                     if !opts.one_shot && waiting_for_new_connection {
                         if count == 0 {
                             waiting_seen_zero_connections = true;

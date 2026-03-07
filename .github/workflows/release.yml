@@ -45,7 +45,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --release --features release-single-instance
 
       - name: Package Windows x64 executable
         shell: pwsh
@@ -77,7 +77,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --release --features release-single-instance
 
       - name: Install cargo-bundle
         run: cargo install cargo-bundle --locked
@@ -88,7 +88,7 @@ jobs:
           set -euo pipefail
           version="${RELEASE_TAG#v}"
           mkdir -p dist
-          cargo bundle --release --format osx
+          cargo bundle --release --features release-single-instance --format osx
 
           app_path="target/release/bundle/osx/DataBeam.app"
           if [ ! -d "${app_path}" ]; then
@@ -146,7 +146,7 @@ jobs:
             patchelf
 
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --release --features release-single-instance
 
       - name: Install cargo-bundle
         run: cargo install cargo-bundle --locked
@@ -158,7 +158,7 @@ jobs:
           version="${RELEASE_TAG#v}"
           mkdir -p dist
 
-          cargo bundle --release --format deb
+          cargo bundle --release --features release-single-instance --format deb
           deb_path="$(find target/release/bundle/deb -maxdepth 1 -name '*.deb' -print -quit)"
           if [ -z "${deb_path}" ]; then
             echo "No .deb produced under target/release/bundle/deb"
@@ -167,7 +167,7 @@ jobs:
           fi
           cp "${deb_path}" "dist/databeam_v${version}_linux-x64.deb"
 
-          cargo bundle --release --format appimage
+          cargo bundle --release --features release-single-instance --format appimage
           appimage_path="$(find target/release/bundle/appimage -maxdepth 1 -name '*.AppImage' -print -quit)"
           if [ -z "${appimage_path}" ]; then
             echo "No .AppImage produced under target/release/bundle/appimage"
@@ -216,3 +216,4 @@ jobs:
           name: DataBeam ${{ env.RELEASE_TAG }}
           generate_release_notes: true
           files: dist/*
+

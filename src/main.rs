@@ -165,6 +165,7 @@ struct DataBeamApp {
     sendme_had_transfer: bool,
     sendme_waiting_after_cycle: bool,
     sendme_last_activity: Option<f64>,
+    sendme_active_transfers: usize,
     sendme_total_items: Option<u64>,
     sendme_done_bytes_est: u64,
     sendme_item_progress: HashMap<u64, u64>,
@@ -238,6 +239,7 @@ impl Default for DataBeamApp {
             sendme_had_transfer: false,
             sendme_waiting_after_cycle: false,
             sendme_last_activity: None,
+            sendme_active_transfers: 0,
             sendme_total_items: None,
             sendme_done_bytes_est: 0,
             sendme_item_progress: HashMap::new(),
@@ -595,6 +597,7 @@ impl DataBeamApp {
         self.sendme_had_transfer = false;
         self.sendme_waiting_after_cycle = false;
         self.sendme_last_activity = None;
+        self.sendme_active_transfers = 0;
         self.picker_block_until = 0.0;
         self.picker_in_flight = false;
         self.picker_rx = None;
@@ -619,6 +622,7 @@ impl DataBeamApp {
         self.sendme_had_transfer = false;
         self.sendme_waiting_after_cycle = true;
         self.sendme_last_activity = None;
+        self.sendme_active_transfers = 0;
         self.sendme_total_items = None;
         self.sendme_done_bytes_est = 0;
         self.sendme_item_progress.clear();
@@ -643,6 +647,7 @@ impl DataBeamApp {
         self.sendme_had_transfer = false;
         self.sendme_waiting_after_cycle = false;
         self.sendme_last_activity = None;
+        self.sendme_active_transfers = 0;
         self.sendme_sender_payload_complete = false;
         if let Some(handle) = &self.transfer_handle {
             handle.request_cancel();
@@ -1196,6 +1201,18 @@ impl DataBeamApp {
                                 }
                             }
                             TransferMsg::Progress(p) => {
+                                let sendme_broadcast_sender = (self.selected_tool
+                                    == SelectedTool::Sendme
+                                    || self.selected_tool == SelectedTool::EazySendme)
+                                    && self.view == AppView::Send
+                                    && self.transfer_state == TransferState::Running
+                                    && !self.sendme_one_shot;
+                                if sendme_broadcast_sender
+                                    && self.sendme_waiting_after_cycle
+                                    && !self.sendme_peer_connected
+                                {
+                                    continue;
+                                }
                                 self.transfer_progress = self.transfer_progress.max(p);
                                 if self.transfer_phase == TransferPhase::Transferring {
                                     if let Some(total) = self.transfer_total_bytes {
@@ -1270,6 +1287,7 @@ impl DataBeamApp {
                                 {
                                     self.transfer_phase = TransferPhase::WaitingForReceiver;
                                     self.sendme_waiting_after_cycle = false;
+                                    self.sendme_active_transfers = 0;
                                 }
                             }
                             TransferMsg::WaitingForReceiver => {
@@ -1278,13 +1296,17 @@ impl DataBeamApp {
                                     && self.view == AppView::Send
                                     && self.transfer_state == TransferState::Running;
                                 if sendme_sender {
-                                    if self.sendme_had_transfer {
-                                        if !self.sendme_one_shot {
-                                            self.mark_sendme_sender_waiting();
-                                        }
+                                    if !self.sendme_one_shot
+                                        && (self.sendme_had_transfer
+                                            || self.sendme_waiting_after_cycle)
+                                    {
+                                        // Keep repeat-cycle waiting state sticky so late events
+                                        // from the previous cycle cannot repopulate stale progress.
+                                        self.mark_sendme_sender_waiting();
                                     } else {
                                         self.transfer_phase = TransferPhase::WaitingForReceiver;
                                         self.sendme_waiting_after_cycle = false;
+                                        self.sendme_active_transfers = 0;
                                     }
                                 }
                             }
@@ -1294,8 +1316,16 @@ impl DataBeamApp {
                                     && self.view == AppView::Send
                                     && self.transfer_state == TransferState::Running
                                 {
+                                    if self.sendme_waiting_after_cycle
+                                        && !self.sendme_peer_connected
+                                    {
+                                        continue;
+                                    }
                                     self.sendme_peer_connected = true;
                                     self.sendme_had_transfer = true;
+                                    if self.sendme_active_transfers == 0 {
+                                        self.sendme_active_transfers = 1;
+                                    }
                                     self.sendme_waiting_after_cycle = false;
                                     self.sendme_last_activity = Some(self.animation_time);
                                     if self.transfer_phase != TransferPhase::Transferring {
@@ -1304,6 +1334,33 @@ impl DataBeamApp {
                                             self.transfer_payload_start_time =
                                                 Some(self.animation_time);
                                         }
+                                    }
+                                }
+                            }
+                            TransferMsg::ActiveTransfers(count) => {
+                                let sendme_broadcast_sender = (self.selected_tool
+                                    == SelectedTool::Sendme
+                                    || self.selected_tool == SelectedTool::EazySendme)
+                                    && self.view == AppView::Send
+                                    && self.transfer_state == TransferState::Running
+                                    && !self.sendme_one_shot;
+                                if sendme_broadcast_sender {
+                                    self.sendme_active_transfers = count;
+                                    if count > 0 {
+                                        self.sendme_peer_connected = true;
+                                        self.sendme_had_transfer = true;
+                                        self.sendme_waiting_after_cycle = false;
+                                        self.sendme_last_activity = Some(self.animation_time);
+                                        if self.transfer_phase == TransferPhase::WaitingForReceiver
+                                        {
+                                            self.transfer_phase = TransferPhase::Transferring;
+                                            if self.transfer_payload_start_time.is_none() {
+                                                self.transfer_payload_start_time =
+                                                    Some(self.animation_time);
+                                            }
+                                        }
+                                    } else {
+                                        self.sendme_peer_connected = false;
                                     }
                                 }
                             }
@@ -1416,6 +1473,7 @@ impl DataBeamApp {
                                         self.transfer_total_bytes = None;
                                         self.sendme_had_transfer = false;
                                         self.sendme_waiting_after_cycle = false;
+                                        self.sendme_active_transfers = 0;
                                     }
                                 }
                             }
@@ -1493,6 +1551,7 @@ impl DataBeamApp {
                                 self.transfer_done_bytes = None;
                                 self.sendme_had_transfer = false;
                                 self.sendme_waiting_after_cycle = false;
+                                self.sendme_active_transfers = 0;
                             }
                         }
                     }
@@ -2645,6 +2704,15 @@ impl DataBeamApp {
                 if changed {
                     self.persist_user_settings();
                 }
+                if !self.sendme_one_shot {
+                    ui.label(
+                        RichText::new(
+                            "Broadcast mode: sender stays online and shows active transfers.",
+                        )
+                        .size(10.0)
+                        .color(TEXT_MUTED),
+                    );
+                }
             });
         }
 
@@ -3026,7 +3094,13 @@ impl DataBeamApp {
 
                         let status_text = match self.transfer_phase {
                             TransferPhase::Preparing => "Preparing…",
-                            TransferPhase::WaitingForReceiver => "Waiting for receiver…",
+                            TransferPhase::WaitingForReceiver => {
+                                if sendme_serve_mode {
+                                    "Broadcast mode: waiting for receivers..."
+                                } else {
+                                    "Waiting for receiver..."
+                                }
+                            }
                             TransferPhase::Transferring => {
                                 if self.view == AppView::Receive {
                                     if effective_progress >= 0.999 {
@@ -3035,7 +3109,11 @@ impl DataBeamApp {
                                         "Downloading…"
                                     }
                                 } else {
-                                    "Uploading on sender..."
+                                    if sendme_serve_mode {
+                                        "Broadcast mode active..."
+                                    } else {
+                                        "Uploading on sender..."
+                                    }
                                 }
                             }
                             TransferPhase::EazySharingTicket => "Sharing ticket via Croc…",
@@ -3054,10 +3132,7 @@ impl DataBeamApp {
                     });
                     ui.add_space(4.0);
 
-                    if !sendme_serve_mode
-                        || self.transfer_phase == TransferPhase::Transferring
-                        || self.transfer_phase == TransferPhase::Preparing
-                    {
+                    if !sendme_serve_mode {
                         if self.transfer_phase == TransferPhase::Transferring {
                             animated_progress_bar(ui, effective_progress, accent);
                         } else {
@@ -3185,37 +3260,33 @@ impl DataBeamApp {
                             }
                         });
                     } else {
-                        ui.horizontal_wrapped(|ui| match self.transfer_phase {
-                            TransferPhase::Preparing
-                            | TransferPhase::WaitingForReceiver
-                            | TransferPhase::EazySharingTicket
-                            | TransferPhase::EazyWaitingForPeer => {
-                                let label = match self.transfer_phase {
-                                    TransferPhase::EazySharingTicket => {
-                                        "Sharing ticket via Croc..."
-                                    }
-                                    TransferPhase::EazyWaitingForPeer => {
-                                        "Waiting for peer (Sendme)..."
-                                    }
-                                    _ => "Waiting for receiver...",
-                                };
-                                ui.label(RichText::new(label).size(10.0).color(TEXT_SECONDARY));
-                            }
-                            TransferPhase::Transferring => {
-                                let transferring_label = if self.view == AppView::Send {
-                                    "Uploading on sender..."
-                                } else {
-                                    "Downloading..."
-                                };
+                        let active = self.sendme_active_transfers;
+                        let transfer_word = if active == 1 { "transfer" } else { "transfers" };
+                        let status_line = match self.transfer_phase {
+                            TransferPhase::Preparing => "Preparing broadcast session...",
+                            TransferPhase::Transferring if active > 0 => "Broadcast mode active",
+                            _ => "Broadcast mode waiting for receivers...",
+                        };
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new(status_line).size(10.0).color(TEXT_SECONDARY));
+                            ui.label(
+                                RichText::new(format!("{} {} in progress", active, transfer_word))
+                                    .size(10.0)
+                                    .color(TEXT_MUTED),
+                            );
+                            if total > 0 {
                                 ui.label(
-                                    RichText::new(transferring_label)
+                                    RichText::new(format!("Payload: {}", format_file_size(total)))
                                         .size(10.0)
-                                        .color(TEXT_SECONDARY),
+                                        .color(TEXT_MUTED),
                                 );
                             }
                         });
+                        if let Some(raw) = &self.latest_cli_progress_line {
+                            ui.add_space(3.0);
+                            ui.label(RichText::new(raw).monospace().size(10.0).color(TEXT_MUTED));
+                        }
                     }
-
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if accent_button_sized(ui, "✕ Cancel", ERROR, Vec2::new(90.0, 26.0))
@@ -4060,7 +4131,7 @@ fn dir_size_capped(path: &std::path::Path, depth: u32, max_depth: u32) -> u64 {
 
 // ── Entry Point ────────────────────────────────────────────────────
 
-#[cfg(all(not(debug_assertions), any(target_os = "windows", target_os = "linux")))]
+#[cfg(all(feature = "release-single-instance", any(target_os = "windows", target_os = "linux")))]
 fn enforce_single_instance_release() -> Option<single_instance::SingleInstance> {
     match single_instance::SingleInstance::new("com.vinaywinai.databeam.release") {
         Ok(instance) => {
@@ -4078,7 +4149,7 @@ fn enforce_single_instance_release() -> Option<single_instance::SingleInstance> 
 }
 
 fn main() -> eframe::Result {
-    #[cfg(all(not(debug_assertions), any(target_os = "windows", target_os = "linux")))]
+    #[cfg(all(feature = "release-single-instance", any(target_os = "windows", target_os = "linux")))]
     let _single_instance_guard = enforce_single_instance_release();
 
     let options = eframe::NativeOptions {
@@ -4639,3 +4710,4 @@ mod parse_tests {
         assert_eq!(app.transfer_done_bytes, Some(4096));
     }
 }
+

@@ -42,7 +42,7 @@ Use Croc when you want:
 Use Sendme when you want:
 - modern peer-to-peer transfer behavior
 - native in-app Sendme support
-- reusable server-style sending when one-shot mode is disabled
+- reusable multi broadcast-style sending when single transfer mode is disabled
 
 ### EasySendMe
 
@@ -76,12 +76,9 @@ DataBeam is for users who want:
 ## Issues And Future Improvements(not ordered by priority)
 
 - a website to download this app
-- proper support for multi broadcasting in Sendme server mode
 - refining UX/UI after gathering user feedback
 - adding helpful pointers
-- locking app launch to a single instance
 - fixing drag/drop in Linux
-- fixing progress bar state on repeated transfers in Sendme server mode
 - more target os/arch binary releases
 
 ## Notes
