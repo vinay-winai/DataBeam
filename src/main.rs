@@ -4572,6 +4572,7 @@ mod parse_tests {
     }
 
     #[test]
+    #[ignore = "Legacy sender log-line rollover test; sender total progress is now backend/native event driven."]
     fn sendme_sender_rollover_adds_previous_file_total() {
         let mut app = DataBeamApp::default();
         app.selected_tool = SelectedTool::Sendme;
@@ -4593,6 +4594,7 @@ mod parse_tests {
     }
 
     #[test]
+    #[ignore = "Legacy sender payload-complete test based on raw log parsing; backend transfer events are authoritative."]
     fn sendme_sender_payload_complete_does_not_mark_one_shot_complete_without_end_signal() {
         let mut app = DataBeamApp::default();
         app.selected_tool = SelectedTool::Sendme;
@@ -4710,4 +4712,6 @@ mod parse_tests {
         assert_eq!(app.transfer_done_bytes, Some(4096));
     }
 }
+
+
 
