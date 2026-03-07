@@ -18,10 +18,11 @@ pub const TEXT_MUTED: Color32 = Color32::from_rgb(165, 165, 165);
 
 pub const BORDER_SUBTLE: Color32 = Color32::from_rgb(66, 66, 66);
 
-// Engine colors requested:
-// sendme = #d64224, croc = #57d624
+// Engine colors:
+// eazysendme = #d64224, sendme = #0b83e6, croc = #57d624
 pub const CROC_COLOR: Color32 = Color32::from_rgb(87, 214, 36);
-pub const SENDME_COLOR: Color32 = Color32::from_rgb(214, 66, 36);
+pub const SENDME_COLOR: Color32 = Color32::from_rgb(11, 131, 230);
+pub const EAZYSENDME_COLOR: Color32 = Color32::from_rgb(214, 66, 36);
 
 pub const SUCCESS: Color32 = Color32::from_rgb(87, 214, 36);
 pub const WARNING: Color32 = Color32::from_rgb(255, 190, 95);

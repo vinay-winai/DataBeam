@@ -409,7 +409,7 @@ impl DataBeamApp {
         match self.selected_tool {
             SelectedTool::Croc => CROC_COLOR,
             SelectedTool::Sendme => SENDME_COLOR,
-            SelectedTool::EazySendme => Color32::from_rgb(255, 165, 0), // Orange-ish
+            SelectedTool::EazySendme => EAZYSENDME_COLOR, // Orange-ish
         }
     }
 
@@ -2123,7 +2123,7 @@ impl eframe::App for DataBeamApp {
                             SelectedTool::Croc => (CROC_COLOR, "🐊 croc"),
                             SelectedTool::Sendme => (SENDME_COLOR, "📡 sendme"),
                             SelectedTool::EazySendme => {
-                                (Color32::from_rgb(255, 165, 0), "⚡ eazysendme")
+                                (EAZYSENDME_COLOR, "⚡ eazysendme")
                             }
                         };
                         status_badge(ui, tn, tc);
@@ -2280,10 +2280,29 @@ impl DataBeamApp {
             .find(|s| s.tool == Tool::Sendme)
             .cloned();
 
+        if tool_card(
+            ui,
+            "EazySendme",
+            "Sendme performance + Croc-like automatic ticket sharing",
+            croc_status.as_ref().map(|s| s.available).unwrap_or(false)
+                && sendme_status.as_ref().map(|s| s.available).unwrap_or(false),
+            None,
+            EAZYSENDME_COLOR,
+            self.selected_tool == SelectedTool::EazySendme,
+        )
+        .clicked()
+            && croc_status.as_ref().map(|s| s.available).unwrap_or(false)
+            && sendme_status.as_ref().map(|s| s.available).unwrap_or(false)
+            && self.selected_tool != SelectedTool::EazySendme
+        {
+            self.switch_tool(SelectedTool::EazySendme);
+        }
+        ui.add_space(3.0);
+
         if let Some(sendme) = &sendme_status {
             if tool_card(
                 ui,
-                "📡 Sendme",
+                "Sendme",
                 "Cutting-edge performance, reliability, and security",
                 sendme.available,
                 sendme.version.as_deref(),
@@ -2298,10 +2317,11 @@ impl DataBeamApp {
             }
         }
         ui.add_space(3.0);
+
         if let Some(croc) = &croc_status {
             if tool_card(
                 ui,
-                "🐊 Croc",
+                "Croc",
                 "Convenience, ease of use, and 3rd-party mobile support",
                 croc.available,
                 croc.version.as_deref(),
@@ -2314,24 +2334,6 @@ impl DataBeamApp {
             {
                 self.switch_tool(SelectedTool::Croc);
             }
-        }
-        ui.add_space(3.0);
-        if tool_card(
-            ui,
-            "⚡ EazySendme",
-            "Sendme performance + Croc-like automatic ticket sharing",
-            croc_status.as_ref().map(|s| s.available).unwrap_or(false)
-                && sendme_status.as_ref().map(|s| s.available).unwrap_or(false),
-            None,
-            Color32::from_rgb(255, 165, 0),
-            self.selected_tool == SelectedTool::EazySendme,
-        )
-        .clicked()
-            && croc_status.as_ref().map(|s| s.available).unwrap_or(false)
-            && sendme_status.as_ref().map(|s| s.available).unwrap_or(false)
-            && self.selected_tool != SelectedTool::EazySendme
-        {
-            self.switch_tool(SelectedTool::EazySendme);
         }
 
         ui.add_space(16.0);
@@ -2749,7 +2751,7 @@ impl DataBeamApp {
                         ),
                     ),
                     SelectedTool::EazySendme => (
-                        Color32::from_rgb(255, 165, 0),
+                        EAZYSENDME_COLOR,
                         format!(
                             "⚡ EazySend{}",
                             if self.send_items.len() > 1 {
@@ -2988,7 +2990,7 @@ impl DataBeamApp {
                     SelectedTool::Croc => (CROC_COLOR, "🐊 Receive"),
                     SelectedTool::Sendme => (SENDME_COLOR, "📡 Receive"),
                     SelectedTool::EazySendme => {
-                        (Color32::from_rgb(255, 165, 0), "⚡ Receive (via Croc)")
+                        (EAZYSENDME_COLOR, "⚡ Receive (via Croc)")
                     }
                 };
                 if accent_button(ui, label, color).clicked() {
@@ -3381,7 +3383,7 @@ impl DataBeamApp {
                     SelectedTool::Croc => ("Share this code:", CROC_COLOR),
                     SelectedTool::Sendme => ("Share this ticket:", SENDME_COLOR),
                     SelectedTool::EazySendme => {
-                        ("EazySendme ticket:", Color32::from_rgb(255, 165, 0))
+                        ("EazySendme ticket:", EAZYSENDME_COLOR)
                     }
                 };
                 if code_display(ui, label, code, color) {
