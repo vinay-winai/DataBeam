@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DataBeam | Fast File Transfer Without the Terminal</title>
+    <meta name="description" content="DataBeam is a compact desktop GUI for croc and sendme. Experience modern, fast file transfer with a beautifully native desktop interface.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="background-effects">
+        <div class="glow glow-1"></div>
+        <div class="glow glow-2"></div>
+        <div class="glow glow-3"></div>
+    </div>
+
+    <div class="container">
+        <header class="header">
+            <div class="logo">
+                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M12 2L2 7L12 12L22 7L12 2Z" stroke="#8884FF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                    <path d="M2 17L12 22L22 17" stroke="#8884FF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                    <path d="M2 12L12 17L22 12" stroke="#8884FF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                <span>DataBeam</span>
+            </div>
+            <nav class="nav">
+                <a href="#features">Features</a>
+                <a href="https://github.com/vinay-winai/DataBeam" target="_blank">GitHub</a>
+            </nav>
+        </header>
+
+        <main class="hero">
+            <div class="badge">v1.0.0 Now Available</div>
+            <h1 class="hero-title">Fast File Transfer,<br><span class="gradient-text">Without the Terminal.</span></h1>
+            <p class="hero-subtitle">
+                The ultimate desktop GUI combining the convenience of <strong>Croc</strong> with the modern transfer speeds of <strong>Sendme</strong>. Send files anywhere instantly.
+            </p>
+
+            <div class="download-section">
+                <p id="download-status" class="status-text">Detecting your operating system...</p>
+                <a id="download-btn" href="https://github.com/vinay-winai/DataBeam/releases/latest" class="btn btn-primary">
+                    <span class="btn-text">Download DataBeam</span>
+                    <span class="btn-icon">↓</span>
+                </a>
+                <p class="auto-download-text">Your download will start automatically in <span id="countdown">3</span>s...</p>
+                
+                <div class="alt-downloads">
+                    <p>Also available for:</p>
+                    <div class="os-links">
+                        <a href="#" id="link-windows">Windows</a> •
+                        <a href="#" id="link-mac">macOS</a> •
+                        <a href="#" id="link-linux">Linux</a>
+                    </div>
+                </div>
+            </div>
+
+            <div class="preview-mockup">
+                <div class="window-bar">
+                    <div class="dots">
+                        <span class="dot red"></span>
+                        <span class="dot yellow"></span>
+                        <span class="dot green"></span>
+                    </div>
+                </div>
+                <div class="mockup-content">
+                    <div class="mock-sidebar"></div>
+                    <div class="mock-main">
+                        <div class="mock-header"></div>
+                        <div class="mock-transfer-card">
+                            <div class="mock-icon"></div>
+                            <div class="mock-bars">
+                                <div class="mock-bar full"></div>
+                                <div class="mock-bar half"></div>
+                            </div>
+                        </div>
+                        <div class="mock-logs"></div>
+                    </div>
+                </div>
+            </div>
+        </main>
+
+        <section id="features" class="features">
+            <h2>Why DataBeam?</h2>
+            <div class="feature-grid">
+                <div class="feature-card">
+                    <div class="feature-icon">⚡</div>
+                    <h3>EasySendMe Mode</h3>
+                    <p>Combines Croc-style convenience (short custom codes) with modern Sendme transfer speeds under the hood.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">📱</div>
+                    <h3>QR Code Handoff</h3>
+                    <p>Instantly generate QR codes for your transfer tickets. Makes scanning and sharing with other devices completely frictionless.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">✨</div>
+                    <h3>Native UI</h3>
+                    <p>A beautifully clear desktop-first workflow. No browser runtime needed, small executables in the single-digit MB range.</p>
+                </div>
+            </div>
+        </section>
+
+        <footer class="footer">
+            <p>&copy; 2025 DataBeam. Built around Croc and Sendme.</p>
+        </footer>
+    </div>
+    
+    <script src="script.js"></script>
+</body>
+</html>
