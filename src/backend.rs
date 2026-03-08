@@ -557,7 +557,6 @@ pub enum TransferMsg {
     WaitingForReceiver,
     SenderTransferActivity,
     ActiveTransfers(usize),
-    Stats(u64, u64, f64),
 }
 
 // ── Transfer Options ───────────────────────────────────────────────
@@ -1227,8 +1226,6 @@ pub fn sendme_send(
                         sender_progress_max = sender_progress_max.max(progress);
                         let _ = tx.send(TransferMsg::Progress(sender_progress_max));
                     }
-                    // Guarantee high-precision byte updates to UI to avoid f32 precision lag
-                    let _ = tx.send(TransferMsg::Stats(aggregate_done, current_total, speed_bps));
 
                     let should_log = aggregate_done > last_logged_done || aggregate_done == 0;
                     if should_log && last_progress_emit.elapsed() >= Duration::from_millis(200) {
@@ -1624,7 +1621,6 @@ pub fn sendme_receive(
                         let progress = (done as f32 / total as f32).clamp(0.0, 1.0);
                         let _ = tx.send(TransferMsg::Progress(progress));
                     }
-                    let _ = tx.send(TransferMsg::Stats(done, total.max(done).max(1), speed_bps));
                     let _ = tx.send(TransferMsg::Output(format!(
                         "[3/4] Downloading ... {} / {} {}",
                         format_size_unit(done),
@@ -1658,12 +1654,11 @@ pub fn sendme_receive(
         }
 
         while let Ok(evt) = evt_rx.try_recv() {
-            if let NativeSendmeEvent::ReceiveProgress { done, total, speed_bps } = evt {
+            if let NativeSendmeEvent::ReceiveProgress { done, total, .. } = evt {
                 if total > 0 {
                     let progress = (done as f32 / total as f32).clamp(0.0, 1.0);
                     let _ = tx.send(TransferMsg::Progress(progress));
                 }
-                let _ = tx.send(TransferMsg::Stats(done, total.max(done).max(1), speed_bps));
             }
         }
 

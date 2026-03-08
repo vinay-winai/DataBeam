@@ -1244,32 +1244,6 @@ impl DataBeamApp {
                                     }
                                 }
                             }
-                            TransferMsg::Stats(done, total, speed_bps) => {
-                                let sendme_broadcast_sender = (self.selected_tool
-                                    == SelectedTool::Sendme
-                                    || self.selected_tool == SelectedTool::EazySendme)
-                                    && self.view == AppView::Send
-                                    && self.transfer_state == TransferState::Running
-                                    && !self.sendme_one_shot;
-                                if sendme_broadcast_sender
-                                    && self.sendme_waiting_after_cycle
-                                    && !self.sendme_peer_connected
-                                {
-                                    continue;
-                                }
-
-                                if self.transfer_phase == TransferPhase::Transferring {
-                                    self.transfer_done_bytes = Some(done);
-                                    self.transfer_total_bytes = Some(total);
-                                    if speed_bps > 0.0 {
-                                        self.transfer_speed_bps = Some(speed_bps);
-                                        self.push_speed_sample(speed_bps);
-                                    }
-                                    if total > 0 {
-                                        self.transfer_progress = (done as f32 / total as f32).clamp(0.0, 1.0);
-                                    }
-                                }
-                            }
                             TransferMsg::Code(code) => {
                                 let should_replace = if is_masked_croc_code(&code) {
                                     self.transfer_code.is_none()
@@ -1464,33 +1438,18 @@ impl DataBeamApp {
                                     continue;
                                 }
                                 self.transfer_log
-                                    .push("Peer disconnected".to_string());
+                                    .push("Peer disconnected (transfer finished)".to_string());
                                 if (self.selected_tool == SelectedTool::Sendme
                                     || self.selected_tool == SelectedTool::EazySendme)
                                     && self.sendme_one_shot
                                 {
                                     let done = self.transfer_done_bytes.unwrap_or(0);
-                                    let total = self.transfer_total_bytes.unwrap_or(0);
-                                    let progress = self.effective_progress();
-
-                                    let transfer_actually_complete = self.sendme_sender_payload_complete
-                                        || (total > 0 && done >= total)
-                                        || (total == 0 && progress >= 0.95)
-                                        || (total > 0 && progress >= 0.95);
-
                                     let has_payload = done > 0 || self.sendme_had_transfer;
-                                    if !has_payload {
-                                        self.transfer_state = TransferState::Failed(
-                                            "Peer disconnected before transfer started".to_string(),
-                                        );
-                                        self.transfer_end_time = Some(self.animation_time);
-                                    } else if transfer_actually_complete {
-                                        // Sender log output often lags slightly behind the network.
-                                        // When peer disconnects and we had payload, it implies full success.
+                                    if has_payload {
                                         self.mark_sendme_one_shot_completed();
                                     } else {
                                         self.transfer_state = TransferState::Failed(
-                                            "Transfer was not completed (peer disconnected early)".to_string(),
+                                            "Peer disconnected before transfer started".to_string(),
                                         );
                                         self.transfer_end_time = Some(self.animation_time);
                                     }
@@ -1554,23 +1513,12 @@ impl DataBeamApp {
                                         || self.transfer_done_bytes.unwrap_or(0) > 0)
                                 {
                                     let done = self.transfer_done_bytes.unwrap_or(0);
-                                    let total = self.transfer_total_bytes.unwrap_or(0);
-                                    let progress = self.effective_progress();
-                                    let transfer_actually_complete = self.sendme_sender_payload_complete
-                                        || (total > 0 && done >= total)
-                                        || (total == 0 && progress >= 0.95)
-                                        || (total > 0 && progress >= 0.95);
                                     let has_payload = done > 0 || self.sendme_had_transfer;
-                                    if !has_payload {
-                                        self.transfer_state = TransferState::Failed(
-                                            "Send session ended before payload started".to_string(),
-                                        );
-                                        self.transfer_end_time = Some(self.animation_time);
-                                    } else if transfer_actually_complete {
+                                    if has_payload {
                                         self.mark_sendme_one_shot_completed();
                                     } else {
                                         self.transfer_state = TransferState::Failed(
-                                            "Transfer was not completed (session ended early)".to_string(),
+                                            "Send session ended before payload started".to_string(),
                                         );
                                         self.transfer_end_time = Some(self.animation_time);
                                     }
@@ -1878,7 +1826,7 @@ impl DataBeamApp {
                 self.transfer_handle = Some(handle);
             }
             SelectedTool::EazySendme => {
-                if self.eazysendme_custom_code.len() < 7 {
+                if self.eazysendme_custom_code.trim().chars().count() < 7 {
                     self.show_toast("Code must be at least 7 characters".to_string(), WARNING);
                     return;
                 }
@@ -1917,6 +1865,8 @@ impl DataBeamApp {
             return;
         }
 
+        self.reset_transfer();
+
         // Persist receive code into recent history for Croc / EazySendme
         if self.selected_tool == SelectedTool::Croc
             || self.selected_tool == SelectedTool::EazySendme
@@ -1931,9 +1881,6 @@ impl DataBeamApp {
                 self.persist_user_settings();
             }
         }
-
-        self.reset_transfer();
-
 
         let binary = match self.selected_tool {
             SelectedTool::Croc | SelectedTool::EazySendme => {
@@ -2411,7 +2358,7 @@ impl DataBeamApp {
         let eazy_available = croc_status.as_ref().map(|s| s.available).unwrap_or(false)
             && sendme_status.as_ref().map(|s| s.available).unwrap_or(false);
 
-        // ── EazySendme (primary, always shown) ─────────────────
+        // ── EazySendme (primary, always shown) ──────────────────────
         if tool_card(
             ui,
             "EazySendme",
@@ -2505,7 +2452,7 @@ impl DataBeamApp {
             }
         });
         ui.add_space(8.0);
-        
+
         ui.horizontal(|ui| {
             let sendme_avail = sendme_status.as_ref().map(|s| s.available).unwrap_or(false);
             let broadcast_btn = ui.add_enabled(
@@ -2520,14 +2467,13 @@ impl DataBeamApp {
                 .corner_radius(egui::epaint::CornerRadius::same(8u8)),
             );
             if broadcast_btn.clicked() && sendme_avail {
-                // Switch to Sendme in broadcast (non-one-shot) mode and go to Send
                 if self.selected_tool != SelectedTool::Sendme {
                     self.switch_tool(SelectedTool::Sendme);
                 }
                 self.sendme_one_shot = false;
                 self.view = AppView::Send;
             }
-            
+
             let croc_avail = croc_status.as_ref().map(|s| s.available).unwrap_or(false);
             let send_text_btn = ui.add_enabled(
                 croc_avail,
@@ -2549,7 +2495,6 @@ impl DataBeamApp {
             }
         });
     }
-
 
     fn show_croc_send_setup(&mut self, ui: &mut egui::Ui, send_locked: bool) {
         let accent = self.engine_color();
@@ -2780,7 +2725,6 @@ impl DataBeamApp {
             });
             ui.add_space(6.0);
         }
-
 
         // ── File list ──
         card_frame(ui, |ui| {
@@ -3129,7 +3073,6 @@ impl DataBeamApp {
                     .size(10.0),
             );
         });
-
 
         ui.add_space(6.0);
 
@@ -4961,7 +4904,7 @@ mod parse_tests {
         app.transfer_phase = TransferPhase::Transferring;
         app.sendme_had_transfer = true;
         app.transfer_total_bytes = Some(4096);
-        app.transfer_done_bytes = Some(4096);
+        app.transfer_done_bytes = Some(2048);
         let (tx, rx) = mpsc::channel();
         app.transfer_rx = Some(rx);
         tx.send(TransferMsg::PeerDisconnected)
