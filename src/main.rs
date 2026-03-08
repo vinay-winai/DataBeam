@@ -89,7 +89,9 @@ struct UserSettings {
     #[serde(default)]
     croc_recent_codes: Vec<String>,
     #[serde(default)]
-    selected_tool: Option<String>,
+    eazysendme_recent_codes: Vec<String>,
+    #[serde(default)]
+    croc_receive_recent_codes: Vec<String>,
     #[serde(default)]
     receive_output_dir: Option<String>,
     #[serde(default = "default_sendme_one_shot")]
@@ -152,9 +154,13 @@ struct DataBeamApp {
 
     // EazySendme
     eazysendme_custom_code: String,
+    eazysendme_recent_codes: Vec<String>,
     eazysendme_ticket: Option<String>,
     eazysendme_croc_handle: Option<ProcessHandle>,
     eazysendme_croc_rx: Option<mpsc::Receiver<TransferMsg>>,
+
+    // Croc receive
+    croc_receive_recent_codes: Vec<String>,
 
     // UI
     toast_msg: Option<(String, f64, Color32)>,
@@ -179,6 +185,7 @@ struct DataBeamApp {
     sendme_sender_payload_complete: bool,
     last_done_speed_sample: Option<(f64, u64)>,
     initialized_once: bool,
+    native_engines_expanded: bool,
 }
 
 impl Drop for DataBeamApp {
@@ -255,9 +262,12 @@ impl Default for DataBeamApp {
             last_done_speed_sample: None,
             initialized_once: false,
             eazysendme_custom_code: String::new(),
+            eazysendme_recent_codes: Vec::new(),
             eazysendme_ticket: None,
             eazysendme_croc_handle: None,
             eazysendme_croc_rx: None,
+            croc_receive_recent_codes: Vec::new(),
+            native_engines_expanded: false,
         }
     }
 }
@@ -312,6 +322,7 @@ impl DataBeamApp {
             detect_all_tools(app.bundled_croc.as_ref(), app.bundled_sendme.as_ref());
         app.load_user_settings();
 
+        // Always start with EazySendme; fall back if tools are unavailable.
         let sendme_available = app
             .tool_statuses
             .iter()
@@ -320,12 +331,13 @@ impl DataBeamApp {
             .tool_statuses
             .iter()
             .any(|s| s.tool == Tool::Croc && s.available);
-        match app.selected_tool {
-            SelectedTool::Sendme if sendme_available => {}
-            SelectedTool::Croc if croc_available => {}
-            _ if sendme_available => app.selected_tool = SelectedTool::Sendme,
-            _ if croc_available => app.selected_tool = SelectedTool::Croc,
-            _ => {}
+        let eazy_available = sendme_available && croc_available;
+        if eazy_available {
+            app.selected_tool = SelectedTool::EazySendme;
+        } else if sendme_available {
+            app.selected_tool = SelectedTool::Sendme;
+        } else if croc_available {
+            app.selected_tool = SelectedTool::Croc;
         }
 
         app
@@ -350,26 +362,26 @@ impl DataBeamApp {
             return;
         };
 
-        let mut deduped = Vec::new();
-        for code in settings.croc_recent_codes {
-            let clean = code.trim().to_string();
-            if clean.chars().count() <= 6 || deduped.iter().any(|c| c == &clean) {
-                continue;
+        fn dedup_codes(codes: Vec<String>) -> Vec<String> {
+            let mut deduped = Vec::new();
+            for code in codes {
+                let clean = code.trim().to_string();
+                if clean.chars().count() <= 6 || deduped.iter().any(|c| c == &clean) {
+                    continue;
+                }
+                deduped.push(clean);
+                if deduped.len() >= 5 {
+                    break;
+                }
             }
-            deduped.push(clean);
-            if deduped.len() >= 5 {
-                break;
-            }
+            deduped
         }
-        self.croc_recent_codes = deduped;
-        if let Some(tool) = settings.selected_tool {
-            let lower = tool.to_lowercase();
-            if lower == "croc" {
-                self.selected_tool = SelectedTool::Croc;
-            } else if lower == "sendme" {
-                self.selected_tool = SelectedTool::Sendme;
-            }
-        }
+
+        self.croc_recent_codes = dedup_codes(settings.croc_recent_codes);
+        self.eazysendme_recent_codes = dedup_codes(settings.eazysendme_recent_codes);
+        self.croc_receive_recent_codes = dedup_codes(settings.croc_receive_recent_codes);
+
+        // NOTE: selected_tool is intentionally NOT loaded — always starts as EazySendme.
         self.receive_output_dir = settings
             .receive_output_dir
             .as_ref()
@@ -389,11 +401,8 @@ impl DataBeamApp {
         }
         let settings = UserSettings {
             croc_recent_codes: self.croc_recent_codes.clone(),
-            selected_tool: Some(match self.selected_tool {
-                SelectedTool::Croc => "croc".to_string(),
-                SelectedTool::Sendme => "sendme".to_string(),
-                SelectedTool::EazySendme => "eazysendme".to_string(),
-            }),
+            eazysendme_recent_codes: self.eazysendme_recent_codes.clone(),
+            croc_receive_recent_codes: self.croc_receive_recent_codes.clone(),
             receive_output_dir: self
                 .receive_output_dir
                 .as_ref()
@@ -1429,18 +1438,31 @@ impl DataBeamApp {
                                     continue;
                                 }
                                 self.transfer_log
-                                    .push("Peer disconnected (transfer finished)".to_string());
+                                    .push("Peer disconnected".to_string());
                                 if (self.selected_tool == SelectedTool::Sendme
                                     || self.selected_tool == SelectedTool::EazySendme)
                                     && self.sendme_one_shot
                                 {
                                     let done = self.transfer_done_bytes.unwrap_or(0);
+                                    let total = self.transfer_total_bytes.unwrap_or(0);
+                                    let progress = self.effective_progress();
+                                    // Consider transfer complete only if progress ≥ 95% or
+                                    // done bytes matches total, or we had a payload-complete signal.
+                                    let transfer_actually_complete = self.sendme_sender_payload_complete
+                                        || (total > 0 && done >= total)
+                                        || (total == 0 && progress >= 0.95)
+                                        || (total > 0 && progress >= 0.95);
                                     let has_payload = done > 0 || self.sendme_had_transfer;
-                                    if has_payload {
+                                    if !has_payload {
+                                        self.transfer_state = TransferState::Failed(
+                                            "Peer disconnected before transfer started".to_string(),
+                                        );
+                                        self.transfer_end_time = Some(self.animation_time);
+                                    } else if transfer_actually_complete {
                                         self.mark_sendme_one_shot_completed();
                                     } else {
                                         self.transfer_state = TransferState::Failed(
-                                            "Peer disconnected before transfer started".to_string(),
+                                            "Transfer was not completed (peer disconnected early)".to_string(),
                                         );
                                         self.transfer_end_time = Some(self.animation_time);
                                     }
@@ -1504,12 +1526,23 @@ impl DataBeamApp {
                                         || self.transfer_done_bytes.unwrap_or(0) > 0)
                                 {
                                     let done = self.transfer_done_bytes.unwrap_or(0);
+                                    let total = self.transfer_total_bytes.unwrap_or(0);
+                                    let progress = self.effective_progress();
+                                    let transfer_actually_complete = self.sendme_sender_payload_complete
+                                        || (total > 0 && done >= total)
+                                        || (total == 0 && progress >= 0.95)
+                                        || (total > 0 && progress >= 0.95);
                                     let has_payload = done > 0 || self.sendme_had_transfer;
-                                    if has_payload {
+                                    if !has_payload {
+                                        self.transfer_state = TransferState::Failed(
+                                            "Send session ended before payload started".to_string(),
+                                        );
+                                        self.transfer_end_time = Some(self.animation_time);
+                                    } else if transfer_actually_complete {
                                         self.mark_sendme_one_shot_completed();
                                     } else {
                                         self.transfer_state = TransferState::Failed(
-                                            "Send session ended before payload started".to_string(),
+                                            "Transfer was not completed (session ended early)".to_string(),
                                         );
                                         self.transfer_end_time = Some(self.animation_time);
                                     }
@@ -1821,6 +1854,15 @@ impl DataBeamApp {
                     self.show_toast("Code must be at least 7 characters".to_string(), WARNING);
                     return;
                 }
+                // Persist the code into recent history
+                let clean = self.eazysendme_custom_code.trim().to_string();
+                self.eazysendme_recent_codes.retain(|c| c != &clean);
+                self.eazysendme_recent_codes.insert(0, clean);
+                if self.eazysendme_recent_codes.len() > 5 {
+                    self.eazysendme_recent_codes.truncate(5);
+                }
+                self.persist_user_settings();
+
                 // Step 1: Start sendme_send to get a ticket
                 // EazySendme MUST be one-shot because tickets are single-use.
                 self.sendme_one_shot = true;
@@ -1847,7 +1889,23 @@ impl DataBeamApp {
             return;
         }
 
+        // Persist receive code into recent history for Croc / EazySendme
+        if self.selected_tool == SelectedTool::Croc
+            || self.selected_tool == SelectedTool::EazySendme
+        {
+            let clean = self.receive_code.trim().to_string();
+            if clean.chars().count() > 6 {
+                self.croc_receive_recent_codes.retain(|c| c != &clean);
+                self.croc_receive_recent_codes.insert(0, clean);
+                if self.croc_receive_recent_codes.len() > 5 {
+                    self.croc_receive_recent_codes.truncate(5);
+                }
+                self.persist_user_settings();
+            }
+        }
+
         self.reset_transfer();
+
 
         let binary = match self.selected_tool {
             SelectedTool::Croc | SelectedTool::EazySendme => {
@@ -2118,6 +2176,7 @@ impl eframe::App for DataBeamApp {
                         style.visuals.selection.stroke = egui::Stroke::new(1.0, accent);
                         ui.set_style(style);
 
+                        let transfer_running = self.transfer_state == TransferState::Running;
                         for (label, view) in &[
                             ("🏠 Home", AppView::Home),
                             ("📤 Send", AppView::Send),
@@ -2126,14 +2185,19 @@ impl eframe::App for DataBeamApp {
                             let active = self.view == *view;
                             let c = if active {
                                 Color32::BLACK
+                            } else if transfer_running {
+                                TEXT_MUTED
                             } else {
                                 TEXT_SECONDARY
                             };
-                            if ui
-                                .selectable_label(active, RichText::new(*label).size(12.0).color(c))
-                                .clicked()
-                                && self.view != *view
-                            {
+                            let btn = ui.add_enabled(
+                                !transfer_running || active,
+                                egui::SelectableLabel::new(
+                                    active,
+                                    RichText::new(*label).size(12.0).color(c),
+                                ),
+                            );
+                            if btn.clicked() && self.view != *view && !transfer_running {
                                 self.view = *view;
                                 // Clear state to prevent confusion
                                 self.send_items.clear();
@@ -2302,7 +2366,7 @@ impl DataBeamApp {
             ui.add_space(16.0);
         });
 
-        section_header(ui, "🔧", "Engines");
+        section_header(ui, "🔧", "Engine");
         ui.add_space(4.0);
 
         let croc_status = self
@@ -2316,77 +2380,122 @@ impl DataBeamApp {
             .find(|s| s.tool == Tool::Sendme)
             .cloned();
 
+        let eazy_available = croc_status.as_ref().map(|s| s.available).unwrap_or(false)
+            && sendme_status.as_ref().map(|s| s.available).unwrap_or(false);
+
+        // ── EazySendme (primary, always shown) ─────────────────
         if tool_card(
             ui,
             "EazySendme",
-            "Sendme performance + Croc like short custom sharing code",
-            croc_status.as_ref().map(|s| s.available).unwrap_or(false)
-                && sendme_status.as_ref().map(|s| s.available).unwrap_or(false),
+            "Sendme performance + Croc‑like short custom sharing code",
+            eazy_available,
             None,
             EAZYSENDME_COLOR,
             self.selected_tool == SelectedTool::EazySendme,
         )
         .clicked()
-            && croc_status.as_ref().map(|s| s.available).unwrap_or(false)
-            && sendme_status.as_ref().map(|s| s.available).unwrap_or(false)
+            && eazy_available
             && self.selected_tool != SelectedTool::EazySendme
         {
             self.switch_tool(SelectedTool::EazySendme);
         }
-        ui.add_space(3.0);
+        ui.add_space(6.0);
 
-        if let Some(sendme) = &sendme_status {
-            if tool_card(
-                ui,
-                "Sendme",
-                "Cutting-edge performance, reliability, and security",
-                sendme.available,
-                sendme.version.as_deref(),
-                SENDME_COLOR,
-                self.selected_tool == SelectedTool::Sendme,
-            )
-            .clicked()
-                && sendme.available
-                && self.selected_tool != SelectedTool::Sendme
-            {
-                self.switch_tool(SelectedTool::Sendme);
+        // ── Standalone engines collapsible ──────────────────────────
+        {
+            let arrow = if self.native_engines_expanded { "▾" } else { "▸" };
+            let header_resp = ui.add(
+                egui::Label::new(
+                    RichText::new(format!("{} Standalone Engines", arrow))
+                        .size(12.0)
+                        .color(TEXT_MUTED),
+                )
+                .sense(egui::Sense::click()),
+            );
+            if header_resp.clicked() {
+                self.native_engines_expanded = !self.native_engines_expanded;
+            }
+
+            if self.native_engines_expanded {
+                ui.add_space(3.0);
+                if let Some(sendme) = &sendme_status {
+                    if tool_card(
+                        ui,
+                        "Sendme",
+                        "Cutting-edge performance, reliability, and security",
+                        sendme.available,
+                        sendme.version.as_deref(),
+                        SENDME_COLOR,
+                        self.selected_tool == SelectedTool::Sendme,
+                    )
+                    .clicked()
+                        && sendme.available
+                        && self.selected_tool != SelectedTool::Sendme
+                    {
+                        self.switch_tool(SelectedTool::Sendme);
+                    }
+                }
+                ui.add_space(3.0);
+
+                if let Some(croc) = &croc_status {
+                    if tool_card(
+                        ui,
+                        "Croc",
+                        "Convenience, ease of use, and 3rd-party mobile support",
+                        croc.available,
+                        croc.version.as_deref(),
+                        CROC_COLOR,
+                        self.selected_tool == SelectedTool::Croc,
+                    )
+                    .clicked()
+                        && croc.available
+                        && self.selected_tool != SelectedTool::Croc
+                    {
+                        self.switch_tool(SelectedTool::Croc);
+                    }
+                }
+                ui.add_space(4.0);
             }
         }
-        ui.add_space(3.0);
 
-        if let Some(croc) = &croc_status {
-            if tool_card(
-                ui,
-                "Croc",
-                "Convenience, ease of use, and 3rd-party mobile support",
-                croc.available,
-                croc.version.as_deref(),
-                CROC_COLOR,
-                self.selected_tool == SelectedTool::Croc,
-            )
-            .clicked()
-                && croc.available
-                && self.selected_tool != SelectedTool::Croc
-            {
-                self.switch_tool(SelectedTool::Croc);
-            }
-        }
-
-        ui.add_space(16.0);
+        ui.add_space(12.0);
         section_header(ui, "🚀", "Quick Actions");
         ui.add_space(4.0);
 
+        let accent = self.engine_color();
+        let total_w = ui.available_width();
+        let btn_w = (total_w - 16.0) / 3.0;
+
         ui.horizontal(|ui| {
-            let accent = self.engine_color();
-            let w = (ui.available_width() - 8.0) / 2.0;
-            if accent_button_sized(ui, "📤 Send", accent, Vec2::new(w, 42.0)).clicked() {
+            if accent_button_sized(ui, "📤 Send", accent, Vec2::new(btn_w, 42.0)).clicked() {
                 self.view = AppView::Send;
             }
-            if accent_button_sized(ui, "📥 Receive", accent, Vec2::new(w, 42.0)).clicked() {
+            if accent_button_sized(ui, "📥 Receive", accent, Vec2::new(btn_w, 42.0)).clicked() {
                 self.view = AppView::Receive;
+            }
+            let sendme_avail = sendme_status.as_ref().map(|s| s.available).unwrap_or(false);
+            let broadcast_btn = ui.add_enabled(
+                sendme_avail,
+                egui::Button::new(
+                    RichText::new("📡 Broadcast with Sendme")
+                        .size(12.0)
+                        .color(if sendme_avail { Color32::BLACK } else { TEXT_MUTED }),
+                )
+                .min_size(Vec2::new(btn_w, 42.0))
+                .fill(if sendme_avail { SENDME_COLOR } else { Color32::from_rgb(50, 50, 55) })
+                .corner_radius(egui::epaint::CornerRadius::same(8u8)),
+            );
+            if broadcast_btn.clicked() && sendme_avail {
+                // Switch to Sendme in broadcast (non-one-shot) mode and go to Send
+                if self.selected_tool != SelectedTool::Sendme {
+                    self.switch_tool(SelectedTool::Sendme);
+                }
+                self.sendme_one_shot = false;
+                self.view = AppView::Send;
             }
         });
     }
+
 
     fn show_croc_send_setup(&mut self, ui: &mut egui::Ui, send_locked: bool) {
         let accent = self.engine_color();
@@ -2558,29 +2667,66 @@ impl DataBeamApp {
                     ui.label(RichText::new("(Required)").color(ERROR).size(10.0));
                 });
                 ui.add_space(4.0);
-                if send_locked {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.eazysendme_custom_code)
-                            .hint_text("Random code")
-                            .interactive(false),
-                    );
-                } else {
-                    let response = ui.add(
-                        egui::TextEdit::singleline(&mut self.eazysendme_custom_code)
-                            .hint_text("Random code"),
-                    );
-                    if response.changed() && !self.eazysendme_custom_code.is_empty() {
-                        // Validation or persistence could go here
+                ui.add_enabled_ui(!send_locked, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Custom code")
+                                .color(TEXT_SECONDARY)
+                                .size(11.0),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.eazysendme_custom_code)
+                                .desired_width(220.0)
+                                .hint_text("More than 6 characters"),
+                        );
+                        if ui.small_button("Clear").clicked() {
+                            self.eazysendme_custom_code.clear();
+                        }
+                    });
+                    let custom_len = self.eazysendme_custom_code.trim().chars().count();
+                    if custom_len > 0 && custom_len <= 6 {
+                        ui.label(
+                            RichText::new("Custom code must be more than 6 characters.")
+                                .size(10.0)
+                                .color(WARNING),
+                        );
                     }
-                }
-                ui.label(
-                    RichText::new("Must use more than 6 characters.")
-                        .size(10.0)
-                        .color(TEXT_MUTED),
-                );
+
+                    if !self.eazysendme_recent_codes.is_empty() {
+                        let recent = self.eazysendme_recent_codes.clone();
+                        ui.add_space(3.0);
+                        egui::ComboBox::from_id_salt("eazy_recent_codes")
+                            .selected_text("Recent codes")
+                            .show_ui(ui, |ui| {
+                                for code in recent {
+                                    let text = truncate_middle(&code, 34);
+                                    if ui.selectable_label(false, text).clicked() {
+                                        self.eazysendme_custom_code = code;
+                                    }
+                                }
+                            });
+                        ui.horizontal(|ui| {
+                            if ui.small_button("Overwrite with latest").clicked() {
+                                if let Some(latest) = self.eazysendme_recent_codes.first() {
+                                    self.eazysendme_custom_code = latest.clone();
+                                }
+                            }
+                            if ui.small_button("Clear recent").clicked() {
+                                self.eazysendme_recent_codes.clear();
+                                self.persist_user_settings();
+                            }
+                        });
+                    }
+                    ui.label(
+                        RichText::new("Must use more than 6 characters.")
+                            .size(10.0)
+                            .color(TEXT_MUTED),
+                    );
+                });
             });
             ui.add_space(6.0);
         }
+
 
         // ── File list ──
         card_frame(ui, |ui| {
@@ -2880,12 +3026,48 @@ impl DataBeamApp {
             };
             ui.label(RichText::new(label).color(TEXT_PRIMARY).strong().size(13.0));
             ui.add_space(3.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut self.receive_code)
-                    .hint_text(hint)
-                    .desired_width(ui.available_width() - 4.0)
-                    .font(egui::FontId::new(13.0, egui::FontFamily::Monospace)),
-            );
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.receive_code)
+                        .hint_text(hint)
+                        .desired_width(ui.available_width() - 60.0)
+                        .font(egui::FontId::new(13.0, egui::FontFamily::Monospace)),
+                );
+                if ui.small_button("Clear").clicked() {
+                    self.receive_code.clear();
+                }
+            });
+
+            // Recent codes for Croc / EazySendme receivers
+            let show_recent = (self.selected_tool == SelectedTool::Croc
+                || self.selected_tool == SelectedTool::EazySendme)
+                && !self.croc_receive_recent_codes.is_empty();
+            if show_recent {
+                let recent = self.croc_receive_recent_codes.clone();
+                ui.add_space(3.0);
+                egui::ComboBox::from_id_salt("croc_receive_recent")
+                    .selected_text("Recent codes")
+                    .show_ui(ui, |ui| {
+                        for code in recent {
+                            let text = truncate_middle(&code, 34);
+                            if ui.selectable_label(false, text).clicked() {
+                                self.receive_code = code;
+                            }
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    if ui.small_button("Overwrite with latest").clicked() {
+                        if let Some(latest) = self.croc_receive_recent_codes.first() {
+                            self.receive_code = latest.clone();
+                        }
+                    }
+                    if ui.small_button("Clear recent").clicked() {
+                        self.croc_receive_recent_codes.clear();
+                        self.persist_user_settings();
+                    }
+                });
+            }
+
             ui.add_space(3.0);
             ui.label(
                 RichText::new("Interrupted downloads can be resumed by running Receive again.")
@@ -2893,6 +3075,7 @@ impl DataBeamApp {
                     .size(10.0),
             );
         });
+
 
         ui.add_space(6.0);
 
@@ -3388,23 +3571,34 @@ impl DataBeamApp {
                 }
             }
 
-            // Code/ticket
-            if let Some(code) = &self.transfer_code {
-                ui.add_space(6.0);
-                let (label, color) = match self.selected_tool {
-                    SelectedTool::Croc => ("Share this code:", CROC_COLOR),
-                    SelectedTool::Sendme => ("Share this ticket:", SENDME_COLOR),
-                    SelectedTool::EazySendme => {
-                        ("EazySendme ticket:", EAZYSENDME_COLOR)
-                    }
-                };
-                if code_display(ui, label, code, color) {
-                    self.show_toast("Code copied".to_string(), SUCCESS);
+            // Code/ticket — for Croc sender, only show once past the Preparing phase
+            let show_code = self.transfer_code.is_some() && {
+                let croc_sender = self.selected_tool == SelectedTool::Croc
+                    && self.view == AppView::Send;
+                if croc_sender {
+                    self.transfer_phase != TransferPhase::Preparing
+                } else {
+                    true
                 }
-                ui.add_space(4.0);
-                if accent_button_sized(ui, "🔳 Show QR", color, Vec2::new(100.0, 24.0)).clicked()
-                {
-                    wants_show_qr = true;
+            };
+            if show_code {
+                if let Some(code) = &self.transfer_code.clone() {
+                    ui.add_space(6.0);
+                    let (label, color) = match self.selected_tool {
+                        SelectedTool::Croc => ("Share this code:", CROC_COLOR),
+                        SelectedTool::Sendme => ("Share this ticket:", SENDME_COLOR),
+                        SelectedTool::EazySendme => {
+                            ("EazySendme ticket:", EAZYSENDME_COLOR)
+                        }
+                    };
+                    if code_display(ui, label, code, color) {
+                        self.show_toast("Code copied".to_string(), SUCCESS);
+                    }
+                    ui.add_space(4.0);
+                    if accent_button_sized(ui, "🔳 Show QR", color, Vec2::new(100.0, 24.0)).clicked()
+                    {
+                        wants_show_qr = true;
+                    }
                 }
             }
 
@@ -4713,7 +4907,7 @@ mod parse_tests {
         app.transfer_phase = TransferPhase::Transferring;
         app.sendme_had_transfer = true;
         app.transfer_total_bytes = Some(4096);
-        app.transfer_done_bytes = Some(2048);
+        app.transfer_done_bytes = Some(4096);
         let (tx, rx) = mpsc::channel();
         app.transfer_rx = Some(rx);
         tx.send(TransferMsg::PeerDisconnected)
