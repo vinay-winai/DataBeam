@@ -49,18 +49,28 @@ function updateDownloadLinks() {
     if (!gReleaseData || !gReleaseData.assets) return;
 
     let windowsAsset = null;
-    let macAsset = null;
-    let linuxAsset = null;
+    let macUnivAsset = null;
+    let macAarchAsset = null;
+    let linuxAppAsset = null;
+    let linuxDebAsset = null;
 
     gReleaseData.assets.forEach(asset => {
         const name = asset.name.toLowerCase();
-        // Matching rules for DataBeam binaries (e.g., databeam.exe, databeam-mac, databeam-linux)
+        // Matching rules for DataBeam binaries
         if (name.includes("win") || name.endsWith(".exe")) {
             windowsAsset = asset.browser_download_url;
+        } else if (name.includes("macos-universal")) {
+            macUnivAsset = asset.browser_download_url;
+        } else if (name.includes("macos-aarch64")) {
+            macAarchAsset = asset.browser_download_url;
         } else if (name.includes("mac") || name.includes("darwin")) {
-            macAsset = asset.browser_download_url;
+            if (!macUnivAsset) macUnivAsset = asset.browser_download_url;
+        } else if (name.endsWith(".appimage")) {
+            linuxAppAsset = asset.browser_download_url;
+        } else if (name.endsWith(".deb")) {
+            linuxDebAsset = asset.browser_download_url;
         } else if (name.includes("linux")) {
-            linuxAsset = asset.browser_download_url;
+             if (!linuxAppAsset) linuxAppAsset = asset.browser_download_url;
         }
     });
 
@@ -68,27 +78,43 @@ function updateDownloadLinks() {
     const releaseUrl = gReleaseData.html_url;
 
     document.getElementById("link-windows").href = windowsAsset || releaseUrl;
-    document.getElementById("link-mac").href = macAsset || releaseUrl;
-    document.getElementById("link-linux").href = linuxAsset || releaseUrl;
+    document.getElementById("link-mac").href = macUnivAsset || macAarchAsset || releaseUrl;
+    document.getElementById("link-linux").href = linuxAppAsset || linuxDebAsset || releaseUrl;
 
     const mainBtn = document.getElementById("download-btn");
     const statusText = document.getElementById("download-status");
     const btnText = mainBtn.querySelector(".btn-text");
 
     let autoUrl = null;
+    const secStatus = document.getElementById("secondary-download");
+    if (secStatus) {
+        secStatus.style.display = "none";
+        secStatus.innerHTML = "";
+    }
 
     if (gUserOS === "windows" && windowsAsset) {
         autoUrl = windowsAsset;
         statusText.textContent = `Latest Release: ${gReleaseData.tag_name} (Windows)`;
         btnText.textContent = "Download for Windows";
-    } else if (gUserOS === "mac" && macAsset) {
-        autoUrl = macAsset;
-        statusText.textContent = `Latest Release: ${gReleaseData.tag_name} (macOS)`;
+    } else if (gUserOS === "mac" && (macUnivAsset || macAarchAsset)) {
+        autoUrl = macUnivAsset || macAarchAsset;
+        statusText.textContent = `Latest Release: ${gReleaseData.tag_name} (macOS Universal)`;
         btnText.textContent = "Download for macOS";
-    } else if (gUserOS === "linux" && linuxAsset) {
-        autoUrl = linuxAsset;
+        if (secStatus && macAarchAsset) {
+            secStatus.style.display = "block";
+            secStatus.innerHTML = `On Apple Silicon? <a href="${macAarchAsset}" style="color: #ff8c00; text-decoration: underline;">Get aarch64 build for smaller app size</a>`;
+        }
+    } else if (gUserOS === "linux" && (linuxAppAsset || linuxDebAsset)) {
+        autoUrl = linuxAppAsset || linuxDebAsset;
         statusText.textContent = `Latest Release: ${gReleaseData.tag_name} (Linux)`;
-        btnText.textContent = "Download for Linux";
+        btnText.textContent = autoUrl === linuxAppAsset ? "Download AppImage" : "Download Linux dist";
+        if (secStatus && linuxDebAsset && autoUrl !== linuxDebAsset) {
+            secStatus.style.display = "block";
+            secStatus.innerHTML = `Also available: <a href="${linuxDebAsset}" style="color: #ff8c00; text-decoration: underline;">Download .deb package</a>`;
+        } else if (secStatus && linuxAppAsset && autoUrl !== linuxAppAsset) {
+            secStatus.style.display = "block";
+            secStatus.innerHTML = `Also available: <a href="${linuxAppAsset}" style="color: #ff8c00; text-decoration: underline;">Download AppImage</a>`;
+        }
     } else {
         autoUrl = releaseUrl; // fallback
         statusText.textContent = `Latest Release: ${gReleaseData.tag_name} (Cross-Platform)`;

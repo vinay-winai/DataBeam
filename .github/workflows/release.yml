@@ -101,17 +101,24 @@ jobs:
             exit 1
           fi
 
-          # Create universal binary using lipo
+          # 1) Create the aarch64 DMG first (smaller size for Apple Silicon natively)
+          codesign --force --deep --sign - "${app_path}"
+          codesign --verify --deep --strict --verbose=2 "${app_path}"
+          dmg_path_aarch="dist/databeam_v${version}_macos-aarch64.dmg"
+          hdiutil create -volname "DataBeam" -srcfolder "${app_path}" -ov -format UDZO "${dmg_path_aarch}"
+
+          # 2) Now merge into Universal App Bundle!
+          echo "Merging into Universal binary..."
           lipo -create -output "${app_path}/Contents/MacOS/databeam" \
                target/aarch64-apple-darwin/release/databeam \
                target/x86_64-apple-darwin/release/databeam
 
-          # Ad-hoc sign to avoid invalid-signature Gatekeeper errors after packaging.
+          # Ad-hoc sign again after replacing binary
           codesign --force --deep --sign - "${app_path}"
           codesign --verify --deep --strict --verbose=2 "${app_path}"
 
-          dmg_path="dist/databeam_v${version}_macos-universal.dmg"
-          hdiutil create -volname "DataBeam" -srcfolder "${app_path}" -ov -format UDZO "${dmg_path}"
+          dmg_path_univ="dist/databeam_v${version}_macos-universal.dmg"
+          hdiutil create -volname "DataBeam" -srcfolder "${app_path}" -ov -format UDZO "${dmg_path_univ}"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
