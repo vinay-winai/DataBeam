@@ -158,10 +158,12 @@ pub async fn download(
             let payload_size = sizes.iter().skip(1).copied().sum::<u64>();
             let total_files = (sizes.len().saturating_sub(1)) as u64;
 
-            // Emit initial progress event (0%) so frontend can display total size immediately
-            emit_progress_event(&app_handle, 0, payload_size, 0.0);
+            // Calculate how much we already successfully downloaded in previous attempts
+            let local_size = local.local_bytes();
 
-            let _local_size = local.local_bytes();
+            // Emit initial progress event right away with our resumed progress
+            emit_progress_event(&app_handle, local_size.min(payload_size), payload_size, 0.0);
+
             let get = db.remote().execute_get(connection, local.missing());
             let mut stats = Stats::default();
             let mut stream = get.stream();
@@ -186,7 +188,7 @@ pub async fn download(
 
                             emit_progress_event(
                                 &app_handle,
-                                offset.min(payload_size),
+                                (local_size + offset).min(payload_size),
                                 payload_size,
                                 speed_bps,
                             );
@@ -227,7 +229,6 @@ pub async fn download(
 
             // Emit events for already complete data
             emit_event(&app_handle, "receive-started");
-            emit_event(&app_handle, "receive-completed");
 
             (Stats::default(), total_files, payload_bytes)
         };
