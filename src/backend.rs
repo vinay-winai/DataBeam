@@ -630,6 +630,11 @@ enum NativeSendmeEvent {
         total: u64,
         speed_bps: f64,
     },
+    ReceiveExportStarted,
+    ReceiveExportProgress {
+        done: u64,
+        total: u64,
+    },
     ReceiveCompleted,
 }
 
@@ -705,6 +710,19 @@ impl NativeSendmeEventEmitter for NativeSendmeEmitter {
             "active-connection-count" => {
                 let count = payload.trim().parse::<usize>().unwrap_or(0);
                 NativeSendmeEvent::ActiveConnectionCount(count)
+            }
+            "receive-export-started" => NativeSendmeEvent::ReceiveExportStarted,
+            "receive-export-progress" => {
+                let mut parts = payload.split(':');
+                if let (Some(d_str), Some(t_str)) = (parts.next(), parts.next()) {
+                    if let (Ok(done), Ok(total)) = (d_str.trim().parse::<u64>(), t_str.trim().parse::<u64>()) {
+                        NativeSendmeEvent::ReceiveExportProgress { done, total }
+                    } else {
+                        return Ok(());
+                    }
+                } else {
+                    return Ok(());
+                }
             }
             _ => return Ok(()),
         };
@@ -1401,7 +1419,9 @@ pub fn sendme_send(
                 }
                 Ok(NativeSendmeEvent::ReceiveStarted)
                 | Ok(NativeSendmeEvent::ReceiveProgress { .. })
-                | Ok(NativeSendmeEvent::ReceiveCompleted) => {}
+                | Ok(NativeSendmeEvent::ReceiveCompleted)
+                | Ok(NativeSendmeEvent::ReceiveExportStarted)
+                | Ok(NativeSendmeEvent::ReceiveExportProgress { .. }) => {}
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     if opts.one_shot {
@@ -1636,6 +1656,16 @@ pub fn sendme_receive(
                 }
                 Ok(NativeSendmeEvent::ReceiveCompleted) => {
                     let _ = tx.send(TransferMsg::Progress(1.0));
+                }
+                Ok(NativeSendmeEvent::ReceiveExportStarted) => {
+                    let _ = tx.send(TransferMsg::Output("[4/4] Writing files to disk...".to_string()));
+                }
+                Ok(NativeSendmeEvent::ReceiveExportProgress { done, total }) => {
+                    let _ = tx.send(TransferMsg::Output(format!(
+                        "[4/4] Writing... {} / {}",
+                        format_size_unit(done),
+                        format_size_unit(total.max(done).max(1))
+                    )));
                 }
                 Ok(NativeSendmeEvent::TransferStarted)
                 | Ok(NativeSendmeEvent::TransferProgress { .. })

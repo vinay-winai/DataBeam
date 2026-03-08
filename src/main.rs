@@ -2558,11 +2558,20 @@ impl DataBeamApp {
                 });
                 if self.croc_text_mode {
                     ui.add_space(4.0);
-                    ui.label(
-                        RichText::new("Text to send")
-                            .color(TEXT_SECONDARY)
-                            .size(11.0),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Clear").clicked() {
+                                self.croc_text_value.clear();
+                            }
+                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                ui.label(
+                                    RichText::new("Text to send")
+                                        .color(TEXT_SECONDARY)
+                                        .size(11.0),
+                                );
+                            });
+                        });
+                    });
                     ui.add(
                         egui::TextEdit::multiline(&mut self.croc_text_value)
                             .desired_rows(3)
