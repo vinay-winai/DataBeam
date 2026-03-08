@@ -461,7 +461,10 @@ async fn show_provide_progress_with_logging(
             .filter(|state| state.count_toward_payload)
             .map(|state| state.last_offset.min(state.total_size))
             .sum::<u64>();
-        let done_bytes = tracker.completed_bytes.saturating_add(active_done).min(total_bytes);
+        let done_bytes = tracker
+            .completed_bytes
+            .saturating_add(active_done)
+            .min(total_bytes);
         let speed_bps = tracker
             .started_at
             .and_then(|started_at| {
