@@ -1028,6 +1028,7 @@ pub fn croc_receive(
         // (passing code as CLI arg is no longer supported in non-classic mode)
         cmd.env("CROC_SECRET", &opts.code);
         cmd.arg("--yes");
+        cmd.arg("--overwrite"); // auto-resume interrupted downloads without y/N prompt
 
         if let Some(dir) = &opts.output_dir {
             cmd.arg("--out").arg(dir);
