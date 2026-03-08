@@ -44,6 +44,12 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Update Cargo.toml version
+        shell: bash
+        run: |
+          version="${RELEASE_TAG#v}"
+          sed -i.bak "s/^version = \".*\"/version = \"${version}\"/" Cargo.toml
+
       - name: Build release binary
         run: cargo build --release --features release-single-instance
 
@@ -77,6 +83,12 @@ jobs:
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
+
+      - name: Update Cargo.toml version
+        shell: bash
+        run: |
+          version="${RELEASE_TAG#v}"
+          sed -i.bak "s/^version = \".*\"/version = \"${version}\"/" Cargo.toml
 
       - name: Build release binaries
         run: |
@@ -160,6 +172,12 @@ jobs:
             libxrandr-dev \
             mesa-common-dev \
             patchelf
+
+      - name: Update Cargo.toml version
+        shell: bash
+        run: |
+          version="${RELEASE_TAG#v}"
+          sed -i.bak "s/^version = \".*\"/version = \"${version}\"/" Cargo.toml
 
       - name: Build release binary
         run: cargo build --release --features release-single-instance
