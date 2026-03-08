@@ -1,5 +1,4 @@
 use crate::core::types::{get_or_create_secret, AppHandle, ReceiveOptions, ReceiveResult};
-use data_encoding::HEXLOWER;
 use iroh::{discovery::dns::DnsDiscovery, Endpoint};
 use iroh_blobs::{
     api::{
@@ -13,7 +12,6 @@ use iroh_blobs::{
     ticket::BlobTicket,
 };
 use n0_future::StreamExt;
-use rand::Rng;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -88,15 +86,9 @@ pub async fn download(
 
     let endpoint = builder.bind().await?;
 
-    // Use system temp directory instead of current_dir for GUI app
-    // This avoids polluting user directories and OS manages cleanup automatically
-        let mut suffix = [0u8; 5];
-    rand::rng().fill(&mut suffix);
-    let dir_name = format!(
-        ".sendme-recv-{}-{}",
-        ticket.hash().to_hex(),
-        HEXLOWER.encode(&suffix)
-    );
+    // Use system temp directory with a STABLE name based on the ticket hash.
+    // This allows resuming interrupted transfers because the blob store will be reused!
+    let dir_name = format!(".sendme-recv-{}", ticket.hash().to_hex());
     let temp_base = std::env::temp_dir();
     let iroh_data_dir = temp_base.join(&dir_name);
     let db = FsStore::load(&iroh_data_dir).await?;
@@ -256,14 +248,14 @@ pub async fn download(
                 tracing::error!("Download operation failed: {}", e);
                 // make sure we shutdown the db before exiting
                 db2.shutdown().await?;
-                let _ = tokio::fs::remove_dir_all(&iroh_data_dir).await;
+                // WE DO NOT DELETE the cache here, so it can be resumed later!
                 anyhow::bail!("error: {e}");
             }
         },
         _ = tokio::signal::ctrl_c() => {
             tracing::warn!("Operation cancelled by user");
             db2.shutdown().await?;
-            let _ = tokio::fs::remove_dir_all(&iroh_data_dir).await;
+            // WE DO NOT DELETE the cache here, so it can be resumed later!
             anyhow::bail!("Operation cancelled");
         }
     };
