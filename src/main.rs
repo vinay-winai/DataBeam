@@ -94,8 +94,10 @@ struct UserSettings {
     receive_output_dir: Option<String>,
     #[serde(default = "default_sendme_one_shot")]
     sendme_one_shot: bool,
-    #[serde(skip)]
+    #[serde(default)]
     eazysendme_custom_code: String,
+    #[serde(default)]
+    croc_custom_code: String,
 }
 
 fn default_sendme_one_shot() -> bool {
@@ -116,6 +118,7 @@ struct DataBeamApp {
     send_items: Vec<SendItem>,
     croc_custom_code: String,
     croc_use_custom_code: bool,
+    croc_consecutive_failures: u8,
     croc_recent_codes: Vec<String>,
     croc_text_mode: bool,
     croc_text_value: String,
@@ -202,6 +205,7 @@ impl Default for DataBeamApp {
             send_items: Vec::new(),
             croc_custom_code: String::new(),
             croc_use_custom_code: false,
+            croc_consecutive_failures: 0,
             croc_recent_codes: Vec::new(),
             croc_text_mode: false,
             croc_text_value: String::new(),
@@ -373,6 +377,7 @@ impl DataBeamApp {
             .filter(|p| !p.as_os_str().is_empty());
         self.sendme_one_shot = settings.sendme_one_shot;
         self.eazysendme_custom_code = settings.eazysendme_custom_code;
+        self.croc_custom_code = settings.croc_custom_code;
     }
 
     fn persist_user_settings(&self) {
@@ -395,6 +400,7 @@ impl DataBeamApp {
                 .map(|p| p.to_string_lossy().to_string()),
             sendme_one_shot: self.sendme_one_shot,
             eazysendme_custom_code: self.eazysendme_custom_code.clone(),
+            croc_custom_code: self.croc_custom_code.clone(),
         };
         if let Ok(json) = serde_json::to_string_pretty(&settings) {
             let _ = fs::write(path, json);
@@ -1407,6 +1413,9 @@ impl DataBeamApp {
                                         }
                                     } else {
                                         self.transfer_state = TransferState::Completed;
+                                        if self.selected_tool == SelectedTool::Croc && self.croc_use_custom_code {
+                                            self.croc_consecutive_failures = 0;
+                                        }
                                         self.transfer_progress = 1.0;
                                         self.preparing_progress = 1.0;
                                         if let Some(total) = self.transfer_total_bytes {
@@ -1522,6 +1531,14 @@ impl DataBeamApp {
                                     restart_sendme_serve = true;
                                     break;
                                 } else {
+                                    if self.selected_tool == SelectedTool::Croc && self.croc_use_custom_code {
+                                        self.croc_consecutive_failures += 1;
+                                        if self.croc_consecutive_failures >= 2 {
+                                            self.croc_custom_code.clear();
+                                            self.croc_consecutive_failures = 0;
+                                            self.persist_user_settings();
+                                        }
+                                    }
                                     self.transfer_state = TransferState::Failed(e);
                                     self.transfer_end_time = Some(self.animation_time);
                                 }
@@ -1762,6 +1779,14 @@ impl DataBeamApp {
                         return;
                     }
                     self.transfer_code = Some(code.clone());
+                    
+                    let clean = code.trim().to_string();
+                    self.croc_recent_codes.retain(|c| c != &clean);
+                    self.croc_recent_codes.insert(0, clean);
+                    if self.croc_recent_codes.len() > 5 {
+                        self.croc_recent_codes.truncate(5);
+                    }
+                    self.persist_user_settings();
                 }
                 let opts = CrocSendOptions {
                     paths: self.send_paths(),
@@ -2116,6 +2141,17 @@ impl eframe::App for DataBeamApp {
                                 self.reset_transfer();
                             }
                         }
+                        
+                        ui.add_space(8.0);
+                        if ui
+                            .selectable_label(
+                                false,
+                                RichText::new("❓ Troubleshoot").size(12.0).color(TEXT_SECONDARY),
+                            )
+                            .clicked()
+                        {
+                            let _ = open::that("https://github.com/vinay-winai/DataBeam/blob/main/trubleshoot.md");
+                        }
                     });
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2283,7 +2319,7 @@ impl DataBeamApp {
         if tool_card(
             ui,
             "EazySendme",
-            "Sendme performance + Croc-like automatic ticket sharing",
+            "Sendme performance + Croc like short custom sharing code",
             croc_status.as_ref().map(|s| s.available).unwrap_or(false)
                 && sendme_status.as_ref().map(|s| s.available).unwrap_or(false),
             None,
@@ -2842,31 +2878,7 @@ impl DataBeamApp {
                 }
                 SelectedTool::Sendme => ("Ticket", "paste ticket here"),
             };
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(label).color(TEXT_PRIMARY).strong().size(13.0));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if accent_button_sized(
-                        ui,
-                        "📋 Paste",
-                        self.engine_color(),
-                        Vec2::new(70.0, 22.0),
-                    )
-                    .clicked()
-                    {
-                        if let Some(clip) = ui.ctx().input(|i| {
-                            i.events.iter().find_map(|e| {
-                                if let egui::Event::Paste(s) = e {
-                                    Some(s.clone())
-                                } else {
-                                    None
-                                }
-                            })
-                        }) {
-                            self.receive_code = clip;
-                        }
-                    }
-                });
-            });
+            ui.label(RichText::new(label).color(TEXT_PRIMARY).strong().size(13.0));
             ui.add_space(3.0);
             ui.add(
                 egui::TextEdit::singleline(&mut self.receive_code)

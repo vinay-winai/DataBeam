@@ -79,15 +79,15 @@ function updateDownloadLinks() {
 
     if (gUserOS === "windows" && windowsAsset) {
         autoUrl = windowsAsset;
-        statusText.textContent = `Latest Release: ${gReleaseData.tag_name} (Windows detected)`;
+        statusText.textContent = `Latest Release: ${gReleaseData.tag_name} (Windows)`;
         btnText.textContent = "Download for Windows";
     } else if (gUserOS === "mac" && macAsset) {
         autoUrl = macAsset;
-        statusText.textContent = `Latest Release: ${gReleaseData.tag_name} (macOS detected)`;
+        statusText.textContent = `Latest Release: ${gReleaseData.tag_name} (macOS)`;
         btnText.textContent = "Download for macOS";
     } else if (gUserOS === "linux" && linuxAsset) {
         autoUrl = linuxAsset;
-        statusText.textContent = `Latest Release: ${gReleaseData.tag_name} (Linux detected)`;
+        statusText.textContent = `Latest Release: ${gReleaseData.tag_name} (Linux)`;
         btnText.textContent = "Download for Linux";
     } else {
         autoUrl = releaseUrl; // fallback
@@ -97,28 +97,6 @@ function updateDownloadLinks() {
 
     mainBtn.href = autoUrl;
     gAutoDownloadUrl = autoUrl;
-
-    // Optional: Start auto-download countdown if we found a valid direct binary
-    if (gAutoDownloadUrl && gAutoDownloadUrl !== releaseUrl) {
-        startCountdown();
-    }
-}
-
-function startCountdown() {
-    const autoTextEl = document.querySelector(".auto-download-text");
-    const countdownEl = document.getElementById("countdown");
-    autoTextEl.classList.add("visible");
-    
-    let seconds = 3;
-    const interval = setInterval(() => {
-        seconds--;
-        countdownEl.textContent = seconds;
-        if (seconds <= 0) {
-            clearInterval(interval);
-            autoTextEl.textContent = "Download starting...";
-            window.location.href = gAutoDownloadUrl;
-        }
-    }, 1000);
 }
 
 // Initialize

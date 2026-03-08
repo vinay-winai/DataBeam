@@ -286,6 +286,13 @@ pub fn log_area(ui: &mut egui::Ui, lines: &[String], max_height: f32, stick_bott
 /// Display a code/ticket with a copy button. Long tickets are truncated.
 pub fn code_display(ui: &mut egui::Ui, label: &str, code: &str, color: Color32) -> bool {
     let mut copied = false;
+    let id = ui.id().with(code);
+    let mut btn_text = "📋 Copy";
+    if let Some(time) = ui.data(|d| d.get_temp::<f64>(id)) {
+        if ui.input(|i| i.time) - time < 2.0 {
+            btn_text = "✅ Copied";
+        }
+    }
 
     egui::Frame::NONE
         .fill(Color32::from_rgba_premultiplied(
@@ -304,9 +311,11 @@ pub fn code_display(ui: &mut egui::Ui, label: &str, code: &str, color: Color32) 
             ui.horizontal(|ui| {
                 ui.label(RichText::new(label).size(11.0).color(TEXT_SECONDARY));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if accent_button_sized(ui, "📋 Copy", color, Vec2::new(70.0, 24.0)).clicked()
+                    if accent_button_sized(ui, btn_text, color, Vec2::new(76.0, 24.0)).clicked()
                     {
+                        let current_time = ui.input(|i| i.time);
                         ui.ctx().copy_text(code.to_string());
+                        ui.data_mut(|d| d.insert_temp(id, current_time));
                         copied = true;
                     }
                 });
