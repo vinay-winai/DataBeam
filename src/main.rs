@@ -1438,18 +1438,27 @@ impl DataBeamApp {
                                     continue;
                                 }
                                 self.transfer_log
-                                    .push("Peer disconnected (transfer finished)".to_string());
+                                    .push("Peer disconnected".to_string());
                                 if (self.selected_tool == SelectedTool::Sendme
                                     || self.selected_tool == SelectedTool::EazySendme)
                                     && self.sendme_one_shot
                                 {
                                     let done = self.transfer_done_bytes.unwrap_or(0);
+                                    let total = self.transfer_total_bytes.unwrap_or(0);
                                     let has_payload = done > 0 || self.sendme_had_transfer;
-                                    if has_payload {
+                                    let complete = self.sendme_sender_payload_complete
+                                        || (total > 0 && done >= total)
+                                        || self.transfer_progress >= 0.95;
+                                    if !has_payload {
+                                        self.transfer_state = TransferState::Failed(
+                                            "Peer disconnected before transfer started".to_string(),
+                                        );
+                                        self.transfer_end_time = Some(self.animation_time);
+                                    } else if complete {
                                         self.mark_sendme_one_shot_completed();
                                     } else {
                                         self.transfer_state = TransferState::Failed(
-                                            "Peer disconnected before transfer started".to_string(),
+                                            "Transfer was not completed (peer disconnected early)".to_string(),
                                         );
                                         self.transfer_end_time = Some(self.animation_time);
                                     }
@@ -1513,12 +1522,21 @@ impl DataBeamApp {
                                         || self.transfer_done_bytes.unwrap_or(0) > 0)
                                 {
                                     let done = self.transfer_done_bytes.unwrap_or(0);
+                                    let total = self.transfer_total_bytes.unwrap_or(0);
                                     let has_payload = done > 0 || self.sendme_had_transfer;
-                                    if has_payload {
+                                    let complete = self.sendme_sender_payload_complete
+                                        || (total > 0 && done >= total)
+                                        || self.transfer_progress >= 0.95;
+                                    if !has_payload {
+                                        self.transfer_state = TransferState::Failed(
+                                            "Send session ended before payload started".to_string(),
+                                        );
+                                        self.transfer_end_time = Some(self.animation_time);
+                                    } else if complete {
                                         self.mark_sendme_one_shot_completed();
                                     } else {
                                         self.transfer_state = TransferState::Failed(
-                                            "Send session ended before payload started".to_string(),
+                                            "Transfer was not completed (session ended early)".to_string(),
                                         );
                                         self.transfer_end_time = Some(self.animation_time);
                                     }
@@ -3182,7 +3200,7 @@ impl DataBeamApp {
                     SelectedTool::Croc => (CROC_COLOR, "🐊 Receive"),
                     SelectedTool::Sendme => (SENDME_COLOR, "📡 Receive"),
                     SelectedTool::EazySendme => {
-                        (EAZYSENDME_COLOR, "⚡ Receive (via Croc)")
+                        (EAZYSENDME_COLOR, "⚡ Receive")
                     }
                 };
                 if accent_button(ui, label, color).clicked() {
@@ -4895,6 +4913,33 @@ mod parse_tests {
     }
 
     #[test]
+    fn sendme_one_shot_incomplete_on_early_peer_disconnect() {
+        let mut app = DataBeamApp::default();
+        app.selected_tool = SelectedTool::Sendme;
+        app.view = AppView::Send;
+        app.transfer_state = TransferState::Running;
+        app.sendme_one_shot = true;
+        app.transfer_phase = TransferPhase::Transferring;
+        app.sendme_had_transfer = true;
+        app.transfer_total_bytes = Some(4096);
+        app.transfer_done_bytes = Some(2048); // 50% — early disconnect
+        app.transfer_progress = 0.5;
+        let (tx, rx) = mpsc::channel();
+        app.transfer_rx = Some(rx);
+        tx.send(TransferMsg::PeerDisconnected)
+            .expect("send peer disconnected");
+        drop(tx);
+
+        app.poll_transfer();
+
+        assert!(
+            matches!(app.transfer_state, TransferState::Failed(_)),
+            "expected Failed for 50% progress disconnect, got {:?}",
+            app.transfer_state
+        );
+    }
+
+    #[test]
     fn sendme_one_shot_completes_on_peer_disconnected_signal() {
         let mut app = DataBeamApp::default();
         app.selected_tool = SelectedTool::Sendme;
@@ -4904,7 +4949,8 @@ mod parse_tests {
         app.transfer_phase = TransferPhase::Transferring;
         app.sendme_had_transfer = true;
         app.transfer_total_bytes = Some(4096);
-        app.transfer_done_bytes = Some(2048);
+        app.transfer_done_bytes = Some(4096); // 100% — normal completion
+        app.transfer_progress = 1.0;
         let (tx, rx) = mpsc::channel();
         app.transfer_rx = Some(rx);
         tx.send(TransferMsg::PeerDisconnected)
@@ -4914,7 +4960,6 @@ mod parse_tests {
         app.poll_transfer();
 
         assert_eq!(app.transfer_state, TransferState::Completed);
-        assert_eq!(app.transfer_done_bytes, Some(4096));
     }
 }
 
