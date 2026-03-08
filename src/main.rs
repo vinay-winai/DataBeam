@@ -1562,6 +1562,10 @@ impl DataBeamApp {
                                             self.croc_custom_code.clear();
                                             self.croc_consecutive_failures = 0;
                                             self.persist_user_settings();
+                                            self.show_toast(
+                                                "Custom code cleared due to consecutive failures".to_string(),
+                                                WARNING,
+                                            );
                                         }
                                     }
                                     self.transfer_state = TransferState::Failed(e);
