@@ -90,6 +90,25 @@ pub async fn download(
     // This allows resuming interrupted transfers because the blob store will be reused!
     let dir_name = format!(".sendme-recv-{}", ticket.hash().to_hex());
     let temp_base = std::env::temp_dir();
+
+    // Clean up old .sendme-recv-* directories from previous aborted transfers
+    // The current active transfer's directory is excluded, preserving its resume capability.
+    let dir_name_clone = dir_name.clone();
+    let temp_base_clone = temp_base.clone();
+    tokio::spawn(async move {
+        if let Ok(mut entries) = tokio::fs::read_dir(&temp_base_clone).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with(".sendme-recv-") && name != dir_name_clone.as_str() {
+                        // Ignore errors; directories currently in use by parallel instances
+                        // will gracefully fail to delete due to OS-level file locks.
+                        let _ = tokio::fs::remove_dir_all(&path).await;
+                    }
+                }
+            }
+        }
+    });
     let iroh_data_dir = temp_base.join(&dir_name);
     let db = FsStore::load(&iroh_data_dir).await?;
     let db2 = db.clone();
@@ -196,7 +215,9 @@ pub async fn download(
             }
 
             if !download_completed {
-                anyhow::bail!("Download stream ended before completion - sender may have disconnected");
+                anyhow::bail!(
+                    "Download stream ended before completion - sender may have disconnected"
+                );
             }
 
             (stats, total_files, payload_size)
@@ -307,13 +328,21 @@ async fn export(
                         if offset - last_log_offset > 1_000_000 {
                             last_log_offset = offset;
                             let payload = format!("{}:{}", offset, current_size);
-                            emit_event_with_payload(app_handle, "receive-export-progress", &payload);
+                            emit_event_with_payload(
+                                app_handle,
+                                "receive-export-progress",
+                                &payload,
+                            );
                         }
                     }
                     ExportProgressItem::Done => {
                         if current_size > 0 {
                             let payload = format!("{}:{}", current_size, current_size);
-                            emit_event_with_payload(app_handle, "receive-export-progress", &payload);
+                            emit_event_with_payload(
+                                app_handle,
+                                "receive-export-progress",
+                                &payload,
+                            );
                         }
                     }
                     ExportProgressItem::Error(cause) => {
@@ -488,7 +517,3 @@ fn show_get_error(e: GetError) -> GetError {
     }
     e
 }
-
-
-
-
