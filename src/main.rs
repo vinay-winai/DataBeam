@@ -2378,7 +2378,7 @@ impl DataBeamApp {
         if tool_card(
             ui,
             "EazySendme",
-            "Sendme performance + Croc‑like short custom sharing code",
+            "Sendme performance + Croc like short custom sharing code",
             eazy_available,
             None,
             EAZYSENDME_COLOR,
@@ -3041,15 +3041,17 @@ impl DataBeamApp {
             ui.label(RichText::new(label).color(TEXT_PRIMARY).strong().size(13.0));
             ui.add_space(3.0);
             ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.receive_code)
-                        .hint_text(hint)
-                        .desired_width(ui.available_width() - 60.0)
-                        .font(egui::FontId::new(13.0, egui::FontFamily::Monospace)),
-                );
-                if ui.small_button("Clear").clicked() {
-                    self.receive_code.clear();
-                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Clear").clicked() {
+                        self.receive_code.clear();
+                    }
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.receive_code)
+                            .hint_text(hint)
+                            .desired_width(ui.available_width())
+                            .font(egui::FontId::new(13.0, egui::FontFamily::Monospace)),
+                    );
+                });
             });
 
             // Recent codes for Croc / EazySendme receivers
