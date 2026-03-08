@@ -1447,8 +1447,7 @@ impl DataBeamApp {
                                     let total = self.transfer_total_bytes.unwrap_or(0);
                                     let has_payload = done > 0 || self.sendme_had_transfer;
                                     let complete = self.sendme_sender_payload_complete
-                                        || (total > 0 && done >= total)
-                                        || self.transfer_progress >= 0.95;
+                                        || (total > 0 && done >= total);
                                     if !has_payload {
                                         self.transfer_state = TransferState::Failed(
                                             "Peer disconnected before transfer started".to_string(),
@@ -1525,8 +1524,7 @@ impl DataBeamApp {
                                     let total = self.transfer_total_bytes.unwrap_or(0);
                                     let has_payload = done > 0 || self.sendme_had_transfer;
                                     let complete = self.sendme_sender_payload_complete
-                                        || (total > 0 && done >= total)
-                                        || self.transfer_progress >= 0.95;
+                                        || (total > 0 && done >= total);
                                     if !has_payload {
                                         self.transfer_state = TransferState::Failed(
                                             "Send session ended before payload started".to_string(),
