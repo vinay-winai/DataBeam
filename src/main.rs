@@ -1244,6 +1244,32 @@ impl DataBeamApp {
                                     }
                                 }
                             }
+                            TransferMsg::Stats(done, total, speed_bps) => {
+                                let sendme_broadcast_sender = (self.selected_tool
+                                    == SelectedTool::Sendme
+                                    || self.selected_tool == SelectedTool::EazySendme)
+                                    && self.view == AppView::Send
+                                    && self.transfer_state == TransferState::Running
+                                    && !self.sendme_one_shot;
+                                if sendme_broadcast_sender
+                                    && self.sendme_waiting_after_cycle
+                                    && !self.sendme_peer_connected
+                                {
+                                    continue;
+                                }
+
+                                if self.transfer_phase == TransferPhase::Transferring {
+                                    self.transfer_done_bytes = Some(done);
+                                    self.transfer_total_bytes = Some(total);
+                                    if speed_bps > 0.0 {
+                                        self.transfer_speed_bps = Some(speed_bps);
+                                        self.push_speed_sample(speed_bps);
+                                    }
+                                    if total > 0 {
+                                        self.transfer_progress = (done as f32 / total as f32).clamp(0.0, 1.0);
+                                    }
+                                }
+                            }
                             TransferMsg::Code(code) => {
                                 let should_replace = if is_masked_croc_code(&code) {
                                     self.transfer_code.is_none()
@@ -1446,12 +1472,12 @@ impl DataBeamApp {
                                     let done = self.transfer_done_bytes.unwrap_or(0);
                                     let total = self.transfer_total_bytes.unwrap_or(0);
                                     let progress = self.effective_progress();
-                                    // Consider transfer complete only if progress ≥ 95% or
-                                    // done bytes matches total, or we had a payload-complete signal.
+
                                     let transfer_actually_complete = self.sendme_sender_payload_complete
                                         || (total > 0 && done >= total)
                                         || (total == 0 && progress >= 0.95)
                                         || (total > 0 && progress >= 0.95);
+
                                     let has_payload = done > 0 || self.sendme_had_transfer;
                                     if !has_payload {
                                         self.transfer_state = TransferState::Failed(
@@ -1459,6 +1485,8 @@ impl DataBeamApp {
                                         );
                                         self.transfer_end_time = Some(self.animation_time);
                                     } else if transfer_actually_complete {
+                                        // Sender log output often lags slightly behind the network.
+                                        // When peer disconnects and we had payload, it implies full success.
                                         self.mark_sendme_one_shot_completed();
                                     } else {
                                         self.transfer_state = TransferState::Failed(
@@ -2405,12 +2433,14 @@ impl DataBeamApp {
         {
             let arrow = if self.native_engines_expanded { "▾" } else { "▸" };
             let header_resp = ui.add(
-                egui::Label::new(
+                egui::Button::new(
                     RichText::new(format!("{} Standalone Engines", arrow))
-                        .size(12.0)
-                        .color(TEXT_MUTED),
+                        .size(13.0)
+                        .color(TEXT_SECONDARY),
                 )
-                .sense(egui::Sense::click()),
+                .fill(BG_CARD)
+                .min_size(Vec2::new(ui.available_width(), 36.0))
+                .corner_radius(egui::epaint::CornerRadius::same(6u8)),
             );
             if header_resp.clicked() {
                 self.native_engines_expanded = !self.native_engines_expanded;
@@ -2464,7 +2494,7 @@ impl DataBeamApp {
 
         let accent = self.engine_color();
         let total_w = ui.available_width();
-        let btn_w = (total_w - 16.0) / 3.0;
+        let btn_w = (total_w - 8.0) / 2.0;
 
         ui.horizontal(|ui| {
             if accent_button_sized(ui, "📤 Send", accent, Vec2::new(btn_w, 42.0)).clicked() {
@@ -2473,11 +2503,15 @@ impl DataBeamApp {
             if accent_button_sized(ui, "📥 Receive", accent, Vec2::new(btn_w, 42.0)).clicked() {
                 self.view = AppView::Receive;
             }
+        });
+        ui.add_space(8.0);
+        
+        ui.horizontal(|ui| {
             let sendme_avail = sendme_status.as_ref().map(|s| s.available).unwrap_or(false);
             let broadcast_btn = ui.add_enabled(
                 sendme_avail,
                 egui::Button::new(
-                    RichText::new("📡 Broadcast with Sendme")
+                    RichText::new("📡 Broadcast")
                         .size(12.0)
                         .color(if sendme_avail { Color32::BLACK } else { TEXT_MUTED }),
                 )
@@ -2491,6 +2525,26 @@ impl DataBeamApp {
                     self.switch_tool(SelectedTool::Sendme);
                 }
                 self.sendme_one_shot = false;
+                self.view = AppView::Send;
+            }
+            
+            let croc_avail = croc_status.as_ref().map(|s| s.available).unwrap_or(false);
+            let send_text_btn = ui.add_enabled(
+                croc_avail,
+                egui::Button::new(
+                    RichText::new("🐊 Send Text")
+                        .size(12.0)
+                        .color(if croc_avail { Color32::BLACK } else { TEXT_MUTED }),
+                )
+                .min_size(Vec2::new(btn_w, 42.0))
+                .fill(if croc_avail { CROC_COLOR } else { Color32::from_rgb(50, 50, 55) })
+                .corner_radius(egui::epaint::CornerRadius::same(8u8)),
+            );
+            if send_text_btn.clicked() && croc_avail {
+                if self.selected_tool != SelectedTool::Croc {
+                    self.switch_tool(SelectedTool::Croc);
+                }
+                self.croc_text_mode = true;
                 self.view = AppView::Send;
             }
         });
