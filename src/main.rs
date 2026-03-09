@@ -700,15 +700,33 @@ impl DataBeamApp {
             && e != "Transfer cancelled"
         {
             self.eazy_retry_count += 1;
-            let wait_secs = 16.0;
+
+            // Sender retries immediately — it just relaunches a process (no disk import needed).
+            // Receiver waits longer because the sender must re-import blobs from disk before it's
+            // ready to accept connections again. We scale by payload size: min 30s, +1s per 100 MB,
+            // capped at 120s.
+            let wait_secs = if self.view == AppView::Send {
+                0.0_f64
+            } else {
+                let bytes = self.transfer_total_bytes.unwrap_or(0);
+                let size_mb = bytes as f64 / (100.0 * 1024.0 * 1024.0); // 1s per 100 MB
+                (30.0_f64 + size_mb).min(120.0)
+            };
+
             self.eazy_next_retry_time = Some(self.animation_time + wait_secs);
-            let retry_msg = format!(
-                "Transfer failed. Auto-retrying {}/3 in {}s...",
-                self.eazy_retry_count, wait_secs
-            );
-            self.transfer_log.push(retry_msg);
-            self.transfer_state =
-                TransferState::Failed(format!("{} (Auto-retrying in {}s...)", e, wait_secs));
+            let retry_msg = if wait_secs == 0.0 {
+                format!(
+                    "Transfer failed. Auto-retrying {}/3 immediately...",
+                    self.eazy_retry_count
+                )
+            } else {
+                format!(
+                    "Transfer failed. Auto-retrying {}/3 in {}s...",
+                    self.eazy_retry_count, wait_secs as u32
+                )
+            };
+            self.transfer_log.push(retry_msg.clone());
+            self.transfer_state = TransferState::Failed(retry_msg);
         } else {
             self.eazy_retry_count = 0;
             self.eazy_next_retry_time = None;
