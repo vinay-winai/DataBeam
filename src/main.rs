@@ -98,8 +98,14 @@ struct UserSettings {
     sendme_one_shot: bool,
     #[serde(default)]
     eazysendme_custom_code: String,
+    #[serde(default = "default_true")]
+    eazysendme_auto_retry: bool,
     #[serde(default)]
     croc_custom_code: String,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_sendme_one_shot() -> bool {
@@ -120,7 +126,6 @@ struct DataBeamApp {
     send_items: Vec<SendItem>,
     croc_custom_code: String,
     croc_use_custom_code: bool,
-    croc_consecutive_failures: u8,
     croc_recent_codes: Vec<String>,
     croc_text_mode: bool,
     croc_text_value: String,
@@ -149,6 +154,9 @@ struct DataBeamApp {
     preparing_progress: f32,
     transfer_payload_start_time: Option<f64>,
     transfer_end_time: Option<f64>,
+    eazysendme_auto_retry: bool,
+    eazy_retry_count: u8,
+    eazy_next_retry_time: Option<f64>,
     croc_qr_popup_open: bool,
     croc_text_popup_open: bool,
 
@@ -212,7 +220,6 @@ impl Default for DataBeamApp {
             send_items: Vec::new(),
             croc_custom_code: String::new(),
             croc_use_custom_code: false,
-            croc_consecutive_failures: 0,
             croc_recent_codes: Vec::new(),
             croc_text_mode: false,
             croc_text_value: String::new(),
@@ -237,6 +244,9 @@ impl Default for DataBeamApp {
             preparing_progress: 0.0,
             transfer_payload_start_time: None,
             transfer_end_time: None,
+            eazysendme_auto_retry: true,
+            eazy_retry_count: 0,
+            eazy_next_retry_time: None,
             croc_qr_popup_open: false,
             croc_text_popup_open: false,
             toast_msg: None,
@@ -389,6 +399,7 @@ impl DataBeamApp {
             .filter(|p| !p.as_os_str().is_empty());
         self.sendme_one_shot = settings.sendme_one_shot;
         self.eazysendme_custom_code = settings.eazysendme_custom_code;
+        self.eazysendme_auto_retry = settings.eazysendme_auto_retry;
         self.croc_custom_code = settings.croc_custom_code;
     }
 
@@ -409,6 +420,7 @@ impl DataBeamApp {
                 .map(|p| p.to_string_lossy().to_string()),
             sendme_one_shot: self.sendme_one_shot,
             eazysendme_custom_code: self.eazysendme_custom_code.clone(),
+            eazysendme_auto_retry: self.eazysendme_auto_retry,
             croc_custom_code: self.croc_custom_code.clone(),
         };
         if let Ok(json) = serde_json::to_string_pretty(&settings) {
@@ -673,24 +685,50 @@ impl DataBeamApp {
         if let Some(handle) = &self.transfer_handle {
             handle.request_cancel();
         }
+        self.eazy_retry_count = 0;
+        self.eazy_next_retry_time = None;
         self.transfer_end_time = Some(self.animation_time);
         self.transfer_state = TransferState::Failed("Transfer cancelled".to_string());
     }
 
-    fn retry_send(&mut self) {
-        if let Some(handle) = &self.transfer_handle {
-            handle.request_cancel();
+    fn fail_transfer(&mut self, e: String) {
+        if self.selected_tool == SelectedTool::EazySendme
+            && self.eazysendme_auto_retry
+            && self.eazy_retry_count < 3
+            && e != "Transfer cancelled"
+        {
+            self.eazy_retry_count += 1;
+            let wait_secs = 16.0;
+            self.eazy_next_retry_time = Some(self.animation_time + wait_secs);
+            let retry_msg = format!(
+                "Transfer failed. Auto-retrying {}/3 in {}s...",
+                self.eazy_retry_count, wait_secs
+            );
+            self.transfer_log.push(retry_msg);
+            self.transfer_state =
+                TransferState::Failed(format!("{} (Auto-retrying in {}s...)", e, wait_secs));
+        } else {
+            self.eazy_retry_count = 0;
+            self.eazy_next_retry_time = None;
+            self.transfer_state = TransferState::Failed(e);
         }
-        self.reset_transfer();
-        self.start_send();
+        self.transfer_end_time = Some(self.animation_time);
     }
 
-    fn retry_receive(&mut self) {
+    fn retry_send(&mut self, is_auto: bool) {
         if let Some(handle) = &self.transfer_handle {
             handle.request_cancel();
         }
         self.reset_transfer();
-        self.start_receive();
+        self.start_send(is_auto);
+    }
+
+    fn retry_receive(&mut self, is_auto: bool) {
+        if let Some(handle) = &self.transfer_handle {
+            handle.request_cancel();
+        }
+        self.reset_transfer();
+        self.start_receive(is_auto);
     }
 
     fn update_transfer_metrics_from_log(&mut self, line: &str) {
@@ -1385,7 +1423,7 @@ impl DataBeamApp {
                                     && self.view == AppView::Send
                                     && self.transfer_code.is_none()
                                 {
-                                    self.transfer_state = TransferState::Failed(
+                                    self.fail_transfer(
                                         "Croc send ended before starting. Check options and retry."
                                             .to_string(),
                                     );
@@ -1416,15 +1454,12 @@ impl DataBeamApp {
                                             self.transfer_start_time = Some(self.animation_time);
                                             return; // Exit poll_transfer, will resume next frame with new_rx
                                         } else {
-                                            self.transfer_state = TransferState::Failed(
+                                            self.fail_transfer(
                                                 "Croc finished but no ticket found".to_string(),
                                             );
                                         }
                                     } else {
                                         self.transfer_state = TransferState::Completed;
-                                        if self.selected_tool == SelectedTool::Croc && self.croc_use_custom_code {
-                                            self.croc_consecutive_failures = 0;
-                                        }
                                         self.transfer_progress = 1.0;
                                         self.preparing_progress = 1.0;
                                         if let Some(total) = self.transfer_total_bytes {
@@ -1437,8 +1472,7 @@ impl DataBeamApp {
                                 if self.transfer_state == TransferState::Completed {
                                     continue;
                                 }
-                                self.transfer_log
-                                    .push("Peer disconnected".to_string());
+                                self.transfer_log.push("Peer disconnected".to_string());
                                 if (self.selected_tool == SelectedTool::Sendme
                                     || self.selected_tool == SelectedTool::EazySendme)
                                     && self.sendme_one_shot
@@ -1449,17 +1483,16 @@ impl DataBeamApp {
                                     let complete = self.sendme_sender_payload_complete
                                         || (total > 0 && done >= total);
                                     if !has_payload {
-                                        self.transfer_state = TransferState::Failed(
+                                        self.fail_transfer(
                                             "Peer disconnected before transfer started".to_string(),
                                         );
-                                        self.transfer_end_time = Some(self.animation_time);
                                     } else if complete {
                                         self.mark_sendme_one_shot_completed();
                                     } else {
-                                        self.transfer_state = TransferState::Failed(
-                                            "Transfer was not completed (peer disconnected early)".to_string(),
+                                        self.fail_transfer(
+                                            "Transfer was not completed (peer disconnected early)"
+                                                .to_string(),
                                         );
-                                        self.transfer_end_time = Some(self.animation_time);
                                     }
                                 } else {
                                     // Keep running, maybe show a toast
@@ -1509,9 +1542,7 @@ impl DataBeamApp {
                                 } else if e == "Transfer cancelled" {
                                     // Keep explicit completion from caller paths; otherwise stay idle-ish failed.
                                     if self.transfer_state != TransferState::Completed {
-                                        self.transfer_state =
-                                            TransferState::Failed("Transfer cancelled".to_string());
-                                        self.transfer_end_time = Some(self.animation_time);
+                                        self.fail_transfer("Transfer cancelled".to_string());
                                     }
                                 } else if e == "Send session ended before transfer completed"
                                     && (self.selected_tool == SelectedTool::Sendme
@@ -1526,17 +1557,16 @@ impl DataBeamApp {
                                     let complete = self.sendme_sender_payload_complete
                                         || (total > 0 && done >= total);
                                     if !has_payload {
-                                        self.transfer_state = TransferState::Failed(
+                                        self.fail_transfer(
                                             "Send session ended before payload started".to_string(),
                                         );
-                                        self.transfer_end_time = Some(self.animation_time);
                                     } else if complete {
                                         self.mark_sendme_one_shot_completed();
                                     } else {
-                                        self.transfer_state = TransferState::Failed(
-                                            "Transfer was not completed (session ended early)".to_string(),
+                                        self.fail_transfer(
+                                            "Transfer was not completed (session ended early)"
+                                                .to_string(),
                                         );
-                                        self.transfer_end_time = Some(self.animation_time);
                                     }
                                 } else if e == "Send session ended before transfer completed"
                                     && (self.selected_tool == SelectedTool::Sendme
@@ -1556,20 +1586,7 @@ impl DataBeamApp {
                                     restart_sendme_serve = true;
                                     break;
                                 } else {
-                                    if self.selected_tool == SelectedTool::Croc && self.croc_use_custom_code {
-                                        self.croc_consecutive_failures += 1;
-                                        if self.croc_consecutive_failures >= 2 {
-                                            self.croc_custom_code.clear();
-                                            self.croc_consecutive_failures = 0;
-                                            self.persist_user_settings();
-                                            self.show_toast(
-                                                "Custom code cleared due to consecutive failures".to_string(),
-                                                WARNING,
-                                            );
-                                        }
-                                    }
-                                    self.transfer_state = TransferState::Failed(e);
-                                    self.transfer_end_time = Some(self.animation_time);
+                                    self.fail_transfer(e);
                                 }
                             }
                             TransferMsg::Started => {
@@ -1605,7 +1622,7 @@ impl DataBeamApp {
                 }
             }
             if restart_sendme_serve {
-                self.start_send();
+                self.start_send(true);
             } else {
                 // Put it back
                 self.transfer_rx = Some(rx);
@@ -1752,7 +1769,11 @@ impl DataBeamApp {
         self.toast_msg = Some((msg, 0.0, color));
     }
 
-    fn start_send(&mut self) {
+    fn start_send(&mut self, is_auto: bool) {
+        if !is_auto {
+            self.eazy_retry_count = 0;
+            self.eazy_next_retry_time = None;
+        }
         let croc_text_mode = self.selected_tool == SelectedTool::Croc && self.croc_text_mode;
         if croc_text_mode && !self.send_items.is_empty() {
             self.show_toast(
@@ -1808,7 +1829,7 @@ impl DataBeamApp {
                         return;
                     }
                     self.transfer_code = Some(code.clone());
-                    
+
                     let clean = code.trim().to_string();
                     self.croc_recent_codes.retain(|c| c != &clean);
                     self.croc_recent_codes.insert(0, clean);
@@ -1879,7 +1900,11 @@ impl DataBeamApp {
         self.transfer_total_bytes = known_total;
     }
 
-    fn start_receive(&mut self) {
+    fn start_receive(&mut self, is_auto: bool) {
+        if !is_auto {
+            self.eazy_retry_count = 0;
+            self.eazy_next_retry_time = None;
+        }
         if self.receive_code.trim().is_empty() {
             self.show_toast("Enter a code or ticket".to_string(), WARNING);
             return;
@@ -2133,7 +2158,22 @@ impl eframe::App for DataBeamApp {
         self.poll_size_updates();
         self.poll_transfer();
 
-        if self.transfer_state == TransferState::Running {
+        if let TransferState::Failed(_) = self.transfer_state {
+            if let Some(retry_time) = self.eazy_next_retry_time {
+                if self.animation_time >= retry_time {
+                    self.eazy_next_retry_time = None;
+                    if self.view == AppView::Send {
+                        self.retry_send(true);
+                    } else {
+                        self.retry_receive(true);
+                    }
+                } else {
+                    ctx.request_repaint(); // ensure it repaints for timer updates
+                }
+            }
+        }
+
+        if self.transfer_state == TransferState::Running || self.eazy_next_retry_time.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
@@ -2200,16 +2240,20 @@ impl eframe::App for DataBeamApp {
                                 self.reset_transfer();
                             }
                         }
-                        
+
                         ui.add_space(8.0);
                         if ui
                             .selectable_label(
                                 false,
-                                RichText::new("❓ Troubleshoot").size(12.0).color(TEXT_SECONDARY),
+                                RichText::new("❓ Troubleshoot")
+                                    .size(12.0)
+                                    .color(TEXT_SECONDARY),
                             )
                             .clicked()
                         {
-                            let _ = open::that("https://github.com/vinay-winai/DataBeam/blob/main/trubleshoot.md");
+                            let _ = open::that(
+                                "https://github.com/vinay-winai/DataBeam/blob/main/trubleshoot.md",
+                            );
                         }
                     });
 
@@ -2217,9 +2261,7 @@ impl eframe::App for DataBeamApp {
                         let (tc, tn) = match self.selected_tool {
                             SelectedTool::Croc => (CROC_COLOR, "🐊 croc"),
                             SelectedTool::Sendme => (SENDME_COLOR, "📡 sendme"),
-                            SelectedTool::EazySendme => {
-                                (EAZYSENDME_COLOR, "⚡ eazysendme")
-                            }
+                            SelectedTool::EazySendme => (EAZYSENDME_COLOR, "⚡ eazysendme"),
                         };
                         status_badge(ui, tn, tc);
                     });
@@ -2398,7 +2440,11 @@ impl DataBeamApp {
 
         // ── Standalone engines collapsible ──────────────────────────
         {
-            let arrow = if self.native_engines_expanded { "▾" } else { "▸" };
+            let arrow = if self.native_engines_expanded {
+                "▾"
+            } else {
+                "▸"
+            };
             let header_resp = ui.add(
                 egui::Button::new(
                     RichText::new(format!("{} Standalone Engines", arrow))
@@ -2477,13 +2523,19 @@ impl DataBeamApp {
             let sendme_avail = sendme_status.as_ref().map(|s| s.available).unwrap_or(false);
             let broadcast_btn = ui.add_enabled(
                 sendme_avail,
-                egui::Button::new(
-                    RichText::new("📡 Broadcast")
-                        .size(12.0)
-                        .color(if sendme_avail { Color32::BLACK } else { TEXT_MUTED }),
-                )
+                egui::Button::new(RichText::new("📡 Broadcast").size(12.0).color(
+                    if sendme_avail {
+                        Color32::BLACK
+                    } else {
+                        TEXT_MUTED
+                    },
+                ))
                 .min_size(Vec2::new(btn_w, 42.0))
-                .fill(if sendme_avail { SENDME_COLOR } else { Color32::from_rgb(50, 50, 55) })
+                .fill(if sendme_avail {
+                    SENDME_COLOR
+                } else {
+                    Color32::from_rgb(50, 50, 55)
+                })
                 .corner_radius(egui::epaint::CornerRadius::same(8u8)),
             );
             if broadcast_btn.clicked() && sendme_avail {
@@ -2495,17 +2547,24 @@ impl DataBeamApp {
             }
 
             let croc_avail = croc_status.as_ref().map(|s| s.available).unwrap_or(false);
-            let send_text_btn = ui.add_enabled(
-                croc_avail,
-                egui::Button::new(
-                    RichText::new("🐊 Send Text")
-                        .size(12.0)
-                        .color(if croc_avail { Color32::BLACK } else { TEXT_MUTED }),
-                )
-                .min_size(Vec2::new(btn_w, 42.0))
-                .fill(if croc_avail { CROC_COLOR } else { Color32::from_rgb(50, 50, 55) })
-                .corner_radius(egui::epaint::CornerRadius::same(8u8)),
-            );
+            let send_text_btn =
+                ui.add_enabled(
+                    croc_avail,
+                    egui::Button::new(RichText::new("🐊 Send Text").size(12.0).color(
+                        if croc_avail {
+                            Color32::BLACK
+                        } else {
+                            TEXT_MUTED
+                        },
+                    ))
+                    .min_size(Vec2::new(btn_w, 42.0))
+                    .fill(if croc_avail {
+                        CROC_COLOR
+                    } else {
+                        Color32::from_rgb(50, 50, 55)
+                    })
+                    .corner_radius(egui::epaint::CornerRadius::same(8u8)),
+                );
             if send_text_btn.clicked() && croc_avail {
                 if self.selected_tool != SelectedTool::Croc {
                     self.switch_tool(SelectedTool::Croc);
@@ -2563,13 +2622,16 @@ impl DataBeamApp {
                             if ui.small_button("Clear").clicked() {
                                 self.croc_text_value.clear();
                             }
-                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                ui.label(
-                                    RichText::new("Text to send")
-                                        .color(TEXT_SECONDARY)
-                                        .size(11.0),
-                                );
-                            });
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new("Text to send")
+                                            .color(TEXT_SECONDARY)
+                                            .size(11.0),
+                                    );
+                                },
+                            );
                         });
                     });
                     ui.add(
@@ -2925,6 +2987,19 @@ impl DataBeamApp {
                     );
                 }
             });
+        } else if self.selected_tool == SelectedTool::EazySendme {
+            ui.add_space(4.0);
+            ui.add_enabled_ui(!send_locked, |ui| {
+                if ui
+                    .checkbox(
+                        &mut self.eazysendme_auto_retry,
+                        RichText::new("Auto-retry on failure").size(12.0),
+                    )
+                    .changed()
+                {
+                    self.persist_user_settings();
+                }
+            });
         }
 
         ui.add_space(8.0);
@@ -2986,7 +3061,7 @@ impl DataBeamApp {
 
                 ui.add_enabled_ui(enabled, |ui| {
                     if accent_button(ui, &label, color).clicked() {
-                        self.start_send();
+                        self.start_send(false);
                     }
                 });
                 if !enabled && self.selected_tool == SelectedTool::EazySendme {
@@ -3017,7 +3092,7 @@ impl DataBeamApp {
                     let accent = self.engine_color();
                     if accent_button_sized(ui, "🔄 Retry", accent, Vec2::new(100.0, 32.0)).clicked()
                     {
-                        self.retry_send();
+                        self.retry_send(false);
                     }
                     if accent_button_sized(
                         ui,
@@ -3205,6 +3280,25 @@ impl DataBeamApp {
             });
         }
 
+        if self.selected_tool == SelectedTool::EazySendme {
+            ui.add_space(4.0);
+            let receive_locked = !matches!(
+                self.transfer_state,
+                TransferState::Idle | TransferState::Failed(_) | TransferState::Completed
+            );
+            ui.add_enabled_ui(!receive_locked, |ui| {
+                if ui
+                    .checkbox(
+                        &mut self.eazysendme_auto_retry,
+                        RichText::new("Auto-retry on failure").size(12.0),
+                    )
+                    .changed()
+                {
+                    self.persist_user_settings();
+                }
+            });
+        }
+
         ui.add_space(8.0);
 
         match &self.transfer_state {
@@ -3212,12 +3306,10 @@ impl DataBeamApp {
                 let (color, label) = match self.selected_tool {
                     SelectedTool::Croc => (CROC_COLOR, "🐊 Receive"),
                     SelectedTool::Sendme => (SENDME_COLOR, "📡 Receive"),
-                    SelectedTool::EazySendme => {
-                        (EAZYSENDME_COLOR, "⚡ Receive")
-                    }
+                    SelectedTool::EazySendme => (EAZYSENDME_COLOR, "⚡ Receive"),
                 };
                 if accent_button(ui, label, color).clicked() {
-                    self.start_receive();
+                    self.start_receive(false);
                 }
             }
             TransferState::Running => {
@@ -3270,7 +3362,7 @@ impl DataBeamApp {
                     )
                     .clicked()
                     {
-                        self.retry_receive();
+                        self.retry_receive(false);
                     }
                     if accent_button_sized(
                         ui,
@@ -3601,8 +3693,8 @@ impl DataBeamApp {
 
             // Code/ticket — for Croc sender, only show once past the Preparing phase
             let show_code = self.transfer_code.is_some() && {
-                let croc_sender = self.selected_tool == SelectedTool::Croc
-                    && self.view == AppView::Send;
+                let croc_sender =
+                    self.selected_tool == SelectedTool::Croc && self.view == AppView::Send;
                 if croc_sender {
                     self.transfer_phase != TransferPhase::Preparing
                 } else {
@@ -3615,15 +3707,14 @@ impl DataBeamApp {
                     let (label, color) = match self.selected_tool {
                         SelectedTool::Croc => ("Share this code:", CROC_COLOR),
                         SelectedTool::Sendme => ("Share this ticket:", SENDME_COLOR),
-                        SelectedTool::EazySendme => {
-                            ("EazySendme ticket:", EAZYSENDME_COLOR)
-                        }
+                        SelectedTool::EazySendme => ("EazySendme ticket:", EAZYSENDME_COLOR),
                     };
                     if code_display(ui, label, code, color) {
                         self.show_toast("Code copied".to_string(), SUCCESS);
                     }
                     ui.add_space(4.0);
-                    if accent_button_sized(ui, "🔳 Show QR", color, Vec2::new(100.0, 24.0)).clicked()
+                    if accent_button_sized(ui, "🔳 Show QR", color, Vec2::new(100.0, 24.0))
+                        .clicked()
                     {
                         wants_show_qr = true;
                     }
@@ -4367,7 +4458,10 @@ fn dir_size_capped(path: &std::path::Path, depth: u32, max_depth: u32) -> u64 {
 
 // ── Entry Point ────────────────────────────────────────────────────
 
-#[cfg(all(feature = "release-single-instance", any(target_os = "windows", target_os = "linux")))]
+#[cfg(all(
+    feature = "release-single-instance",
+    any(target_os = "windows", target_os = "linux")
+))]
 fn enforce_single_instance_release() -> Option<single_instance::SingleInstance> {
     match single_instance::SingleInstance::new("com.vinaywinai.databeam.release") {
         Ok(instance) => {
@@ -4385,7 +4479,10 @@ fn enforce_single_instance_release() -> Option<single_instance::SingleInstance> 
 }
 
 fn main() -> eframe::Result {
-    #[cfg(all(feature = "release-single-instance", any(target_os = "windows", target_os = "linux")))]
+    #[cfg(all(
+        feature = "release-single-instance",
+        any(target_os = "windows", target_os = "linux")
+    ))]
     let _single_instance_guard = enforce_single_instance_release();
 
     let options = eframe::NativeOptions {
@@ -4975,6 +5072,3 @@ mod parse_tests {
         assert_eq!(app.transfer_state, TransferState::Completed);
     }
 }
-
-
-

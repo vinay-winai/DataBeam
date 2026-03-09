@@ -311,8 +311,7 @@ pub fn code_display(ui: &mut egui::Ui, label: &str, code: &str, color: Color32) 
             ui.horizontal(|ui| {
                 ui.label(RichText::new(label).size(11.0).color(TEXT_SECONDARY));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if accent_button_sized(ui, btn_text, color, Vec2::new(76.0, 24.0)).clicked()
-                    {
+                    if accent_button_sized(ui, btn_text, color, Vec2::new(76.0, 24.0)).clicked() {
                         let current_time = ui.input(|i| i.time);
                         ui.ctx().copy_text(code.to_string());
                         ui.data_mut(|d| d.insert_temp(id, current_time));

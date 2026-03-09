@@ -715,7 +715,9 @@ impl NativeSendmeEventEmitter for NativeSendmeEmitter {
             "receive-export-progress" => {
                 let mut parts = payload.split(':');
                 if let (Some(d_str), Some(t_str)) = (parts.next(), parts.next()) {
-                    if let (Ok(done), Ok(total)) = (d_str.trim().parse::<u64>(), t_str.trim().parse::<u64>()) {
+                    if let (Ok(done), Ok(total)) =
+                        (d_str.trim().parse::<u64>(), t_str.trim().parse::<u64>())
+                    {
                         NativeSendmeEvent::ReceiveExportProgress { done, total }
                     } else {
                         return Ok(());
@@ -1658,7 +1660,9 @@ pub fn sendme_receive(
                     let _ = tx.send(TransferMsg::Progress(1.0));
                 }
                 Ok(NativeSendmeEvent::ReceiveExportStarted) => {
-                    let _ = tx.send(TransferMsg::Output("[4/4] Writing files to disk...".to_string()));
+                    let _ = tx.send(TransferMsg::Output(
+                        "[4/4] Writing files to disk...".to_string(),
+                    ));
                 }
                 Ok(NativeSendmeEvent::ReceiveExportProgress { done, total }) => {
                     let _ = tx.send(TransferMsg::Output(format!(
