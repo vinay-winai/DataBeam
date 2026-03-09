@@ -102,6 +102,10 @@ struct UserSettings {
     eazysendme_auto_retry: bool,
     #[serde(default)]
     croc_custom_code: String,
+    /// Maps croc code → last known sendme ticket for that session.
+    /// Persisted so local-blob retry works even after app restart or reset_transfer.
+    #[serde(default)]
+    eazysendme_code_ticket_map: HashMap<String, String>,
 }
 
 fn default_true() -> bool {
@@ -194,6 +198,8 @@ struct DataBeamApp {
     last_done_speed_sample: Option<(f64, u64)>,
     initialized_once: bool,
     native_engines_expanded: bool,
+    /// Persisted map of croc_code → sendme_ticket for local-blob retry.
+    eazysendme_code_ticket_map: HashMap<String, String>,
 }
 
 impl Drop for DataBeamApp {
@@ -278,6 +284,7 @@ impl Default for DataBeamApp {
             eazysendme_croc_rx: None,
             croc_receive_recent_codes: Vec::new(),
             native_engines_expanded: false,
+            eazysendme_code_ticket_map: HashMap::new(),
         }
     }
 }
@@ -401,6 +408,12 @@ impl DataBeamApp {
         self.eazysendme_custom_code = settings.eazysendme_custom_code;
         self.eazysendme_auto_retry = settings.eazysendme_auto_retry;
         self.croc_custom_code = settings.croc_custom_code;
+        // Limit map size to 20 entries (keep newest)
+        let mut map = settings.eazysendme_code_ticket_map;
+        if map.len() > 20 {
+            map = map.into_iter().take(20).collect();
+        }
+        self.eazysendme_code_ticket_map = map;
     }
 
     fn persist_user_settings(&self) {
@@ -422,6 +435,7 @@ impl DataBeamApp {
             eazysendme_custom_code: self.eazysendme_custom_code.clone(),
             eazysendme_auto_retry: self.eazysendme_auto_retry,
             croc_custom_code: self.croc_custom_code.clone(),
+            eazysendme_code_ticket_map: self.eazysendme_code_ticket_map.clone(),
         };
         if let Ok(json) = serde_json::to_string_pretty(&settings) {
             let _ = fs::write(path, json);
@@ -709,10 +723,17 @@ impl DataBeamApp {
             return;
         }
 
+        // "File already exists" should never auto-retry — it will fail identically every time.
+        let is_file_exists_error = e.contains("already exists")
+            || e.to_lowercase().contains("file exists")
+            || e.to_lowercase().contains("os error 17") // EEXIST on Unix
+            || e.to_lowercase().contains("os error 183"); // ERROR_ALREADY_EXISTS on Windows
+
         if self.selected_tool == SelectedTool::EazySendme
             && self.eazysendme_auto_retry
             && self.eazy_retry_count < 3
             && e != "Transfer cancelled"
+            && !is_file_exists_error
         {
             self.eazy_retry_count += 1;
 
@@ -762,7 +783,32 @@ impl DataBeamApp {
         if let Some(handle) = &self.transfer_handle {
             handle.request_cancel();
         }
+        // Preserve the ticket for the local-blob check BEFORE reset_transfer clears it.
+        // reset_transfer sets eazysendme_ticket = None, so we rescue it here.
+        let saved_ticket = self.eazysendme_ticket.clone();
+        // Also record the current code→ticket association so it survives across restarts.
+        if self.selected_tool == SelectedTool::EazySendme
+            && self.view == AppView::Receive
+            && is_auto
+        {
+            if let Some(ticket) = &saved_ticket {
+                let code_key = self.receive_code.trim().to_string();
+                if !code_key.is_empty() {
+                    self.eazysendme_code_ticket_map.insert(code_key, ticket.clone());
+                    self.persist_user_settings();
+                }
+            }
+        }
         self.reset_transfer();
+        // Restore ticket so start_receive(is_auto=true) can attempt local-blob export.
+        if is_auto {
+            self.eazysendme_ticket = saved_ticket
+                // If not in memory (e.g. after app restart), look it up from the persisted map.
+                .or_else(|| {
+                    let code_key = self.receive_code.trim().to_string();
+                    self.eazysendme_code_ticket_map.get(&code_key).cloned()
+                });
+        }
         self.start_receive(is_auto);
     }
 
@@ -1478,6 +1524,14 @@ impl DataBeamApp {
                                                 normalize_sendme_ticket(&ticket).unwrap_or(ticket);
                                             self.eazysendme_ticket =
                                                 Some(normalized_ticket.clone()); // Start native sendme_receive
+                                            // Record code→ticket mapping so local-blob retry
+                                            // works even after reset_transfer clears the ticket.
+                                            let code_key = self.receive_code.trim().to_string();
+                                            if !code_key.is_empty() {
+                                                self.eazysendme_code_ticket_map
+                                                    .insert(code_key, normalized_ticket.clone());
+                                                self.persist_user_settings();
+                                            }
                                             let opts = SendmeReceiveOptions {
                                                 ticket: normalized_ticket,
                                                 output_dir: self.receive_output_dir.clone(),
