@@ -59,7 +59,6 @@ enum PickerRequest {
     SendFolder,
     SendFiles,
     ReceiveFolder,
-    ReceiveBlobFolder,
 }
 
 #[derive(Debug)]
@@ -67,7 +66,6 @@ enum PickerResult {
     SendFolder(Option<PathBuf>),
     SendFiles(Option<Vec<PathBuf>>),
     ReceiveFolder(Option<PathBuf>),
-    ReceiveBlobFolder(Option<PathBuf>),
 }
 
 /// A file/folder entry with its cached size
@@ -84,6 +82,13 @@ impl SendItem {
         let size = cached_path_size(&path);
         Self { path, size, is_dir }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EazyCacheEntry {
+    pub ticket: String,
+    pub payload_size: u64,
+    pub recv_size: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,12 +111,10 @@ struct UserSettings {
     croc_custom_code: String,
     #[serde(default)]
     croc_use_custom_code: bool,
-    /// Maps croc code → last known sendme ticket for that session.
+    /// Maps croc code → cache entry containing Sendme ticket and sizes for that session.
     /// Persisted so local-blob retry works even after app restart or reset_transfer.
     #[serde(default)]
-    eazysendme_code_ticket_map: HashMap<String, String>,
-    #[serde(default)]
-    eazysendme_blob_dir: Option<String>,
+    eazysendme_code_ticket_map: HashMap<String, EazyCacheEntry>,
 }
 
 fn default_true() -> bool {
@@ -176,7 +179,6 @@ struct DataBeamApp {
     eazysendme_ticket: Option<String>,
     eazysendme_croc_handle: Option<ProcessHandle>,
     eazysendme_croc_rx: Option<mpsc::Receiver<TransferMsg>>,
-    eazysendme_blob_dir: Option<PathBuf>,
 
     // Croc receive
     croc_receive_recent_codes: Vec<String>,
@@ -206,7 +208,12 @@ struct DataBeamApp {
     initialized_once: bool,
     native_engines_expanded: bool,
     /// Persisted map of croc_code → sendme_ticket for local-blob retry.
-    eazysendme_code_ticket_map: HashMap<String, String>,
+    eazysendme_code_ticket_map: HashMap<String, EazyCacheEntry>,
+
+    cleanup_scan_rx: Option<mpsc::Receiver<(Vec<PathBuf>, u64)>>,
+    cleanup_targets: Vec<PathBuf>,
+    cleanup_bytes: u64,
+    cleanup_prompt_open: bool,
 }
 
 impl Drop for DataBeamApp {
@@ -238,7 +245,6 @@ impl Default for DataBeamApp {
             croc_text_value: String::new(),
             receive_code: String::new(),
             receive_output_dir: None,
-            eazysendme_blob_dir: None,
             transfer_state: TransferState::Idle,
             transfer_progress: 0.0,
             transfer_code: None,
@@ -293,6 +299,10 @@ impl Default for DataBeamApp {
             croc_receive_recent_codes: Vec::new(),
             native_engines_expanded: false,
             eazysendme_code_ticket_map: HashMap::new(),
+            cleanup_scan_rx: None,
+            cleanup_targets: Vec::new(),
+            cleanup_bytes: 0,
+            cleanup_prompt_open: false,
         }
     }
 }
@@ -414,7 +424,7 @@ impl DataBeamApp {
             .filter(|p| !p.as_os_str().is_empty());
         self.sendme_one_shot = settings.sendme_one_shot;
         self.eazysendme_custom_code = settings.eazysendme_custom_code;
-        self.eazysendme_auto_retry = settings.eazysendme_auto_retry;
+        self.eazysendme_auto_retry = true; // Always true on launch
         self.croc_custom_code = settings.croc_custom_code;
         self.croc_use_custom_code = settings.croc_use_custom_code;
         // Limit map size to 20 entries (keep newest)
@@ -423,11 +433,6 @@ impl DataBeamApp {
             map = map.into_iter().take(20).collect();
         }
         self.eazysendme_code_ticket_map = map;
-        self.eazysendme_blob_dir = settings
-            .eazysendme_blob_dir
-            .as_ref()
-            .map(PathBuf::from)
-            .filter(|p| !p.as_os_str().is_empty());
     }
 
     fn persist_user_settings(&self) {
@@ -451,10 +456,6 @@ impl DataBeamApp {
             croc_custom_code: self.croc_custom_code.clone(),
             croc_use_custom_code: self.croc_use_custom_code,
             eazysendme_code_ticket_map: self.eazysendme_code_ticket_map.clone(),
-            eazysendme_blob_dir: self
-                .eazysendme_blob_dir
-                .as_ref()
-                .map(|p| p.to_string_lossy().to_string()),
         };
         if let Ok(json) = serde_json::to_string_pretty(&settings) {
             let _ = fs::write(path, json);
@@ -533,9 +534,6 @@ impl DataBeamApp {
                 PickerRequest::ReceiveFolder => {
                     PickerResult::ReceiveFolder(rfd::FileDialog::new().pick_folder())
                 }
-                PickerRequest::ReceiveBlobFolder => {
-                    PickerResult::ReceiveBlobFolder(rfd::FileDialog::new().pick_folder())
-                }
             };
             let _ = tx.send(result);
         });
@@ -562,14 +560,9 @@ impl DataBeamApp {
                         self.receive_output_dir = Some(path);
                         self.persist_user_settings();
                     }
-                    PickerResult::ReceiveBlobFolder(Some(path)) => {
-                        self.eazysendme_blob_dir = Some(path);
-                        self.persist_user_settings();
-                    }
                     PickerResult::SendFolder(None)
                     | PickerResult::SendFiles(None)
-                    | PickerResult::ReceiveFolder(None)
-                    | PickerResult::ReceiveBlobFolder(None) => {}
+                    | PickerResult::ReceiveFolder(None) => {}
                 }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -728,6 +721,29 @@ impl DataBeamApp {
         // exist and check_and_export_local will return Ok(false), falling through to Croc.
     }
 
+    fn update_eazy_cache_sizes(&mut self) {
+        if self.selected_tool == SelectedTool::EazySendme && self.view == AppView::Receive {
+            let code_key = self.receive_code.trim().to_string();
+            let mut sizes_changed = false;
+            let t_bytes = self.transfer_total_bytes.unwrap_or(0);
+            let d_bytes = self.transfer_done_bytes.unwrap_or(0);
+            
+            if let Some(entry) = self.eazysendme_code_ticket_map.get_mut(&code_key) {
+                if t_bytes > 0 && entry.payload_size != t_bytes {
+                    entry.payload_size = t_bytes;
+                    sizes_changed = true;
+                }
+                if entry.recv_size != d_bytes {
+                    entry.recv_size = d_bytes;
+                    sizes_changed = true;
+                }
+            }
+            if sizes_changed {
+                self.persist_user_settings();
+            }
+        }
+    }
+
     fn cancel_transfer(&mut self) {
         if let Some(handle) = &self.transfer_handle {
             handle.request_cancel();
@@ -736,6 +752,7 @@ impl DataBeamApp {
         self.eazy_next_retry_time = None;
         self.transfer_end_time = Some(self.animation_time);
         self.transfer_state = TransferState::Failed("Transfer cancelled".to_string());
+        self.update_eazy_cache_sizes();
     }
 
     fn fail_transfer(&mut self, e: String) {
@@ -800,6 +817,7 @@ impl DataBeamApp {
             self.transfer_state = TransferState::Failed(e);
         }
         self.transfer_end_time = Some(self.animation_time);
+        self.update_eazy_cache_sizes();
     }
 
     fn retry_send(&mut self, is_auto: bool) {
@@ -821,18 +839,16 @@ impl DataBeamApp {
             && self.view == AppView::Receive
         {
             let code_key = self.receive_code.trim().to_string();
-            if is_auto {
-                // Persist the in-memory ticket to the map so start_receive can find it.
-                if let Some(ticket) = &self.eazysendme_ticket {
-                    if !code_key.is_empty() {
-                        self.eazysendme_code_ticket_map.insert(code_key, ticket.clone());
-                        self.persist_user_settings();
-                    }
+            // Persist the in-memory ticket to the map so start_receive can find it.
+            if let Some(ticket) = &self.eazysendme_ticket {
+                if !code_key.is_empty() {
+                    self.eazysendme_code_ticket_map.insert(code_key, EazyCacheEntry {
+                        ticket: ticket.clone(),
+                        payload_size: 0, // This gets updated by update_eazy_cache_sizes
+                        recv_size: 0,
+                    });
+                    self.persist_user_settings();
                 }
-            } else {
-                // Manual retry: clear cached ticket — always do a fresh Croc handshake.
-                self.eazysendme_code_ticket_map.remove(&code_key);
-                self.persist_user_settings();
             }
         }
         self.reset_transfer();
@@ -1163,6 +1179,8 @@ impl DataBeamApp {
         if sendme_like && self.view == AppView::Send && self.transfer_done_bytes.unwrap_or(0) > 0 {
             self.sendme_had_transfer = true;
         }
+        
+        self.update_eazy_cache_sizes();
     }
 
     fn update_croc_received_text_from_log(&mut self, line: &str) -> bool {
@@ -1556,13 +1574,16 @@ impl DataBeamApp {
                                             let code_key = self.receive_code.trim().to_string();
                                             if !code_key.is_empty() {
                                                 self.eazysendme_code_ticket_map
-                                                    .insert(code_key, normalized_ticket.clone());
+                                                    .insert(code_key, EazyCacheEntry {
+                                                        ticket: normalized_ticket.clone(),
+                                                        payload_size: 0,
+                                                        recv_size: 0,
+                                                    });
                                                 self.persist_user_settings();
                                             }
                                             let opts = SendmeReceiveOptions {
                                                 ticket: normalized_ticket,
                                                 output_dir: self.receive_output_dir.clone(),
-                                                blob_dir: self.eazysendme_blob_dir.clone(),
                                             };
                                             let (new_rx, new_handle) = sendme_receive(opts, "");
                                             self.transfer_rx = Some(new_rx);
@@ -1584,6 +1605,7 @@ impl DataBeamApp {
                                         if let Some(total) = self.transfer_total_bytes {
                                             self.transfer_done_bytes = Some(total);
                                         }
+                                        self.update_eazy_cache_sizes();
                                         // NOTE: do NOT evict map entry on success — the blob dir
                                         // is cleaned up by iroh after export. If map entry lingers,
                                         // check_and_export_local will safely return Ok(false) on
@@ -2037,15 +2059,14 @@ impl DataBeamApp {
         // reset_transfer() sets eazysendme_ticket = None, so we read both the in-memory
         // value and the persisted map here, before the reset happens.
         // Done for BOTH auto and manual start — local cache is always preferred over Croc.
-        let eazy_cached_ticket: Option<String> =
+        let eazy_cached_entry: Option<EazyCacheEntry> =
             if self.selected_tool == SelectedTool::EazySendme {
-                self.eazysendme_ticket.clone().or_else(|| {
-                    let code_key = self.receive_code.trim().to_string();
-                    self.eazysendme_code_ticket_map.get(&code_key).cloned()
-                })
+                let code_key = self.receive_code.trim().to_string();
+                self.eazysendme_code_ticket_map.get(&code_key).cloned()
             } else {
                 None
             };
+        let eazy_cached_ticket = self.eazysendme_ticket.clone().or_else(|| eazy_cached_entry.as_ref().map(|e| e.ticket.clone()));
 
         self.reset_transfer();
 
@@ -2091,56 +2112,66 @@ impl DataBeamApp {
                 let opts = SendmeReceiveOptions {
                     ticket: self.receive_code.trim().to_string(),
                     output_dir: self.receive_output_dir.clone(),
-                    blob_dir: self.eazysendme_blob_dir.clone(),
                 };
                 let (rx, handle) = sendme_receive(opts, &binary);
                 self.transfer_rx = Some(rx);
                 self.transfer_handle = Some(handle);
             }
             SelectedTool::EazySendme => {
+                // Verify if the underlying downloaded chunks actually exist on disk right now.
+                let mut can_resume_locally = false;
+                if let Some(entry) = &eazy_cached_entry {
+                    if crate::backend::sendme_has_local_blob(&entry.ticket) {
+                        can_resume_locally = true;
+                    }
+                }
+
                 // Always try local blob cache first — avoids wasting a Croc session.
                 // eazy_cached_ticket was captured BEFORE reset_transfer() cleared it.
-                if !is_auto {
+                if !is_auto && can_resume_locally {
+                    if let Some(entry) = &eazy_cached_entry {
+                        if entry.payload_size > 0 && entry.recv_size == entry.payload_size {
+                            self.transfer_log
+                                .push("[Local] Cached ticket found and sizes match — checking local blob export"
+                                    .to_string());
+                            let opts = SendmeReceiveOptions {
+                                ticket: entry.ticket.clone(),
+                                output_dir: self.receive_output_dir.clone(),
+                            };
+                            let (rx, handle) = sendme_check_local(opts);
+                            self.transfer_rx = Some(rx);
+                            self.transfer_handle = Some(handle);
+                            self.transfer_state = TransferState::Running;
+                            self.transfer_start_time = Some(self.animation_time);
+                            return;
+                        }
+                    }
+                }
+                
+                // If we already have the ticket cached (partial download) AND the blobs actually exist on disk, 
+                // the sender is likely still running `sendme serve`. Skip Croc entirely and resume directly.
+                if can_resume_locally {
                     if let Some(ticket) = eazy_cached_ticket {
-                        self.transfer_log
-                            .push("[Local] Cached ticket found — trying local blob export before Croc"
-                                .to_string());
+                        self.transfer_phase = TransferPhase::Transferring;
+                        self.transfer_log.push("[Local] Resuming EazySendme from cached ticket...".to_string());
                         let opts = SendmeReceiveOptions {
                             ticket,
                             output_dir: self.receive_output_dir.clone(),
-                            blob_dir: self.eazysendme_blob_dir.clone(),
                         };
-                        let (rx, handle) = sendme_check_local(opts, self.eazysendme_blob_dir.clone());
+                        let (rx, handle) = sendme_receive(opts, &binary);
                         self.transfer_rx = Some(rx);
                         self.transfer_handle = Some(handle);
-                        // poll_transfer will fall through to a full Croc retry if it
-                        // receives a "blobs-incomplete" error.
-                        self.transfer_state = TransferState::Running;
-                        self.transfer_start_time = Some(self.animation_time);
-                        return;
                     }
-                    // No map entry but blobs may still be on disk (map evicted or app crashed
-                    // before map could be written). Scan disk for any complete blob.
-                    if local_ticket_exists_on_disk(self.eazysendme_blob_dir.as_deref()) {
-                        self.transfer_log
-                            .push("[Local] No cached ticket — scanning disk for blobs..."
-                                .to_string());
-                        let (rx, handle) = sendme_scan_and_export_local(self.receive_output_dir.clone(), self.eazysendme_blob_dir.clone());
-                        self.transfer_rx = Some(rx);
-                        self.transfer_handle = Some(handle);
-                        self.transfer_state = TransferState::Running;
-                        self.transfer_start_time = Some(self.animation_time);
-                        return;
-                    }
+                } else {
+                    // Step 1: Start croc_receive to get the ticket
+                    let opts = CrocReceiveOptions {
+                        code: self.receive_code.trim().to_string(),
+                        output_dir: None, // Ticket is text, no dir needed
+                    };
+                    let (rx, handle) = croc_receive(opts, &binary);
+                    self.transfer_rx = Some(rx);
+                    self.transfer_handle = Some(handle);
                 }
-                // Step 1: Start croc_receive to get the ticket
-                let opts = CrocReceiveOptions {
-                    code: self.receive_code.trim().to_string(),
-                    output_dir: None, // Ticket is text, no dir needed
-                };
-                let (rx, handle) = croc_receive(opts, &binary);
-                self.transfer_rx = Some(rx);
-                self.transfer_handle = Some(handle);
             }
         }
 
@@ -2240,6 +2271,58 @@ impl DataBeamApp {
         if self.croc_text_popup_open {
             self.render_croc_text_popup(ctx);
         }
+        if self.cleanup_prompt_open {
+            self.render_cleanup_popup(ctx);
+        }
+    }
+
+    fn render_cleanup_popup(&mut self, ctx: &egui::Context) {
+        let mut open = self.cleanup_prompt_open;
+        if !open {
+            return;
+        }
+        let mut close_modal = false;
+        
+        egui::Window::new("Incomplete Downloads Detected")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label("DataBeam found incomplete temporary EazySendme downloads.");
+                ui.add_space(4.0);
+                ui.label(RichText::new(format!(
+                    "Found {} folder(s) using {}.",
+                    self.cleanup_targets.len(),
+                    backend::format_size_unit(self.cleanup_bytes)
+                )).strong());
+                
+                ui.add_space(8.0);
+                ui.label(RichText::new("Would you like to delete these incomplete temporary files to reclaim disk space?").color(TEXT_MUTED));
+                
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if accent_button_sized(ui, "Delete Files", Color32::from_rgb(200, 60, 60), Vec2::new(120.0, 32.0)).clicked() {
+                        let targets = self.cleanup_targets.clone();
+                        std::thread::spawn(move || {
+                            for path in targets {
+                                let _ = std::fs::remove_dir_all(&path);
+                            }
+                        });
+                        self.show_toast("Deleted incomplete downloads".to_string(), SUCCESS);
+                        close_modal = true;
+                    }
+                    if ui.add_sized([80.0, 32.0], egui::Button::new("Keep Files")).clicked() {
+                        close_modal = true;
+                    }
+                });
+            });
+            
+        if !open || close_modal {
+            self.cleanup_prompt_open = false;
+            self.cleanup_targets.clear();
+            self.cleanup_bytes = 0;
+        }
     }
 
     fn render_croc_qr_popup(&mut self, ctx: &egui::Context) {
@@ -2318,6 +2401,82 @@ impl eframe::App for DataBeamApp {
                 format!("Running DataBeam v{} (Fixed Build)", APP_VERSION),
                 SUCCESS,
             );
+
+            // Background check for orphaned/incomplete temp downloads
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.cleanup_scan_rx = Some(rx);
+            let map = self.eazysendme_code_ticket_map.clone();
+            std::thread::spawn(move || {
+                let mut targets = Vec::new();
+                let mut total_bytes = 0;
+                let temp_dir = std::env::temp_dir();
+                
+                fn dir_size(path: &std::path::Path) -> u64 {
+                    let mut total = 0;
+                    if let Ok(entries) = std::fs::read_dir(path) {
+                        for entry in entries.flatten() {
+                            if let Ok(meta) = entry.metadata() {
+                                if meta.is_dir() {
+                                    total += dir_size(&entry.path());
+                                } else {
+                                    total += meta.len();
+                                }
+                            }
+                        }
+                    }
+                    total
+                }
+                
+                if let Ok(entries) = std::fs::read_dir(&temp_dir) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if name.starts_with(".sendme-recv-") {
+                            let path = entry.path();
+                            if !path.is_dir() { continue; }
+                            
+                            let ticket_path = path.join("ticket.txt");
+                            let mut is_incomplete = true;
+                            
+                            if let Ok(ticket_str) = std::fs::read_to_string(&ticket_path) {
+                                let ticket_str = ticket_str.trim();
+                                for cache in map.values() {
+                                    if cache.ticket == ticket_str {
+                                        if cache.payload_size > 0 && cache.recv_size >= cache.payload_size {
+                                            is_incomplete = false; // complete cache entry
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            // Empty temp dirs with size 0 aren't worth bothering the user about
+                            let size = dir_size(&path);
+                            if is_incomplete && size > 1024 * 1024 {
+                                targets.push(path);
+                                total_bytes += size;
+                            }
+                        }
+                    }
+                }
+                
+                if !targets.is_empty() {
+                    let _ = tx.send((targets, total_bytes));
+                }
+            });
+        }
+
+        if let Some(rx) = &self.cleanup_scan_rx {
+            match rx.try_recv() {
+                Ok((targets, total_bytes)) => {
+                    self.cleanup_targets = targets;
+                    self.cleanup_bytes = total_bytes;
+                    self.cleanup_prompt_open = true;
+                    self.cleanup_scan_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.cleanup_scan_rx = None;
+                }
+                _ => {}
+            }
         }
 
         if let Some((_, ref mut start, _)) = self.toast_msg {
@@ -3352,7 +3511,7 @@ impl DataBeamApp {
                 let has_cached = !code_key.is_empty()
                     && (self.eazysendme_ticket.is_some()
                         || self.eazysendme_code_ticket_map.contains_key(&code_key))
-                    || local_ticket_exists_on_disk(self.eazysendme_blob_dir.as_deref());
+                    || local_ticket_exists_on_disk();
 
                 let (icon, msg, color) = if has_cached {
                     (
@@ -3430,58 +3589,6 @@ impl DataBeamApp {
                 });
             });
         });
-
-        if self.selected_tool == SelectedTool::EazySendme {
-            ui.add_space(6.0);
-            card_frame(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Local Cache")
-                            .color(TEXT_PRIMARY)
-                            .strong()
-                            .size(13.0),
-                    );
-                    let dir_text = self
-                        .eazysendme_blob_dir
-                        .as_ref()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "Temporary Directory".into());
-                    ui.label(
-                        RichText::new(truncate_middle(&dir_text, 40))
-                            .color(TEXT_MUTED)
-                            .size(11.0),
-                    );
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if let Some(dir) = self.eazysendme_blob_dir.clone().or_else(|| Some(std::env::temp_dir())) {
-                            if accent_button_sized(ui, "↗", self.engine_color(), Vec2::new(24.0, 22.0))
-                                .clicked()
-                            {
-                                let _ = open::that(&dir);
-                            }
-                        }
-                        if accent_button_sized(ui, "📂", self.engine_color(), Vec2::new(32.0, 22.0))
-                            .clicked()
-                        {
-                            self.launch_picker(PickerRequest::ReceiveBlobFolder);
-                        }
-                        if self.eazysendme_blob_dir.is_some()
-                            && accent_button_sized(
-                                ui,
-                                "✕",
-                                Color32::from_rgb(130, 85, 85),
-                                Vec2::new(24.0, 22.0),
-                            )
-                            .clicked()
-                        {
-                            self.eazysendme_blob_dir = None;
-                            self.persist_user_settings();
-                        }
-                    });
-                });
-            });
-        }
-
         if self.selected_tool == SelectedTool::Croc {
             let text = self
                 .croc_received_text
@@ -3710,7 +3817,7 @@ impl DataBeamApp {
                             ui.add_space(3.0);
                             ui.label(RichText::new(raw).monospace().size(10.0).color(TEXT_MUTED));
                         }
-                        let pct_text = format!("{:.1}%", effective_progress * 100.0);
+                        let pct_text = format!("{:>5.1}%", effective_progress * 100.0);
                         ui.horizontal_wrapped(|ui| match self.transfer_phase {
                             TransferPhase::Preparing
                             | TransferPhase::EazySharingTicket
@@ -3728,11 +3835,12 @@ impl DataBeamApp {
                                 if total > 0 {
                                     ui.label(
                                         RichText::new(format!(
-                                            "Total: {}",
+                                            "Total: {:>9}",
                                             format_file_size(total)
                                         ))
                                         .size(10.0)
-                                        .color(TEXT_MUTED),
+                                        .color(TEXT_MUTED)
+                                        .monospace(),
                                     );
                                 }
                             }
@@ -3745,11 +3853,12 @@ impl DataBeamApp {
                                 if total > 0 {
                                     ui.label(
                                         RichText::new(format!(
-                                            "Total: {}",
+                                            "Total: {:>9}",
                                             format_file_size(total)
                                         ))
                                         .size(10.0)
-                                        .color(TEXT_MUTED),
+                                        .color(TEXT_MUTED)
+                                        .monospace(),
                                     );
                                 }
                             }
@@ -3762,7 +3871,8 @@ impl DataBeamApp {
                                 ui.label(
                                     RichText::new(progress_label)
                                         .size(10.0)
-                                        .color(TEXT_SECONDARY),
+                                        .color(TEXT_SECONDARY)
+                                        .monospace(),
                                 );
                                 if total > 0 {
                                     let data_label = if self.view == AppView::Send {
@@ -3772,13 +3882,14 @@ impl DataBeamApp {
                                     };
                                     ui.label(
                                         RichText::new(format!(
-                                            "{}: {}/{}",
+                                            "{}: {:>9} / {:>9}",
                                             data_label,
                                             format_file_size(done),
                                             format_file_size(total)
                                         ))
                                         .size(10.0)
-                                        .color(TEXT_MUTED),
+                                        .color(TEXT_MUTED)
+                                        .monospace(),
                                     );
                                 }
                                 if let Some(speed) = self.transfer_speed_bps {
@@ -3789,12 +3900,13 @@ impl DataBeamApp {
                                     };
                                     ui.label(
                                         RichText::new(format!(
-                                            "{}: {}/s",
+                                            "{}: {:>9}/s",
                                             speed_label,
                                             format_file_size(speed as u64)
                                         ))
                                         .size(10.0)
-                                        .color(TEXT_MUTED),
+                                        .color(TEXT_MUTED)
+                                        .monospace(),
                                     );
                                 }
                                 if self.selected_tool == SelectedTool::Croc {
@@ -3889,13 +4001,14 @@ impl DataBeamApp {
                             };
                             ui.label(
                                 RichText::new(format!(
-                                    "{}: {}/{}",
+                                    "{}: {:>9} / {:>9}",
                                     data_label,
                                     format_file_size(done),
                                     format_file_size(total)
                                 ))
                                 .size(10.0)
-                                .color(TEXT_MUTED),
+                                .color(TEXT_MUTED)
+                                .monospace(),
                             );
                             let progress_label = if self.view == AppView::Send {
                                 "Upload progress (sender)"
@@ -3904,7 +4017,7 @@ impl DataBeamApp {
                             };
                             ui.label(
                                 RichText::new(format!(
-                                    "{}: {:.1}%",
+                                    "{}: {:>5.1}%",
                                     progress_label,
                                     if total > 0 {
                                         (done as f64 / total as f64 * 100.0).clamp(0.0, 100.0)
@@ -3913,7 +4026,8 @@ impl DataBeamApp {
                                     }
                                 ))
                                 .size(10.0)
-                                .color(TEXT_SECONDARY),
+                                .color(TEXT_SECONDARY)
+                                .monospace(),
                             );
                         }
                         if let Some(speed) = self.transfer_speed_bps {
@@ -3924,12 +4038,13 @@ impl DataBeamApp {
                             };
                             ui.label(
                                 RichText::new(format!(
-                                    "{}: {}/s",
+                                    "{}: {:>9}/s",
                                     speed_label,
                                     format_file_size(speed as u64)
                                 ))
                                 .size(10.0)
-                                .color(TEXT_MUTED),
+                                .color(TEXT_MUTED)
+                                .monospace(),
                             );
                         }
                     });

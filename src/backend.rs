@@ -19,6 +19,7 @@ use sendme_native::{
     download as native_sendme_download,
     has_any_local_ticket_on_disk as native_has_any_local_ticket_on_disk,
     scan_for_local_ticket as native_scan_for_local_ticket,
+    local_ticket_exists_on_disk as native_local_ticket_exists_on_disk,
     start_share as native_sendme_start_share,
     AddrInfoOptions as NativeAddrInfoOptions, AppHandle as NativeSendmeAppHandle,
     EventEmitter as NativeSendmeEventEmitter, ReceiveOptions as NativeReceiveOptions,
@@ -589,7 +590,6 @@ pub struct SendmeSendOptions {
 pub struct SendmeReceiveOptions {
     pub ticket: String,
     pub output_dir: Option<PathBuf>,
-    pub blob_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -760,7 +760,7 @@ struct SenderRequestRenderState {
     started_at: Instant,
 }
 
-fn format_size_unit(bytes: u64) -> String {
+pub fn format_size_unit(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = 1024.0 * 1024.0;
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -1625,7 +1625,7 @@ pub fn sendme_receive(
                 relay_mode: NativeRelayModeOption::Default,
                 magic_ipv4_addr: None,
                 magic_ipv6_addr: None,
-                blob_dir: opts.blob_dir.clone(),
+                blob_dir: None,
             },
             app_handle,
         ));
@@ -1730,7 +1730,6 @@ pub fn sendme_receive(
 /// Callers should fall back to a full `sendme_receive` if they get `blobs-incomplete`.
 pub fn sendme_check_local(
     opts: SendmeReceiveOptions,
-    blob_dir: Option<std::path::PathBuf>,
 ) -> (mpsc::Receiver<TransferMsg>, ProcessHandle) {
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -1758,13 +1757,15 @@ pub fn sendme_check_local(
 
         let ticket = opts.ticket.clone();
         let output_dir = opts.output_dir.clone();
+        let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<()>();
         let task = runtime.spawn(async move {
-            native_check_and_export_local_in(&ticket, output_dir, app_handle, blob_dir).await
+            native_check_and_export_local_in(&ticket, output_dir, app_handle, None, Some(abort_rx)).await
         });
 
         // Forward events to the transfer channel while task runs
         loop {
             if cancel2.load(Ordering::Relaxed) {
+                let _ = abort_tx.send(());
                 task.abort();
                 let _ = tx.send(TransferMsg::Error("Transfer cancelled".to_string()));
                 return;
@@ -1827,15 +1828,22 @@ pub fn sendme_check_local(
 
 /// Cheap synchronous check: are there any blob dirs on disk that have a `ticket.txt`?
 /// Used only for the UI badge — does not spin up a Tokio runtime.
-pub fn local_ticket_exists_on_disk(blob_dir: Option<&std::path::Path>) -> bool {
-    native_has_any_local_ticket_on_disk(blob_dir)
+pub fn scan_for_local_ticket(extra_blob_dir: Option<&Path>) -> Vec<String> {
+    native_scan_for_local_ticket(extra_blob_dir)
+}
+
+pub fn sendme_has_local_blob(ticket_str: &str) -> bool {
+    native_local_ticket_exists_on_disk(ticket_str)
+}
+
+pub fn local_ticket_exists_on_disk() -> bool {
+    native_has_any_local_ticket_on_disk(None)
 }
 
 /// Scans disk for the first complete blob whose `ticket.txt` passes integrity checks,
 /// then exports it directly. Sends `Completed` on success or `blobs-incomplete` if nothing found.
 pub fn sendme_scan_and_export_local(
     output_dir: Option<std::path::PathBuf>,
-    blob_dir: Option<std::path::PathBuf>,
 ) -> (mpsc::Receiver<TransferMsg>, ProcessHandle) {
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -1859,19 +1867,35 @@ pub fn sendme_scan_and_export_local(
         let app_handle: NativeSendmeAppHandle =
             Some(Arc::new(NativeSendmeEmitter::new(evt_tx)));
 
+        let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<()>();
+        // Using Arc/Mutex just to allow the sync loop to share ownership if we had to send it over multiple iterations, 
+        // but inside this worker thread we only need to pass one channel if there's only one successful match.
+        // Actually since we loop through tickets and await each one, we can just instantiate the abort token
+        // inside the loop, or better yet, since the UI cancel cancels the whole background thread, 
+        // we can share an Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>> to abort the active one.
+        let active_abort_tx: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>> = Arc::new(std::sync::Mutex::new(None));
+        let active_abort_tx_clone = active_abort_tx.clone();
+
         let task = runtime.spawn(async move {
             // Find ALL valid ticket.txt on disk (O(1) operation).
-            let tickets = native_scan_for_local_ticket(blob_dir.as_deref());
+            let tickets = native_scan_for_local_ticket(None);
             if tickets.is_empty() {
                 return Ok::<bool, Box<dyn std::error::Error + Send + Sync>>(false);
             }
             // Export the first one that is complete.
             for ticket in tickets {
+                let (tx_inner, rx_inner) = tokio::sync::oneshot::channel::<()>();
+                {
+                    let mut lock = active_abort_tx_clone.lock().unwrap();
+                    *lock = Some(tx_inner);
+                }
+                
                 let success = native_check_and_export_local_in(
                     &ticket,
                     output_dir.clone(),
                     app_handle.clone(),
-                    blob_dir.clone(),
+                    None,
+                    Some(rx_inner)
                 )
                 .await.unwrap_or(false);
                 
@@ -1885,6 +1909,12 @@ pub fn sendme_scan_and_export_local(
         // Forward events while waiting — use recv_timeout to avoid CPU spin.
         loop {
             if cancel2.load(Ordering::Relaxed) {
+                // Send abort signal if active export is running
+                if let Ok(mut lock) = active_abort_tx.lock() {
+                    if let Some(tx) = lock.take() {
+                        let _ = tx.send(());
+                    }
+                }
                 task.abort();
                 let _ = tx.send(TransferMsg::Error("Transfer cancelled".to_string()));
                 return;

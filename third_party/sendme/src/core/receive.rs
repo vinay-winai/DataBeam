@@ -433,7 +433,7 @@ pub async fn check_and_export_local(
     output_dir: Option<PathBuf>,
     app_handle: AppHandle,
 ) -> anyhow::Result<bool> {
-    check_and_export_local_in(ticket_str, output_dir, app_handle, None).await
+    check_and_export_local_in(ticket_str, output_dir, app_handle, None, None).await
 }
 
 /// Same as `check_and_export_local` but also checks `extra_blob_dir` if the default
@@ -443,6 +443,7 @@ pub async fn check_and_export_local_in(
     output_dir: Option<PathBuf>,
     app_handle: AppHandle,
     blob_dir: Option<PathBuf>,
+    cancel_token: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> anyhow::Result<bool> {
     let ticket = match BlobTicket::from_str(ticket_str) {
         Ok(t) => t,
@@ -515,7 +516,22 @@ pub async fn check_and_export_local_in(
 
     emit_event(&app_handle, "receive-started");
     emit_event(&app_handle, "receive-export-started");
-    export(&db, collection, &output_dir, &app_handle).await?;
+    let export_fut = export(&db, collection, &output_dir, &app_handle);
+
+    if let Some(mut cancel_rx) = cancel_token {
+        tokio::select! {
+            res = export_fut => {
+                res?;
+            }
+            _ = &mut cancel_rx => {
+                tracing::warn!("Local export cancelled by token");
+                anyhow::bail!("Operation cancelled");
+            }
+        }
+    } else {
+        export_fut.await?;
+    }
+
     emit_event(&app_handle, "receive-completed");
 
     Ok(true)
@@ -566,6 +582,15 @@ pub fn scan_for_local_ticket(extra_blob_dir: Option<&std::path::Path>) -> Vec<St
 /// Used only for the UI badge. Also checks `extra_blob_dir` if provided.
 pub fn has_any_local_ticket_on_disk(extra_blob_dir: Option<&std::path::Path>) -> bool {
     !scan_for_local_ticket(extra_blob_dir).is_empty()
+}
+
+/// Checks if a specific ticket exists as a local blob directory in temp_dir.
+pub fn local_ticket_exists_on_disk(ticket_str: &str) -> bool {
+    let Ok(ticket) = BlobTicket::from_str(ticket_str) else {
+        return false;
+    };
+    let expected_dir = format!(".sendme-recv-{}", ticket.hash().to_hex());
+    std::env::temp_dir().join(expected_dir).exists()
 }
 
 #[cfg(test)]
