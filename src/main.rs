@@ -792,38 +792,28 @@ impl DataBeamApp {
         if let Some(handle) = &self.transfer_handle {
             handle.request_cancel();
         }
-        // Preserve the ticket for the local-blob check BEFORE reset_transfer clears it.
-        // reset_transfer sets eazysendme_ticket = None, so we rescue it here.
-        let saved_ticket = self.eazysendme_ticket.clone();
-        // Also record the current code→ticket association so it survives across restarts.
+        // Persist code→ticket association (for the is_auto path) or clear it (manual retry).
+        // NOTE: start_receive reads the ticket directly from the map now, so no need to
+        // restore eazysendme_ticket here — start_receive captures it before reset_transfer.
         if self.selected_tool == SelectedTool::EazySendme
             && self.view == AppView::Receive
-            && is_auto
         {
-            if let Some(ticket) = &saved_ticket {
-                let code_key = self.receive_code.trim().to_string();
-                if !code_key.is_empty() {
-                    self.eazysendme_code_ticket_map.insert(code_key, ticket.clone());
-                    self.persist_user_settings();
-                }
-            }
-        } else {
-            // Manual retry: clear the cached ticket so we always go through Croc fresh
-            // and pick up whatever ticket the sender currently has (possibly a new payload).
             let code_key = self.receive_code.trim().to_string();
-            self.eazysendme_code_ticket_map.remove(&code_key);
-            self.persist_user_settings();
+            if is_auto {
+                // Persist the in-memory ticket to the map so start_receive can find it.
+                if let Some(ticket) = &self.eazysendme_ticket {
+                    if !code_key.is_empty() {
+                        self.eazysendme_code_ticket_map.insert(code_key, ticket.clone());
+                        self.persist_user_settings();
+                    }
+                }
+            } else {
+                // Manual retry: clear cached ticket — always do a fresh Croc handshake.
+                self.eazysendme_code_ticket_map.remove(&code_key);
+                self.persist_user_settings();
+            }
         }
         self.reset_transfer();
-        // Restore ticket so start_receive(is_auto=true) can attempt local-blob export.
-        if is_auto {
-            self.eazysendme_ticket = saved_ticket
-                // If not in memory (e.g. after app restart), look it up from the persisted map.
-                .or_else(|| {
-                    let code_key = self.receive_code.trim().to_string();
-                    self.eazysendme_code_ticket_map.get(&code_key).cloned()
-                });
-        }
         self.start_receive(is_auto);
     }
 
@@ -2030,6 +2020,19 @@ impl DataBeamApp {
             return;
         }
 
+        // IMPORTANT: capture the EazySendme ticket BEFORE reset_transfer() wipes it.
+        // reset_transfer() sets eazysendme_ticket = None, so we read both the in-memory
+        // value and the persisted map here, before the reset happens.
+        let eazy_auto_ticket: Option<String> =
+            if is_auto && self.selected_tool == SelectedTool::EazySendme {
+                self.eazysendme_ticket.clone().or_else(|| {
+                    let code_key = self.receive_code.trim().to_string();
+                    self.eazysendme_code_ticket_map.get(&code_key).cloned()
+                })
+            } else {
+                None
+            };
+
         self.reset_transfer();
 
         // Persist receive code into recent history for Croc / EazySendme
@@ -2080,23 +2083,25 @@ impl DataBeamApp {
                 self.transfer_handle = Some(handle);
             }
             SelectedTool::EazySendme => {
-                // If we already have a ticket from a previous successful download,
-                // try exporting directly from local blobs before burning a Croc session.
-                if is_auto {
-                    if let Some(ticket) = self.eazysendme_ticket.clone() {
-                        let opts = SendmeReceiveOptions {
-                            ticket,
-                            output_dir: self.receive_output_dir.clone(),
-                        };
-                        let (rx, handle) = sendme_check_local(opts);
-                        self.transfer_rx = Some(rx);
-                        self.transfer_handle = Some(handle);
-                        // poll_transfer will fall through to a full Croc retry if it
-                        // receives a "blobs-incomplete" error
-                        self.transfer_state = TransferState::Running;
-                        self.transfer_start_time = Some(self.animation_time);
-                        return;
-                    }
+                // If we already have a ticket from a previous session, try exporting
+                // directly from local blobs before burning a Croc session.
+                // eazy_auto_ticket was captured BEFORE reset_transfer() above.
+                if let Some(ticket) = eazy_auto_ticket {
+                    self.transfer_log
+                        .push("[Local] Cached ticket found — trying local blob export before Croc"
+                            .to_string());
+                    let opts = SendmeReceiveOptions {
+                        ticket,
+                        output_dir: self.receive_output_dir.clone(),
+                    };
+                    let (rx, handle) = sendme_check_local(opts);
+                    self.transfer_rx = Some(rx);
+                    self.transfer_handle = Some(handle);
+                    // poll_transfer will fall through to a full Croc retry if it
+                    // receives a "blobs-incomplete" error.
+                    self.transfer_state = TransferState::Running;
+                    self.transfer_start_time = Some(self.animation_time);
+                    return;
                 }
                 // Step 1: Start croc_receive to get the ticket
                 let opts = CrocReceiveOptions {
@@ -3311,11 +3316,36 @@ impl DataBeamApp {
             }
 
             ui.add_space(3.0);
-            ui.label(
-                RichText::new("Interrupted downloads can be resumed by running Receive again.")
-                    .color(TEXT_MUTED)
-                    .size(10.0),
-            );
+            if self.selected_tool == SelectedTool::EazySendme {
+                let code_key = self.receive_code.trim().to_string();
+                let has_cached = !code_key.is_empty()
+                    && (self.eazysendme_ticket.is_some()
+                        || self.eazysendme_code_ticket_map.contains_key(&code_key));
+
+                let (icon, msg, color) = if has_cached {
+                    (
+                        "🟢",
+                        "Local blobs cached — retry will export without sender",
+                        Color32::from_rgb(100, 200, 120),
+                    )
+                } else {
+                    (
+                        "○",
+                        "No local cache for this code",
+                        TEXT_MUTED,
+                    )
+                };
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(icon).size(9.0));
+                    ui.label(RichText::new(msg).color(color).size(10.0));
+                });
+            } else {
+                ui.label(
+                    RichText::new("Interrupted downloads can be resumed by running Receive again.")
+                        .color(TEXT_MUTED)
+                        .size(10.0),
+                );
+            }
         });
 
         ui.add_space(6.0);
