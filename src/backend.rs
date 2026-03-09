@@ -1865,36 +1865,36 @@ pub fn sendme_scan_and_export_local(
             Ok(native_check_and_export_local(&ticket, output_dir, app_handle).await?)
         });
 
-        // Forward events while waiting
+        // Forward events while waiting — use recv_timeout to avoid CPU spin.
         loop {
-            if cancel2.load(std::sync::atomic::Ordering::Relaxed) {
-                break;
+            if cancel2.load(Ordering::Relaxed) {
+                task.abort();
+                let _ = tx.send(TransferMsg::Error("Transfer cancelled".to_string()));
+                return;
             }
-            while let Ok(evt) = evt_rx.try_recv() {
-                match evt {
-                    NativeSendmeEvent::ReceiveStarted => {
-                        let _ = tx.send(TransferMsg::Output("[Local] Exporting from local cache...".to_string()));
-                    }
-                    NativeSendmeEvent::ReceiveExportStarted => {
-                        let _ = tx.send(TransferMsg::Output("[Local] Writing files to disk...".to_string()));
-                    }
-                    NativeSendmeEvent::ReceiveProgress { done, total, .. } => {
-                        let _ = tx.send(TransferMsg::Output(format!(
-                            "[Local] {}/{}",
-                            format_size_unit(done),
-                            format_size_unit(total.max(done).max(1))
-                        )));
-                        if total > 0 {
-                            let _ = tx.send(TransferMsg::Progress(
-                                (done as f32 / total as f32).clamp(0.0, 1.0),
-                            ));
-                        }
-                    }
-                    NativeSendmeEvent::ReceiveCompleted => {
-                        let _ = tx.send(TransferMsg::Progress(1.0));
-                    }
-                    _ => {}
+            match evt_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(NativeSendmeEvent::ReceiveStarted) => {
+                    let _ = tx.send(TransferMsg::Output("[Local] Exporting from local cache...".to_string()));
                 }
+                Ok(NativeSendmeEvent::ReceiveExportStarted) => {
+                    let _ = tx.send(TransferMsg::Output("[Local] Writing files to disk...".to_string()));
+                }
+                Ok(NativeSendmeEvent::ReceiveExportProgress { done, total }) => {
+                    let _ = tx.send(TransferMsg::Output(format!(
+                        "[Local] Writing... {} / {}",
+                        format_size_unit(done),
+                        format_size_unit(total.max(done).max(1))
+                    )));
+                    if total > 0 {
+                        let _ = tx.send(TransferMsg::Progress(
+                            (done as f32 / total as f32).clamp(0.0, 1.0),
+                        ));
+                    }
+                }
+                Ok(NativeSendmeEvent::ReceiveCompleted) => {
+                    let _ = tx.send(TransferMsg::Progress(1.0));
+                }
+                _ => {}
             }
             if task.is_finished() {
                 break;

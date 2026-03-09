@@ -2008,8 +2008,9 @@ impl DataBeamApp {
         // IMPORTANT: capture the EazySendme ticket BEFORE reset_transfer() wipes it.
         // reset_transfer() sets eazysendme_ticket = None, so we read both the in-memory
         // value and the persisted map here, before the reset happens.
-        let eazy_auto_ticket: Option<String> =
-            if is_auto && self.selected_tool == SelectedTool::EazySendme {
+        // Done for BOTH auto and manual start — local cache is always preferred over Croc.
+        let eazy_cached_ticket: Option<String> =
+            if self.selected_tool == SelectedTool::EazySendme {
                 self.eazysendme_ticket.clone().or_else(|| {
                     let code_key = self.receive_code.trim().to_string();
                     self.eazysendme_code_ticket_map.get(&code_key).cloned()
@@ -2068,10 +2069,9 @@ impl DataBeamApp {
                 self.transfer_handle = Some(handle);
             }
             SelectedTool::EazySendme => {
-                // If we already have a ticket from a previous session, try exporting
-                // directly from local blobs before burning a Croc session.
-                // eazy_auto_ticket was captured BEFORE reset_transfer() above.
-                if let Some(ticket) = eazy_auto_ticket {
+                // Always try local blob cache first — avoids wasting a Croc session.
+                // eazy_cached_ticket was captured BEFORE reset_transfer() cleared it.
+                if let Some(ticket) = eazy_cached_ticket {
                     self.transfer_log
                         .push("[Local] Cached ticket found — trying local blob export before Croc"
                             .to_string());
@@ -2088,9 +2088,9 @@ impl DataBeamApp {
                     self.transfer_start_time = Some(self.animation_time);
                     return;
                 }
-                // No map entry but blobs may still be on disk (e.g. map evicted on success
-                // or app crashed before map was written). Scan disk for any complete blob.
-                if is_auto && local_ticket_exists_on_disk() {
+                // No map entry but blobs may still be on disk (map evicted or app crashed
+                // before map could be written). Scan disk for any complete blob.
+                if local_ticket_exists_on_disk() {
                     self.transfer_log
                         .push("[Local] No cached ticket — scanning disk for blobs..."
                             .to_string());
