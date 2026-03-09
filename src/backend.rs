@@ -16,9 +16,10 @@ use flate2::read::GzDecoder;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use sendme_native::{
     check_and_export_local as native_check_and_export_local,
+    check_and_export_local_in as native_check_and_export_local_in,
     download as native_sendme_download,
     has_any_local_ticket_on_disk as native_has_any_local_ticket_on_disk,
-    scan_for_complete_local_ticket as native_scan_for_complete_local_ticket,
+    scan_for_local_ticket as native_scan_for_local_ticket,
     start_share as native_sendme_start_share,
     AddrInfoOptions as NativeAddrInfoOptions, AppHandle as NativeSendmeAppHandle,
     EventEmitter as NativeSendmeEventEmitter, ReceiveOptions as NativeReceiveOptions,
@@ -589,6 +590,7 @@ pub struct SendmeSendOptions {
 pub struct SendmeReceiveOptions {
     pub ticket: String,
     pub output_dir: Option<PathBuf>,
+    pub blob_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1624,6 +1626,7 @@ pub fn sendme_receive(
                 relay_mode: NativeRelayModeOption::Default,
                 magic_ipv4_addr: None,
                 magic_ipv6_addr: None,
+                blob_dir: opts.blob_dir.clone(),
             },
             app_handle,
         ));
@@ -1728,6 +1731,7 @@ pub fn sendme_receive(
 /// Callers should fall back to a full `sendme_receive` if they get `blobs-incomplete`.
 pub fn sendme_check_local(
     opts: SendmeReceiveOptions,
+    blob_dir: Option<std::path::PathBuf>,
 ) -> (mpsc::Receiver<TransferMsg>, ProcessHandle) {
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -1756,7 +1760,7 @@ pub fn sendme_check_local(
         let ticket = opts.ticket.clone();
         let output_dir = opts.output_dir.clone();
         let task = runtime.spawn(async move {
-            native_check_and_export_local(&ticket, output_dir, app_handle).await
+            native_check_and_export_local_in(&ticket, output_dir, app_handle, blob_dir).await
         });
 
         // Forward events to the transfer channel while task runs
@@ -1824,14 +1828,15 @@ pub fn sendme_check_local(
 
 /// Cheap synchronous check: are there any blob dirs on disk that have a `ticket.txt`?
 /// Used only for the UI badge — does not spin up a Tokio runtime.
-pub fn local_ticket_exists_on_disk() -> bool {
-    native_has_any_local_ticket_on_disk()
+pub fn local_ticket_exists_on_disk(blob_dir: Option<&std::path::Path>) -> bool {
+    native_has_any_local_ticket_on_disk(blob_dir)
 }
 
 /// Scans disk for the first complete blob whose `ticket.txt` passes integrity checks,
 /// then exports it directly. Sends `Completed` on success or `blobs-incomplete` if nothing found.
 pub fn sendme_scan_and_export_local(
     output_dir: Option<std::path::PathBuf>,
+    blob_dir: Option<std::path::PathBuf>,
 ) -> (mpsc::Receiver<TransferMsg>, ProcessHandle) {
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -1856,13 +1861,13 @@ pub fn sendme_scan_and_export_local(
             Some(Arc::new(NativeSendmeEmitter::new(evt_tx)));
 
         let task = runtime.spawn(async move {
-            // Find the first complete blob dir on disk.
-            let ticket_str = native_scan_for_complete_local_ticket().await;
+            // Find the first valid ticket.txt on disk (O(1) operation).
+            let ticket_str = native_scan_for_local_ticket(blob_dir.as_deref());
             let Some(ticket) = ticket_str else {
                 return Ok::<bool, Box<dyn std::error::Error + Send + Sync>>(false);
             };
-            // Export it.
-            Ok(native_check_and_export_local(&ticket, output_dir, app_handle).await?)
+            // Export it if it's complete.
+            Ok(native_check_and_export_local_in(&ticket, output_dir, app_handle, blob_dir).await?)
         });
 
         // Forward events while waiting — use recv_timeout to avoid CPU spin.

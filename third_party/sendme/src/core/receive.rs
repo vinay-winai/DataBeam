@@ -86,17 +86,20 @@ pub async fn download(
 
     let endpoint = builder.bind().await?;
 
-    // Use system temp directory with a STABLE name based on the ticket hash.
-    // This allows resuming interrupted transfers because the blob store will be reused!
+    // Stable blob store directory name based on ticket hash.
+    // Uses user-configured blob_dir if set, otherwise system temp dir.
     let dir_name = format!(".sendme-recv-{}", ticket.hash().to_hex());
-    let temp_base = std::env::temp_dir();
+    let blob_base = {
+        let base = options.blob_dir.clone().unwrap_or_else(std::env::temp_dir);
+        let _ = std::fs::create_dir_all(&base);
+        base
+    };
 
-    // Clean up old .sendme-recv-* directories from previous aborted transfers
-    // The current active transfer's directory is excluded, preserving its resume capability.
+    // Clean up OTHER .sendme-recv-* dirs, preserving the current one.
     let dir_name_clone = dir_name.clone();
-    let temp_base_clone = temp_base.clone();
+    let blob_base_clone = blob_base.clone();
     tokio::spawn(async move {
-        if let Ok(mut entries) = tokio::fs::read_dir(&temp_base_clone).await {
+        if let Ok(mut entries) = tokio::fs::read_dir(&blob_base_clone).await {
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let path = entry.path();
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
@@ -109,7 +112,7 @@ pub async fn download(
             }
         }
     });
-    let iroh_data_dir = temp_base.join(&dir_name);
+    let iroh_data_dir = blob_base.join(&dir_name);
     let db = FsStore::load(&iroh_data_dir).await?;
     // Persist the ticket string alongside the blob store so it can be recovered
     // after an app restart when the in-memory map has been cleared.
@@ -430,18 +433,39 @@ pub async fn check_and_export_local(
     output_dir: Option<PathBuf>,
     app_handle: AppHandle,
 ) -> anyhow::Result<bool> {
+    check_and_export_local_in(ticket_str, output_dir, app_handle, None).await
+}
+
+/// Same as `check_and_export_local` but also checks `extra_blob_dir` if the default
+/// temp-dir location doesn't have the blobs (e.g., user configured a custom blob dir).
+pub async fn check_and_export_local_in(
+    ticket_str: &str,
+    output_dir: Option<PathBuf>,
+    app_handle: AppHandle,
+    blob_dir: Option<PathBuf>,
+) -> anyhow::Result<bool> {
     let ticket = match BlobTicket::from_str(ticket_str) {
         Ok(t) => t,
         Err(_) => return Ok(false), // malformed ticket, need full receive
     };
 
     let dir_name = format!(".sendme-recv-{}", ticket.hash().to_hex());
-    let iroh_data_dir = std::env::temp_dir().join(&dir_name);
-
-    // If the blob store directory doesn't even exist, blobs are definitely not local
-    if !iroh_data_dir.exists() {
-        return Ok(false);
-    }
+    // Check both the user-specified blob dir and the default temp dir.
+    let candidates: Vec<PathBuf> = {
+        let mut v = Vec::new();
+        if let Some(ref bd) = blob_dir {
+            v.push(bd.join(&dir_name));
+        }
+        let temp_candidate = std::env::temp_dir().join(&dir_name);
+        if !v.contains(&temp_candidate) {
+            v.push(temp_candidate);
+        }
+        v
+    };
+    let iroh_data_dir = match candidates.into_iter().find(|p| p.exists()) {
+        Some(p) => p,
+        None => return Ok(false),
+    };
 
     let db = match FsStore::load(&iroh_data_dir).await {
         Ok(db) => db,
@@ -491,81 +515,54 @@ pub async fn check_and_export_local(
 
     emit_event(&app_handle, "receive-started");
     emit_event(&app_handle, "receive-export-started");
-    export(&db, collection, &output_dir, &app_handle).await?;
-    emit_event(&app_handle, "receive-completed");
+            emit_event(&app_handle, "receive-completed");
 
     Ok(true)
 }
-
-/// Scans the system temp directory for any `.sendme-recv-*` blob store directories that
-/// contain a `ticket.txt` file and have fully complete blobs. Returns the first such ticket
-/// string found, or `None` if nothing complete is available.
+/// Scans blob dirs for any `.sendme-recv-*` directory containing a valid `ticket.txt`.
+/// Returns the ticket string immediately — does NOT load FsStore or check completeness.
+/// `check_and_export_local` handles incompleteness (returns Ok(false)) so we avoid the
+/// expensive/potentially-blocking FsStore::load/remote() calls at scan time.
 ///
-/// This is used as a fallback when the in-memory/persisted croc_code→ticket map has no
-/// entry (e.g. after app restart, or after the entry was evicted), but blobs are still on disk.
-pub async fn scan_for_complete_local_ticket() -> Option<String> {
+/// Searches `extra_blob_dir` first (user-configured location), then system temp dir.
+pub fn scan_for_local_ticket(extra_blob_dir: Option<&std::path::Path>) -> Option<String> {
+    let mut search_dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(d) = extra_blob_dir {
+        search_dirs.push(d.to_path_buf());
+    }
     let temp_dir = std::env::temp_dir();
-    let mut read_dir = tokio::fs::read_dir(&temp_dir).await.ok()?;
-    while let Ok(Some(entry)) = read_dir.next_entry().await {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if !name_str.starts_with(".sendme-recv-") {
-            continue;
-        }
-        let dir_path = entry.path();
-        let ticket_path = dir_path.join("ticket.txt");
-        if !ticket_path.exists() {
-            continue;
-        }
-        let ticket_str = match tokio::fs::read_to_string(&ticket_path).await {
-            Ok(s) => s.trim().to_string(),
-            Err(_) => continue,
-        };
-        let ticket = match BlobTicket::from_str(&ticket_str) {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        // Verify the hash matches the directory name (sanity check for corrupted/stale files)
-        let expected_dir = format!(".sendme-recv-{}", ticket.hash().to_hex());
-        if name_str.as_ref() != expected_dir.as_str() {
-            continue;
-        }
-        let db = match FsStore::load(&dir_path).await {
-            Ok(db) => db,
-            Err(_) => continue,
-        };
-        let hash_and_format = ticket.hash_and_format();
-        let local = match db.remote().local(hash_and_format).await {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        if local.is_complete() {
-            tracing::info!(
-                "Found complete local blobs in {}: ticket recovered from ticket.txt",
-                dir_path.display()
-            );
-            return Some(ticket_str);
+    if !search_dirs.contains(&temp_dir) {
+        search_dirs.push(temp_dir);
+    }
+
+    for dir in &search_dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if !name_str.starts_with(".sendme-recv-") {
+                continue;
+            }
+            let ticket_path = entry.path().join("ticket.txt");
+            let Ok(ticket_str) = std::fs::read_to_string(&ticket_path) else { continue };
+            let ticket_str = ticket_str.trim().to_string();
+            // Basic sanity: must parse as a BlobTicket and hash must match dirname.
+            if let Ok(ticket) = BlobTicket::from_str(&ticket_str) {
+                let expected = format!(".sendme-recv-{}", ticket.hash().to_hex());
+                if name_str.as_ref() == expected.as_str() {
+                    tracing::info!("Found local ticket in {}", entry.path().display());
+                    return Some(ticket_str);
+                }
+            }
         }
     }
     None
 }
 
 /// Quick synchronous check: does any `.sendme-recv-*` directory with a `ticket.txt` exist?
-/// Used only for the UI badge — does NOT verify blob completeness (that's async).
-pub fn has_any_local_ticket_on_disk() -> bool {
-    let temp_dir = std::env::temp_dir();
-    if let Ok(entries) = std::fs::read_dir(&temp_dir) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.starts_with(".sendme-recv-") {
-                if entry.path().join("ticket.txt").exists() {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+/// Used only for the UI badge. Also checks `extra_blob_dir` if provided.
+pub fn has_any_local_ticket_on_disk(extra_blob_dir: Option<&std::path::Path>) -> bool {
+    scan_for_local_ticket(extra_blob_dir).is_some()
 }
 
 #[cfg(test)]

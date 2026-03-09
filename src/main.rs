@@ -59,6 +59,7 @@ enum PickerRequest {
     SendFolder,
     SendFiles,
     ReceiveFolder,
+    ReceiveBlobFolder,
 }
 
 #[derive(Debug)]
@@ -66,6 +67,7 @@ enum PickerResult {
     SendFolder(Option<PathBuf>),
     SendFiles(Option<Vec<PathBuf>>),
     ReceiveFolder(Option<PathBuf>),
+    ReceiveBlobFolder(Option<PathBuf>),
 }
 
 /// A file/folder entry with its cached size
@@ -106,6 +108,8 @@ struct UserSettings {
     /// Persisted so local-blob retry works even after app restart or reset_transfer.
     #[serde(default)]
     eazysendme_code_ticket_map: HashMap<String, String>,
+    #[serde(default)]
+    eazysendme_blob_dir: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -170,6 +174,7 @@ struct DataBeamApp {
     eazysendme_ticket: Option<String>,
     eazysendme_croc_handle: Option<ProcessHandle>,
     eazysendme_croc_rx: Option<mpsc::Receiver<TransferMsg>>,
+    eazysendme_blob_dir: Option<PathBuf>,
 
     // Croc receive
     croc_receive_recent_codes: Vec<String>,
@@ -231,6 +236,7 @@ impl Default for DataBeamApp {
             croc_text_value: String::new(),
             receive_code: String::new(),
             receive_output_dir: None,
+            eazysendme_blob_dir: None,
             transfer_state: TransferState::Idle,
             transfer_progress: 0.0,
             transfer_code: None,
@@ -414,6 +420,11 @@ impl DataBeamApp {
             map = map.into_iter().take(20).collect();
         }
         self.eazysendme_code_ticket_map = map;
+        self.eazysendme_blob_dir = settings
+            .eazysendme_blob_dir
+            .as_ref()
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty());
     }
 
     fn persist_user_settings(&self) {
@@ -436,6 +447,10 @@ impl DataBeamApp {
             eazysendme_auto_retry: self.eazysendme_auto_retry,
             croc_custom_code: self.croc_custom_code.clone(),
             eazysendme_code_ticket_map: self.eazysendme_code_ticket_map.clone(),
+            eazysendme_blob_dir: self
+                .eazysendme_blob_dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
         };
         if let Ok(json) = serde_json::to_string_pretty(&settings) {
             let _ = fs::write(path, json);
@@ -514,6 +529,9 @@ impl DataBeamApp {
                 PickerRequest::ReceiveFolder => {
                     PickerResult::ReceiveFolder(rfd::FileDialog::new().pick_folder())
                 }
+                PickerRequest::ReceiveBlobFolder => {
+                    PickerResult::ReceiveBlobFolder(rfd::FileDialog::new().pick_folder())
+                }
             };
             let _ = tx.send(result);
         });
@@ -540,9 +558,14 @@ impl DataBeamApp {
                         self.receive_output_dir = Some(path);
                         self.persist_user_settings();
                     }
+                    PickerResult::ReceiveBlobFolder(Some(path)) => {
+                        self.eazysendme_blob_dir = Some(path);
+                        self.persist_user_settings();
+                    }
                     PickerResult::SendFolder(None)
                     | PickerResult::SendFiles(None)
-                    | PickerResult::ReceiveFolder(None) => {}
+                    | PickerResult::ReceiveFolder(None)
+                    | PickerResult::ReceiveBlobFolder(None) => {}
                 }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -1535,6 +1558,7 @@ impl DataBeamApp {
                                             let opts = SendmeReceiveOptions {
                                                 ticket: normalized_ticket,
                                                 output_dir: self.receive_output_dir.clone(),
+                                                blob_dir: self.eazysendme_blob_dir.clone(),
                                             };
                                             let (new_rx, new_handle) = sendme_receive(opts, "");
                                             self.transfer_rx = Some(new_rx);
@@ -2063,6 +2087,7 @@ impl DataBeamApp {
                 let opts = SendmeReceiveOptions {
                     ticket: self.receive_code.trim().to_string(),
                     output_dir: self.receive_output_dir.clone(),
+                    blob_dir: self.eazysendme_blob_dir.clone(),
                 };
                 let (rx, handle) = sendme_receive(opts, &binary);
                 self.transfer_rx = Some(rx);
@@ -2078,8 +2103,9 @@ impl DataBeamApp {
                     let opts = SendmeReceiveOptions {
                         ticket,
                         output_dir: self.receive_output_dir.clone(),
+                        blob_dir: self.eazysendme_blob_dir.clone(),
                     };
-                    let (rx, handle) = sendme_check_local(opts);
+                    let (rx, handle) = sendme_check_local(opts, self.eazysendme_blob_dir.clone());
                     self.transfer_rx = Some(rx);
                     self.transfer_handle = Some(handle);
                     // poll_transfer will fall through to a full Croc retry if it
@@ -2090,11 +2116,11 @@ impl DataBeamApp {
                 }
                 // No map entry but blobs may still be on disk (map evicted or app crashed
                 // before map could be written). Scan disk for any complete blob.
-                if local_ticket_exists_on_disk() {
+                if local_ticket_exists_on_disk(self.eazysendme_blob_dir.as_deref()) {
                     self.transfer_log
                         .push("[Local] No cached ticket — scanning disk for blobs..."
                             .to_string());
-                    let (rx, handle) = sendme_scan_and_export_local(self.receive_output_dir.clone());
+                    let (rx, handle) = sendme_scan_and_export_local(self.receive_output_dir.clone(), self.eazysendme_blob_dir.clone());
                     self.transfer_rx = Some(rx);
                     self.transfer_handle = Some(handle);
                     self.transfer_state = TransferState::Running;
@@ -3320,7 +3346,7 @@ impl DataBeamApp {
                 let has_cached = !code_key.is_empty()
                     && (self.eazysendme_ticket.is_some()
                         || self.eazysendme_code_ticket_map.contains_key(&code_key))
-                    || local_ticket_exists_on_disk();
+                    || local_ticket_exists_on_disk(self.eazysendme_blob_dir.as_deref());
 
                 let (icon, msg, color) = if has_cached {
                     (
@@ -3398,6 +3424,57 @@ impl DataBeamApp {
                 });
             });
         });
+
+        if self.selected_tool == SelectedTool::EazySendme {
+            ui.add_space(6.0);
+            card_frame(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Local Cache")
+                            .color(TEXT_PRIMARY)
+                            .strong()
+                            .size(13.0),
+                    );
+                    let dir_text = self
+                        .eazysendme_blob_dir
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "Temporary Directory".into());
+                    ui.label(
+                        RichText::new(truncate_middle(&dir_text, 40))
+                            .color(TEXT_MUTED)
+                            .size(11.0),
+                    );
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let Some(dir) = self.eazysendme_blob_dir.clone().or_else(|| Some(std::env::temp_dir())) {
+                            if accent_button_sized(ui, "↗", self.engine_color(), Vec2::new(24.0, 22.0))
+                                .clicked()
+                            {
+                                let _ = open::that(&dir);
+                            }
+                        }
+                        if accent_button_sized(ui, "📂", self.engine_color(), Vec2::new(32.0, 22.0))
+                            .clicked()
+                        {
+                            self.launch_picker(PickerRequest::ReceiveBlobFolder);
+                        }
+                        if self.eazysendme_blob_dir.is_some()
+                            && accent_button_sized(
+                                ui,
+                                "✕",
+                                Color32::from_rgb(130, 85, 85),
+                                Vec2::new(24.0, 22.0),
+                            )
+                            .clicked()
+                        {
+                            self.eazysendme_blob_dir = None;
+                            self.persist_user_settings();
+                        }
+                    });
+                });
+            });
+        }
 
         if self.selected_tool == SelectedTool::Croc {
             let text = self

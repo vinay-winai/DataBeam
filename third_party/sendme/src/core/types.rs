@@ -44,6 +44,8 @@ pub struct ReceiveOptions {
     pub relay_mode: RelayModeOption,
     pub magic_ipv4_addr: Option<std::net::SocketAddrV4>,
     pub magic_ipv6_addr: Option<std::net::SocketAddrV6>,
+    /// If set, iroh blob stores are created under this directory instead of std::env::temp_dir().
+    pub blob_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
