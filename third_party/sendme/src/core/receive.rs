@@ -515,7 +515,8 @@ pub async fn check_and_export_local_in(
 
     emit_event(&app_handle, "receive-started");
     emit_event(&app_handle, "receive-export-started");
-            emit_event(&app_handle, "receive-completed");
+    export(&db, collection, &output_dir, &app_handle).await?;
+    emit_event(&app_handle, "receive-completed");
 
     Ok(true)
 }
@@ -525,7 +526,7 @@ pub async fn check_and_export_local_in(
 /// expensive/potentially-blocking FsStore::load/remote() calls at scan time.
 ///
 /// Searches `extra_blob_dir` first (user-configured location), then system temp dir.
-pub fn scan_for_local_ticket(extra_blob_dir: Option<&std::path::Path>) -> Option<String> {
+pub fn scan_for_local_ticket(extra_blob_dir: Option<&std::path::Path>) -> Vec<String> {
     let mut search_dirs: Vec<std::path::PathBuf> = Vec::new();
     if let Some(d) = extra_blob_dir {
         search_dirs.push(d.to_path_buf());
@@ -534,6 +535,8 @@ pub fn scan_for_local_ticket(extra_blob_dir: Option<&std::path::Path>) -> Option
     if !search_dirs.contains(&temp_dir) {
         search_dirs.push(temp_dir);
     }
+
+    let mut tickets = Vec::new();
 
     for dir in &search_dirs {
         let Ok(entries) = std::fs::read_dir(dir) else { continue };
@@ -551,18 +554,18 @@ pub fn scan_for_local_ticket(extra_blob_dir: Option<&std::path::Path>) -> Option
                 let expected = format!(".sendme-recv-{}", ticket.hash().to_hex());
                 if name_str.as_ref() == expected.as_str() {
                     tracing::info!("Found local ticket in {}", entry.path().display());
-                    return Some(ticket_str);
+                    tickets.push(ticket_str);
                 }
             }
         }
     }
-    None
+    tickets
 }
 
 /// Quick synchronous check: does any `.sendme-recv-*` directory with a `ticket.txt` exist?
 /// Used only for the UI badge. Also checks `extra_blob_dir` if provided.
 pub fn has_any_local_ticket_on_disk(extra_blob_dir: Option<&std::path::Path>) -> bool {
-    scan_for_local_ticket(extra_blob_dir).is_some()
+    !scan_for_local_ticket(extra_blob_dir).is_empty()
 }
 
 #[cfg(test)]

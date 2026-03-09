@@ -104,6 +104,8 @@ struct UserSettings {
     eazysendme_auto_retry: bool,
     #[serde(default)]
     croc_custom_code: String,
+    #[serde(default)]
+    croc_use_custom_code: bool,
     /// Maps croc code → last known sendme ticket for that session.
     /// Persisted so local-blob retry works even after app restart or reset_transfer.
     #[serde(default)]
@@ -414,6 +416,7 @@ impl DataBeamApp {
         self.eazysendme_custom_code = settings.eazysendme_custom_code;
         self.eazysendme_auto_retry = settings.eazysendme_auto_retry;
         self.croc_custom_code = settings.croc_custom_code;
+        self.croc_use_custom_code = settings.croc_use_custom_code;
         // Limit map size to 20 entries (keep newest)
         let mut map = settings.eazysendme_code_ticket_map;
         if map.len() > 20 {
@@ -446,6 +449,7 @@ impl DataBeamApp {
             eazysendme_custom_code: self.eazysendme_custom_code.clone(),
             eazysendme_auto_retry: self.eazysendme_auto_retry,
             croc_custom_code: self.croc_custom_code.clone(),
+            croc_use_custom_code: self.croc_use_custom_code,
             eazysendme_code_ticket_map: self.eazysendme_code_ticket_map.clone(),
             eazysendme_blob_dir: self
                 .eazysendme_blob_dir
@@ -2096,36 +2100,38 @@ impl DataBeamApp {
             SelectedTool::EazySendme => {
                 // Always try local blob cache first — avoids wasting a Croc session.
                 // eazy_cached_ticket was captured BEFORE reset_transfer() cleared it.
-                if let Some(ticket) = eazy_cached_ticket {
-                    self.transfer_log
-                        .push("[Local] Cached ticket found — trying local blob export before Croc"
-                            .to_string());
-                    let opts = SendmeReceiveOptions {
-                        ticket,
-                        output_dir: self.receive_output_dir.clone(),
-                        blob_dir: self.eazysendme_blob_dir.clone(),
-                    };
-                    let (rx, handle) = sendme_check_local(opts, self.eazysendme_blob_dir.clone());
-                    self.transfer_rx = Some(rx);
-                    self.transfer_handle = Some(handle);
-                    // poll_transfer will fall through to a full Croc retry if it
-                    // receives a "blobs-incomplete" error.
-                    self.transfer_state = TransferState::Running;
-                    self.transfer_start_time = Some(self.animation_time);
-                    return;
-                }
-                // No map entry but blobs may still be on disk (map evicted or app crashed
-                // before map could be written). Scan disk for any complete blob.
-                if local_ticket_exists_on_disk(self.eazysendme_blob_dir.as_deref()) {
-                    self.transfer_log
-                        .push("[Local] No cached ticket — scanning disk for blobs..."
-                            .to_string());
-                    let (rx, handle) = sendme_scan_and_export_local(self.receive_output_dir.clone(), self.eazysendme_blob_dir.clone());
-                    self.transfer_rx = Some(rx);
-                    self.transfer_handle = Some(handle);
-                    self.transfer_state = TransferState::Running;
-                    self.transfer_start_time = Some(self.animation_time);
-                    return;
+                if !is_auto {
+                    if let Some(ticket) = eazy_cached_ticket {
+                        self.transfer_log
+                            .push("[Local] Cached ticket found — trying local blob export before Croc"
+                                .to_string());
+                        let opts = SendmeReceiveOptions {
+                            ticket,
+                            output_dir: self.receive_output_dir.clone(),
+                            blob_dir: self.eazysendme_blob_dir.clone(),
+                        };
+                        let (rx, handle) = sendme_check_local(opts, self.eazysendme_blob_dir.clone());
+                        self.transfer_rx = Some(rx);
+                        self.transfer_handle = Some(handle);
+                        // poll_transfer will fall through to a full Croc retry if it
+                        // receives a "blobs-incomplete" error.
+                        self.transfer_state = TransferState::Running;
+                        self.transfer_start_time = Some(self.animation_time);
+                        return;
+                    }
+                    // No map entry but blobs may still be on disk (map evicted or app crashed
+                    // before map could be written). Scan disk for any complete blob.
+                    if local_ticket_exists_on_disk(self.eazysendme_blob_dir.as_deref()) {
+                        self.transfer_log
+                            .push("[Local] No cached ticket — scanning disk for blobs..."
+                                .to_string());
+                        let (rx, handle) = sendme_scan_and_export_local(self.receive_output_dir.clone(), self.eazysendme_blob_dir.clone());
+                        self.transfer_rx = Some(rx);
+                        self.transfer_handle = Some(handle);
+                        self.transfer_state = TransferState::Running;
+                        self.transfer_start_time = Some(self.animation_time);
+                        return;
+                    }
                 }
                 // Step 1: Start croc_receive to get the ticket
                 let opts = CrocReceiveOptions {

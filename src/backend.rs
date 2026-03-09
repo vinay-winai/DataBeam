@@ -15,7 +15,6 @@ use std::time::{Duration, Instant};
 use flate2::read::GzDecoder;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use sendme_native::{
-    check_and_export_local as native_check_and_export_local,
     check_and_export_local_in as native_check_and_export_local_in,
     download as native_sendme_download,
     has_any_local_ticket_on_disk as native_has_any_local_ticket_on_disk,
@@ -1861,13 +1860,26 @@ pub fn sendme_scan_and_export_local(
             Some(Arc::new(NativeSendmeEmitter::new(evt_tx)));
 
         let task = runtime.spawn(async move {
-            // Find the first valid ticket.txt on disk (O(1) operation).
-            let ticket_str = native_scan_for_local_ticket(blob_dir.as_deref());
-            let Some(ticket) = ticket_str else {
+            // Find ALL valid ticket.txt on disk (O(1) operation).
+            let tickets = native_scan_for_local_ticket(blob_dir.as_deref());
+            if tickets.is_empty() {
                 return Ok::<bool, Box<dyn std::error::Error + Send + Sync>>(false);
-            };
-            // Export it if it's complete.
-            Ok(native_check_and_export_local_in(&ticket, output_dir, app_handle, blob_dir).await?)
+            }
+            // Export the first one that is complete.
+            for ticket in tickets {
+                let success = native_check_and_export_local_in(
+                    &ticket,
+                    output_dir.clone(),
+                    app_handle.clone(),
+                    blob_dir.clone(),
+                )
+                .await.unwrap_or(false);
+                
+                if success {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
         });
 
         // Forward events while waiting — use recv_timeout to avoid CPU spin.
