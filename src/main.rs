@@ -662,6 +662,8 @@ impl DataBeamApp {
 
     fn mark_sendme_one_shot_completed(&mut self) {
         self.transfer_state = TransferState::Completed;
+        self.eazy_retry_count = 0;
+        self.eazy_next_retry_time = None;
         self.transfer_progress = 1.0;
         self.preparing_progress = 1.0;
         self.transfer_end_time = Some(self.animation_time);
@@ -1460,6 +1462,8 @@ impl DataBeamApp {
                                         }
                                     } else {
                                         self.transfer_state = TransferState::Completed;
+                                        self.eazy_retry_count = 0;
+                                        self.eazy_next_retry_time = None;
                                         self.transfer_progress = 1.0;
                                         self.preparing_progress = 1.0;
                                         if let Some(total) = self.transfer_total_bytes {
