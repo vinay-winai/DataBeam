@@ -857,6 +857,7 @@ impl DataBeamApp {
 
     fn update_transfer_metrics_from_log(&mut self, line: &str) {
         let lower = line.to_lowercase();
+        let old_total = self.transfer_total_bytes;
         let eazy_receive_pre_ticket = self.selected_tool == SelectedTool::EazySendme
             && self.view == AppView::Receive
             && self.eazysendme_ticket.is_none();
@@ -1180,7 +1181,9 @@ impl DataBeamApp {
             self.sendme_had_transfer = true;
         }
         
-        self.update_eazy_cache_sizes();
+        if old_total.is_none() && self.transfer_total_bytes.is_some() {
+            self.update_eazy_cache_sizes();
+        }
     }
 
     fn update_croc_received_text_from_log(&mut self, line: &str) -> bool {
