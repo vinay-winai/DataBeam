@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use flate2::read::GzDecoder;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use sendme_native::{
+    check_and_export_local as native_check_and_export_local,
     download as native_sendme_download, start_share as native_sendme_start_share,
     AddrInfoOptions as NativeAddrInfoOptions, AppHandle as NativeSendmeAppHandle,
     EventEmitter as NativeSendmeEventEmitter, ReceiveOptions as NativeReceiveOptions,
@@ -1712,6 +1713,105 @@ pub fn sendme_receive(
                     "Receive task ended unexpectedly: {}",
                     e
                 )));
+            }
+        }
+    });
+
+    (rx, ProcessHandle { cancel, child_pid })
+}
+
+/// Tries to complete the receive by exporting blobs that are already fully cached locally.
+/// Returns a channel that sends `Completed` if successful or `Error("blobs-incomplete")` if not.
+/// Callers should fall back to a full `sendme_receive` if they get `blobs-incomplete`.
+pub fn sendme_check_local(
+    opts: SendmeReceiveOptions,
+) -> (mpsc::Receiver<TransferMsg>, ProcessHandle) {
+    let (tx, rx) = mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel2 = cancel.clone();
+    let child_pid = Arc::new(std::sync::Mutex::new(None));
+
+    let _worker = thread::spawn(move || {
+        let _ = tx.send(TransferMsg::Started);
+
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                let _ =
+                    tx.send(TransferMsg::Error(format!("Failed to create runtime: {}", e)));
+                return;
+            }
+        };
+
+        let (evt_tx, evt_rx) = mpsc::channel::<NativeSendmeEvent>();
+        let app_handle: NativeSendmeAppHandle =
+            Some(Arc::new(NativeSendmeEmitter::new(evt_tx)));
+
+        let ticket = opts.ticket.clone();
+        let output_dir = opts.output_dir.clone();
+        let task = runtime.spawn(async move {
+            native_check_and_export_local(&ticket, output_dir, app_handle).await
+        });
+
+        // Forward events to the transfer channel while task runs
+        loop {
+            if cancel2.load(Ordering::Relaxed) {
+                task.abort();
+                let _ = tx.send(TransferMsg::Error("Transfer cancelled".to_string()));
+                return;
+            }
+            match evt_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(NativeSendmeEvent::ReceiveStarted) => {
+                    let _ = tx.send(TransferMsg::Output(
+                        "[local] Blobs complete locally, exporting...".to_string(),
+                    ));
+                }
+                Ok(NativeSendmeEvent::ReceiveExportStarted) => {
+                    let _ = tx.send(TransferMsg::Output(
+                        "[4/4] Writing files to disk...".to_string(),
+                    ));
+                }
+                Ok(NativeSendmeEvent::ReceiveExportProgress { done, total }) => {
+                    let _ = tx.send(TransferMsg::Output(format!(
+                        "[4/4] Writing... {} / {}",
+                        format_size_unit(done),
+                        format_size_unit(total.max(done).max(1))
+                    )));
+                    if total > 0 {
+                        let _ = tx.send(TransferMsg::Progress(
+                            (done as f32 / total as f32).clamp(0.0, 1.0),
+                        ));
+                    }
+                }
+                Ok(NativeSendmeEvent::ReceiveCompleted) => {
+                    let _ = tx.send(TransferMsg::Progress(1.0));
+                }
+                _ => {}
+            }
+            if task.is_finished() {
+                break;
+            }
+        }
+
+        let result = runtime.block_on(async { task.await });
+        match result {
+            Ok(Ok(true)) => {
+                // Successfully exported from local blobs
+                let _ = tx.send(TransferMsg::Progress(1.0));
+                let _ = tx.send(TransferMsg::Completed);
+            }
+            Ok(Ok(false)) => {
+                // Blobs not complete locally — caller should do full receive
+                let _ = tx.send(TransferMsg::Error("blobs-incomplete".to_string()));
+            }
+            Ok(Err(e)) => {
+                let _ = tx.send(TransferMsg::Error(format!("{e}")));
+            }
+            Err(e) => {
+                let _ = tx.send(TransferMsg::Error(format!("Local check task failed: {e}")));
             }
         }
     });

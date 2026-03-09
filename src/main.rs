@@ -694,6 +694,21 @@ impl DataBeamApp {
     }
 
     fn fail_transfer(&mut self, e: String) {
+        // "blobs-incomplete" is a sentinel from sendme_check_local: it means the blob store
+        // check found the data is not fully cached locally. Immediately fall through to the
+        // full Croc receive path without charging a retry or waiting.
+        if e == "blobs-incomplete"
+            && self.selected_tool == SelectedTool::EazySendme
+            && self.view == AppView::Receive
+        {
+            self.transfer_log
+                .push("Local blobs incomplete, starting full receive...".to_string());
+            self.eazy_next_retry_time = Some(self.animation_time); // trigger immediately
+            self.transfer_state = TransferState::Failed(e);
+            self.transfer_end_time = Some(self.animation_time);
+            return;
+        }
+
         if self.selected_tool == SelectedTool::EazySendme
             && self.eazysendme_auto_retry
             && self.eazy_retry_count < 3
@@ -1982,6 +1997,24 @@ impl DataBeamApp {
                 self.transfer_handle = Some(handle);
             }
             SelectedTool::EazySendme => {
+                // If we already have a ticket from a previous successful download,
+                // try exporting directly from local blobs before burning a Croc session.
+                if is_auto {
+                    if let Some(ticket) = self.eazysendme_ticket.clone() {
+                        let opts = SendmeReceiveOptions {
+                            ticket,
+                            output_dir: self.receive_output_dir.clone(),
+                        };
+                        let (rx, handle) = sendme_check_local(opts);
+                        self.transfer_rx = Some(rx);
+                        self.transfer_handle = Some(handle);
+                        // poll_transfer will fall through to a full Croc retry if it
+                        // receives a "blobs-incomplete" error
+                        self.transfer_state = TransferState::Running;
+                        self.transfer_start_time = Some(self.animation_time);
+                        return;
+                    }
+                }
                 // Step 1: Start croc_receive to get the ticket
                 let opts = CrocReceiveOptions {
                     code: self.receive_code.trim().to_string(),

@@ -1,7 +1,7 @@
 pub mod core;
 
 pub use core::{
-    receive::download,
+    receive::{check_and_export_local, download},
     send::start_share,
     types::{
         AddrInfoOptions, AppHandle, EventEmitter, ReceiveOptions, ReceiveResult, RelayModeOption,

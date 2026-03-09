@@ -419,6 +419,67 @@ fn validate_path_component(component: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Checks if all blobs for the given ticket hash are already in the local iroh-blobs store.
+/// If yes, runs the export directly to `output_dir` without any network connection (no Croc, no Sendme).
+/// Returns `Ok(true)` if export succeeded from local blobs.
+/// Returns `Ok(false)` if blobs are incomplete and a full receive is needed.
+/// Returns `Err` if something went wrong during the local export itself.
+pub async fn check_and_export_local(
+    ticket_str: &str,
+    output_dir: Option<PathBuf>,
+    app_handle: AppHandle,
+) -> anyhow::Result<bool> {
+    let ticket = match BlobTicket::from_str(ticket_str) {
+        Ok(t) => t,
+        Err(_) => return Ok(false), // malformed ticket, need full receive
+    };
+
+    let dir_name = format!(".sendme-recv-{}", ticket.hash().to_hex());
+    let iroh_data_dir = std::env::temp_dir().join(&dir_name);
+
+    // If the blob store directory doesn't even exist, blobs are definitely not local
+    if !iroh_data_dir.exists() {
+        return Ok(false);
+    }
+
+    let db = match FsStore::load(&iroh_data_dir).await {
+        Ok(db) => db,
+        Err(_) => return Ok(false),
+    };
+
+    let hash_and_format = ticket.hash_and_format();
+    let local = db.remote().local(hash_and_format).await?;
+
+    if !local.is_complete() {
+        return Ok(false); // partial download, need to reconnect to sender
+    }
+
+    // All blobs are local — run export directly, no network needed
+    let output_dir = output_dir.unwrap_or_else(|| {
+        dirs::download_dir().unwrap_or_else(|| std::env::current_dir().unwrap())
+    });
+
+    // Load collection from local store
+    let collection = Collection::load(hash_and_format.hash, db.as_ref()).await?;
+
+    // Emit file names
+    let mut file_names: Vec<String> = Vec::new();
+    for (name, _hash) in collection.iter() {
+        file_names.push(name.to_string());
+    }
+    if !file_names.is_empty() {
+        let json = serde_json::to_string(&file_names).unwrap_or_else(|_| "[]".to_string());
+        emit_event_with_payload(&app_handle, "receive-file-names", &json);
+    }
+
+    emit_event(&app_handle, "receive-started");
+    emit_event(&app_handle, "receive-export-started");
+    export(&db, collection, &output_dir, &app_handle).await?;
+    emit_event(&app_handle, "receive-completed");
+
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
