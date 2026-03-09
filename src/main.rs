@@ -695,6 +695,15 @@ impl DataBeamApp {
         if let Some(handle) = &self.transfer_handle {
             handle.request_cancel();
         }
+        // On successful completion, evict the cached ticket for this code.
+        // The sender will generate a fresh ticket (and ticket hash) for any future session
+        // with the same croc code, so the cached entry would be stale.
+        if self.selected_tool == SelectedTool::EazySendme && self.view == AppView::Receive {
+            let code_key = self.receive_code.trim().to_string();
+            if self.eazysendme_code_ticket_map.remove(&code_key).is_some() {
+                self.persist_user_settings();
+            }
+        }
     }
 
     fn cancel_transfer(&mut self) {
@@ -798,6 +807,12 @@ impl DataBeamApp {
                     self.persist_user_settings();
                 }
             }
+        } else {
+            // Manual retry: clear the cached ticket so we always go through Croc fresh
+            // and pick up whatever ticket the sender currently has (possibly a new payload).
+            let code_key = self.receive_code.trim().to_string();
+            self.eazysendme_code_ticket_map.remove(&code_key);
+            self.persist_user_settings();
         }
         self.reset_transfer();
         // Restore ticket so start_receive(is_auto=true) can attempt local-blob export.
@@ -1555,6 +1570,20 @@ impl DataBeamApp {
                                         self.preparing_progress = 1.0;
                                         if let Some(total) = self.transfer_total_bytes {
                                             self.transfer_done_bytes = Some(total);
+                                        }
+                                        // Evict cached ticket on success — sender issues
+                                        // a new ticket for any future session with this code.
+                                        if self.selected_tool == SelectedTool::EazySendme
+                                            && self.view == AppView::Receive
+                                        {
+                                            let code_key = self.receive_code.trim().to_string();
+                                            if self
+                                                .eazysendme_code_ticket_map
+                                                .remove(&code_key)
+                                                .is_some()
+                                            {
+                                                self.persist_user_settings();
+                                            }
                                         }
                                     }
                                 }
