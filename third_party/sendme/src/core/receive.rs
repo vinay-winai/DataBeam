@@ -472,6 +472,22 @@ pub async fn check_and_export_local(
         emit_event_with_payload(&app_handle, "receive-file-names", &json);
     }
 
+    // Remove any partial output files left by a previous interrupted write.
+    // We know the local blobs are fully verified (is_complete() == true), so it is safe
+    // to delete whatever was partially written and recreate it from the local store.
+    for name in &file_names {
+        if let Ok(target) = get_export_path(&output_dir, name) {
+            if target.exists() {
+                if target.is_dir() {
+                    let _ = tokio::fs::remove_dir_all(&target).await;
+                } else {
+                    let _ = tokio::fs::remove_file(&target).await;
+                }
+                tracing::info!("Removed partial output before re-export: {}", target.display());
+            }
+        }
+    }
+
     emit_event(&app_handle, "receive-started");
     emit_event(&app_handle, "receive-export-started");
     export(&db, collection, &output_dir, &app_handle).await?;
