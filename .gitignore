@@ -12,3 +12,4 @@ dist/*
 temp_*
 _alt_sendme_inspect/
 _official_sendme_inspect/
+/third_party/sendme/target

@@ -16,7 +16,10 @@ use flate2::read::GzDecoder;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use sendme_native::{
     check_and_export_local as native_check_and_export_local,
-    download as native_sendme_download, start_share as native_sendme_start_share,
+    download as native_sendme_download,
+    has_any_local_ticket_on_disk as native_has_any_local_ticket_on_disk,
+    scan_for_complete_local_ticket as native_scan_for_complete_local_ticket,
+    start_share as native_sendme_start_share,
     AddrInfoOptions as NativeAddrInfoOptions, AppHandle as NativeSendmeAppHandle,
     EventEmitter as NativeSendmeEventEmitter, ReceiveOptions as NativeReceiveOptions,
     RelayModeOption as NativeRelayModeOption, SendOptions as NativeSendOptions,
@@ -1819,7 +1822,106 @@ pub fn sendme_check_local(
     (rx, ProcessHandle { cancel, child_pid })
 }
 
-// ── Output Parsing ─────────────────────────────────────────────────
+/// Cheap synchronous check: are there any blob dirs on disk that have a `ticket.txt`?
+/// Used only for the UI badge — does not spin up a Tokio runtime.
+pub fn local_ticket_exists_on_disk() -> bool {
+    native_has_any_local_ticket_on_disk()
+}
+
+/// Scans disk for the first complete blob whose `ticket.txt` passes integrity checks,
+/// then exports it directly. Sends `Completed` on success or `blobs-incomplete` if nothing found.
+pub fn sendme_scan_and_export_local(
+    output_dir: Option<std::path::PathBuf>,
+) -> (mpsc::Receiver<TransferMsg>, ProcessHandle) {
+    let (tx, rx) = mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel2 = cancel.clone();
+    let child_pid = Arc::new(std::sync::Mutex::new(None));
+
+    let _worker = thread::spawn(move || {
+        let _ = tx.send(TransferMsg::Started);
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                let _ = tx.send(TransferMsg::Error(format!("Failed to create runtime: {}", e)));
+                return;
+            }
+        };
+
+        let (evt_tx, evt_rx) = mpsc::channel::<NativeSendmeEvent>();
+        let app_handle: NativeSendmeAppHandle =
+            Some(Arc::new(NativeSendmeEmitter::new(evt_tx)));
+
+        let task = runtime.spawn(async move {
+            // Find the first complete blob dir on disk.
+            let ticket_str = native_scan_for_complete_local_ticket().await;
+            let Some(ticket) = ticket_str else {
+                return Ok::<bool, Box<dyn std::error::Error + Send + Sync>>(false);
+            };
+            // Export it.
+            Ok(native_check_and_export_local(&ticket, output_dir, app_handle).await?)
+        });
+
+        // Forward events while waiting
+        loop {
+            if cancel2.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            while let Ok(evt) = evt_rx.try_recv() {
+                match evt {
+                    NativeSendmeEvent::ReceiveStarted => {
+                        let _ = tx.send(TransferMsg::Output("[Local] Exporting from local cache...".to_string()));
+                    }
+                    NativeSendmeEvent::ReceiveExportStarted => {
+                        let _ = tx.send(TransferMsg::Output("[Local] Writing files to disk...".to_string()));
+                    }
+                    NativeSendmeEvent::ReceiveProgress { done, total, .. } => {
+                        let _ = tx.send(TransferMsg::Output(format!(
+                            "[Local] {}/{}",
+                            format_size_unit(done),
+                            format_size_unit(total.max(done).max(1))
+                        )));
+                        if total > 0 {
+                            let _ = tx.send(TransferMsg::Progress(
+                                (done as f32 / total as f32).clamp(0.0, 1.0),
+                            ));
+                        }
+                    }
+                    NativeSendmeEvent::ReceiveCompleted => {
+                        let _ = tx.send(TransferMsg::Progress(1.0));
+                    }
+                    _ => {}
+                }
+            }
+            if task.is_finished() {
+                break;
+            }
+        }
+
+        let result = runtime.block_on(async { task.await });
+        match result {
+            Ok(Ok(true)) => {
+                let _ = tx.send(TransferMsg::Progress(1.0));
+                let _ = tx.send(TransferMsg::Completed);
+            }
+            Ok(Ok(false)) => {
+                let _ = tx.send(TransferMsg::Error("blobs-incomplete".to_string()));
+            }
+            Ok(Err(e)) => {
+                let _ = tx.send(TransferMsg::Error(format!("{e}")));
+            }
+            Err(e) => {
+                let _ = tx.send(TransferMsg::Error(format!("Scan task failed: {e}")));
+            }
+        }
+    });
+
+    (rx, ProcessHandle { cancel, child_pid })
+}
+
 
 fn parse_croc_output(line: &str, tx: &mpsc::Sender<TransferMsg>) {
     let cleaned = strip_ansi(line);

@@ -695,15 +695,10 @@ impl DataBeamApp {
         if let Some(handle) = &self.transfer_handle {
             handle.request_cancel();
         }
-        // On successful completion, evict the cached ticket for this code.
-        // The sender will generate a fresh ticket (and ticket hash) for any future session
-        // with the same croc code, so the cached entry would be stale.
-        if self.selected_tool == SelectedTool::EazySendme && self.view == AppView::Receive {
-            let code_key = self.receive_code.trim().to_string();
-            if self.eazysendme_code_ticket_map.remove(&code_key).is_some() {
-                self.persist_user_settings();
-            }
-        }
+        // NOTE: we intentionally do NOT evict the map entry here. The blob dir is cleaned up
+        // by iroh after export, so the map entry becomes a dead link — but leaving it in the
+        // map doesn’t cause incorrect behavior: next time the code is used, the dir won’t
+        // exist and check_and_export_local will return Ok(false), falling through to Croc.
     }
 
     fn cancel_transfer(&mut self) {
@@ -1561,20 +1556,10 @@ impl DataBeamApp {
                                         if let Some(total) = self.transfer_total_bytes {
                                             self.transfer_done_bytes = Some(total);
                                         }
-                                        // Evict cached ticket on success — sender issues
-                                        // a new ticket for any future session with this code.
-                                        if self.selected_tool == SelectedTool::EazySendme
-                                            && self.view == AppView::Receive
-                                        {
-                                            let code_key = self.receive_code.trim().to_string();
-                                            if self
-                                                .eazysendme_code_ticket_map
-                                                .remove(&code_key)
-                                                .is_some()
-                                            {
-                                                self.persist_user_settings();
-                                            }
-                                        }
+                                        // NOTE: do NOT evict map entry on success — the blob dir
+                                        // is cleaned up by iroh after export. If map entry lingers,
+                                        // check_and_export_local will safely return Ok(false) on
+                                        // next attempt (dir gone) and fall through to Croc.
                                     }
                                 }
                             }
@@ -2099,6 +2084,19 @@ impl DataBeamApp {
                     self.transfer_handle = Some(handle);
                     // poll_transfer will fall through to a full Croc retry if it
                     // receives a "blobs-incomplete" error.
+                    self.transfer_state = TransferState::Running;
+                    self.transfer_start_time = Some(self.animation_time);
+                    return;
+                }
+                // No map entry but blobs may still be on disk (e.g. map evicted on success
+                // or app crashed before map was written). Scan disk for any complete blob.
+                if is_auto && local_ticket_exists_on_disk() {
+                    self.transfer_log
+                        .push("[Local] No cached ticket — scanning disk for blobs..."
+                            .to_string());
+                    let (rx, handle) = sendme_scan_and_export_local(self.receive_output_dir.clone());
+                    self.transfer_rx = Some(rx);
+                    self.transfer_handle = Some(handle);
                     self.transfer_state = TransferState::Running;
                     self.transfer_start_time = Some(self.animation_time);
                     return;
@@ -3318,9 +3316,11 @@ impl DataBeamApp {
             ui.add_space(3.0);
             if self.selected_tool == SelectedTool::EazySendme {
                 let code_key = self.receive_code.trim().to_string();
+                // Check map AND disk (disk check catches the case where map was evicted).
                 let has_cached = !code_key.is_empty()
                     && (self.eazysendme_ticket.is_some()
-                        || self.eazysendme_code_ticket_map.contains_key(&code_key));
+                        || self.eazysendme_code_ticket_map.contains_key(&code_key))
+                    || local_ticket_exists_on_disk();
 
                 let (icon, msg, color) = if has_cached {
                     (
