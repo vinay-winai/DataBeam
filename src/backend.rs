@@ -860,6 +860,15 @@ fn read_lines_cr_aware(
                     }
                 } else {
                     buf.push(byte[0]);
+                    // Check for prompts that don't end in newline (like "Overwrite? (y/N)")
+                    if buf.len() >= 9 {
+                        let partial = String::from_utf8_lossy(&buf);
+                        let lower = partial.to_lowercase();
+                        if lower.contains("overwrite") || lower.contains("--overwrite") {
+                            parser(&partial, &tx, &cancel);
+                            buf.clear();
+                        }
+                    }
                 }
             }
             Err(_) => break,
@@ -1848,7 +1857,7 @@ fn parse_croc_output(line: &str, tx: &mpsc::Sender<TransferMsg>, cancel: &Arc<At
     }
 
     let lower = trimmed.to_lowercase();
-    if lower.starts_with("overwrite") || lower.contains("use --overwrite") {
+    if lower.contains("overwrite") || lower.contains("--overwrite") {
         let _ = tx.send(TransferMsg::Error("conflict-detected".to_string()));
         cancel.store(true, Ordering::Relaxed);
         return;

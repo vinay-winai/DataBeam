@@ -757,6 +757,10 @@ impl DataBeamApp {
     }
 
     fn fail_transfer(&mut self, e: String) {
+        if let Some(handle) = &self.transfer_handle {
+            handle.request_cancel();
+        }
+
         // Don't let generic cancellation message overwrite a more specific error already set.
         if e == "Transfer cancelled" {
             if let TransferState::Failed(_) = self.transfer_state {
