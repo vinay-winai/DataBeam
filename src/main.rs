@@ -114,12 +114,8 @@ struct UserSettings {
     /// Persisted so local-blob retry works even after app restart or reset_transfer.
     #[serde(default)]
     eazysendme_code_ticket_map: HashMap<String, EazyCacheEntry>,
-    #[serde(default = "default_false")]
+    #[serde(default = "default_true")]
     croc_overwrite: bool,
-}
-
-fn default_false() -> bool {
-    false
 }
 
 fn default_true() -> bool {
@@ -255,7 +251,7 @@ impl Default for DataBeamApp {
             receive_output_dir: None,
             receive_overwrite_prompt: false,
             sendme_overwrite_approved: false,
-            croc_overwrite: false,
+            croc_overwrite: true,
             transfer_state: TransferState::Idle,
             transfer_progress: 0.0,
             transfer_code: None,
@@ -444,7 +440,6 @@ impl DataBeamApp {
             map = map.into_iter().take(20).collect();
         }
         self.eazysendme_code_ticket_map = map;
-        self.croc_overwrite = settings.croc_overwrite;
     }
 
     fn persist_user_settings(&self) {
@@ -684,7 +679,6 @@ impl DataBeamApp {
         self.sendme_stream_last_total = None;
         self.sendme_sender_payload_complete = false;
         self.last_done_speed_sample = None;
-        self.croc_overwrite = false;
     }
 
     fn mark_sendme_sender_waiting(&mut self) {
@@ -1779,16 +1773,6 @@ impl DataBeamApp {
                                     self.fail_transfer(e);
                                 }
                             }
-                            TransferMsg::Conflict(prompt) => {
-                                if prompt == "auto-accept-transfer" {
-                                    if let Some(handle) = &self.transfer_handle {
-                                        handle.send_input("y\n".to_string());
-                                    }
-                                } else {
-                                    self.transfer_log.push(format!("Conflict: {}", prompt));
-                                    self.receive_overwrite_prompt = true;
-                                }
-                            }
                             TransferMsg::Started => {
                                 self.transfer_state = TransferState::Running;
                                 self.transfer_start_time = Some(self.animation_time);
@@ -2355,27 +2339,10 @@ impl DataBeamApp {
             
         if !open || close_modal {
             self.receive_overwrite_prompt = false;
-
+            
             if approved {
-                if self.selected_tool == SelectedTool::Croc {
-                    if let Some(handle) = &self.transfer_handle {
-                        handle.send_input("y\n".to_string());
-                    } else {
-                        // Restart with overwrite if the process died
-                        self.croc_overwrite = true;
-                        self.retry_receive(false);
-                    }
-                } else {
-                    self.sendme_overwrite_approved = true;
-                    self.retry_receive(false);
-                }
-            } else if close_modal && !approved {
-                // If user cancelled, send 'n' to croc to let it exit/skip if still running
-                if self.selected_tool == SelectedTool::Croc {
-                    if let Some(handle) = &self.transfer_handle {
-                        handle.send_input("n\n".to_string());
-                    }
-                }
+               self.sendme_overwrite_approved = true;
+               self.retry_receive(false);
             }
         }
     }
@@ -3700,6 +3667,17 @@ impl DataBeamApp {
                 });
             });
             
+            if self.selected_tool == SelectedTool::Croc {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.checkbox(
+                        &mut self.croc_overwrite,
+                        RichText::new("Automatically overwrite existing files (--overwrite)").size(11.0),
+                    ).changed() {
+                        self.persist_user_settings();
+                    }
+                });
+            }
         });
         if self.selected_tool == SelectedTool::Croc {
             let text = self
