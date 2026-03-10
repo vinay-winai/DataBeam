@@ -114,8 +114,12 @@ struct UserSettings {
     /// Persisted so local-blob retry works even after app restart or reset_transfer.
     #[serde(default)]
     eazysendme_code_ticket_map: HashMap<String, EazyCacheEntry>,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_false")]
     croc_overwrite: bool,
+}
+
+fn default_false() -> bool {
+    false
 }
 
 fn default_true() -> bool {
@@ -251,7 +255,7 @@ impl Default for DataBeamApp {
             receive_output_dir: None,
             receive_overwrite_prompt: false,
             sendme_overwrite_approved: false,
-            croc_overwrite: true,
+            croc_overwrite: false,
             transfer_state: TransferState::Idle,
             transfer_progress: 0.0,
             transfer_code: None,
@@ -440,6 +444,7 @@ impl DataBeamApp {
             map = map.into_iter().take(20).collect();
         }
         self.eazysendme_code_ticket_map = map;
+        self.croc_overwrite = settings.croc_overwrite;
     }
 
     fn persist_user_settings(&self) {
@@ -679,6 +684,7 @@ impl DataBeamApp {
         self.sendme_stream_last_total = None;
         self.sendme_sender_payload_complete = false;
         self.last_done_speed_sample = None;
+        self.croc_overwrite = false;
     }
 
     fn mark_sendme_sender_waiting(&mut self) {
@@ -2341,8 +2347,25 @@ impl DataBeamApp {
             self.receive_overwrite_prompt = false;
             
             if approved {
-               self.sendme_overwrite_approved = true;
-               self.retry_receive(false);
+                if self.selected_tool == SelectedTool::Croc {
+                    if let Some(handle) = &self.transfer_handle {
+                        handle.send_input("y\n".to_string());
+                    } else {
+                        // Restart with overwrite if the process died
+                        self.croc_overwrite = true;
+                        self.retry_receive(false);
+                    }
+                } else {
+                    self.sendme_overwrite_approved = true;
+                    self.retry_receive(false);
+                }
+            } else if close_modal && !approved {
+                // If user cancelled, send 'n' to croc to let it exit/skip if still running
+                if self.selected_tool == SelectedTool::Croc {
+                    if let Some(handle) = &self.transfer_handle {
+                        handle.send_input("n\n".to_string());
+                    }
+                }
             }
         }
     }
