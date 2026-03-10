@@ -855,9 +855,11 @@ impl DataBeamApp {
             // Persist the in-memory ticket to the map so start_receive can find it.
             if let Some(ticket) = &self.eazysendme_ticket {
                 if !code_key.is_empty() {
+                    let existing_size = self.eazysendme_code_ticket_map.get(&code_key).map(|e| e.payload_size).unwrap_or(0);
+                    let final_size = self.transfer_total_bytes.unwrap_or(existing_size);
                     self.eazysendme_code_ticket_map.insert(code_key, EazyCacheEntry {
                         ticket: ticket.clone(),
-                        payload_size: 0, // This gets updated by update_eazy_cache_sizes
+                        payload_size: final_size,
                     });
                     self.persist_user_settings();
                 }
@@ -1588,10 +1590,11 @@ impl DataBeamApp {
                                             // works even after reset_transfer clears the ticket.
                                             let code_key = self.receive_code.trim().to_string();
                                             if !code_key.is_empty() {
+                                                let existing_size = self.eazysendme_code_ticket_map.get(&code_key).map(|e| e.payload_size).unwrap_or(0);
                                                 self.eazysendme_code_ticket_map
                                                     .insert(code_key, EazyCacheEntry {
                                                         ticket: normalized_ticket.clone(),
-                                                        payload_size: 0,
+                                                        payload_size: existing_size,
                                                     });
                                                 self.persist_user_settings();
                                             }
