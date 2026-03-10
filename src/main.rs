@@ -3497,20 +3497,10 @@ impl DataBeamApp {
                     {
                         self.retry_send(false);
                     }
-                    if accent_button_sized(
-                        ui,
-                        "✕ Cancel",
-                        Color32::from_rgb(150, 75, 75),
-                        Vec2::new(100.0, 32.0),
-                    )
-                    .clicked()
+                    if accent_button_sized(ui, "🆕 New", accent, Vec2::new(100.0, 32.0)).clicked()
                     {
                         self.reset_transfer();
                         self.send_items.clear();
-                    }
-                    if accent_button_sized(ui, "🆕 New", accent, Vec2::new(80.0, 32.0)).clicked()
-                    {
-                        self.reset_transfer();
                     }
                 });
             }
@@ -3801,7 +3791,7 @@ impl DataBeamApp {
                 self.show_transfer_status(ui);
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if accent_button_sized(ui, "🆕 New", self.engine_color(), Vec2::new(80.0, 32.0))
+                    if accent_button_sized(ui, "🆕 New", self.engine_color(), Vec2::new(100.0, 32.0))
                         .clicked()
                     {
                         self.reset_transfer();
@@ -3816,17 +3806,6 @@ impl DataBeamApp {
                     .clicked()
                     {
                         self.retry_receive(false);
-                    }
-                    if accent_button_sized(
-                        ui,
-                        "✕ Cancel",
-                        Color32::from_rgb(150, 75, 75),
-                        Vec2::new(100.0, 32.0),
-                    )
-                    .clicked()
-                    {
-                        self.reset_transfer();
-                        self.receive_code.clear();
                     }
                 });
             }
@@ -4055,13 +4034,7 @@ impl DataBeamApp {
                         });
                     }
                     ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if accent_button_sized(ui, "✕ Cancel", ERROR, Vec2::new(90.0, 26.0))
-                            .clicked()
-                        {
-                            wants_cancel = true;
-                        }
-                    });
+                    // Cancel removed – use Top Bar Stop button for consistency.
                 }
                 TransferState::Completed => {
                     ui.horizontal(|ui| {
