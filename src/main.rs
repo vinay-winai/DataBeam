@@ -2172,6 +2172,7 @@ impl DataBeamApp {
                             let (rx, handle) = sendme_check_local(opts);
                             self.transfer_rx = Some(rx);
                             self.transfer_handle = Some(handle);
+                            self.transfer_phase = TransferPhase::Transferring;
                             self.transfer_state = TransferState::Running;
                             self.transfer_start_time = Some(self.animation_time);
                             return;
@@ -3583,11 +3584,18 @@ impl DataBeamApp {
             ui.add_space(3.0);
             if self.selected_tool == SelectedTool::EazySendme {
                 let code_key = self.receive_code.trim().to_string();
-                // Check map AND disk (disk check catches the case where map was evicted).
-                let has_cached = !code_key.is_empty()
-                    && (self.eazysendme_ticket.is_some()
-                        || self.eazysendme_code_ticket_map.contains_key(&code_key))
-                    || local_ticket_exists_on_disk();
+                let mut has_cached = false;
+                if !code_key.is_empty() {
+                    let mut ticket_to_check = self.eazysendme_ticket.clone();
+                    if ticket_to_check.is_none() {
+                        if let Some(entry) = self.eazysendme_code_ticket_map.get(&code_key) {
+                            ticket_to_check = Some(entry.ticket.clone());
+                        }
+                    }
+                    if let Some(tick) = ticket_to_check {
+                        has_cached = crate::backend::sendme_has_local_blob(&tick);
+                    }
+                }
 
                 let (icon, msg, color) = if has_cached {
                     (

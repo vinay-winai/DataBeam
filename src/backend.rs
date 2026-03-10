@@ -17,7 +17,6 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use sendme_native::{
     check_and_export_local_in as native_check_and_export_local_in,
     download as native_sendme_download,
-    has_any_local_ticket_on_disk as native_has_any_local_ticket_on_disk,
     local_ticket_exists_on_disk as native_local_ticket_exists_on_disk,
     start_share as native_sendme_start_share,
     cleanup_sendme_receive_artifacts_for_ticket as native_cleanup_sendme_receive_artifacts_for_ticket,
@@ -752,10 +751,10 @@ fn parse_native_progress_payload(payload: &str) -> Option<(u64, u64, f64)> {
 
 #[derive(Debug, Clone)]
 struct SenderRequestRenderState {
-    endpoint_id: String,
-    connection_id: u64,
-    request_id: u64,
-    item_index: u64,
+    _endpoint_id: String,
+    _connection_id: u64,
+    _request_id: u64,
+    _item_index: u64,
     hash_short: String,
     total_bytes: u64,
     done_bytes: u64,
@@ -1281,10 +1280,10 @@ pub fn sendme_send(
                         let _ = tx.send(TransferMsg::Output(format_sender_request_line(&prev)));
                     }
                     let state = SenderRequestRenderState {
-                        endpoint_id: started.endpoint_id,
-                        connection_id: started.connection_id,
-                        request_id: started.request_id,
-                        item_index: started.item_index,
+                        _endpoint_id: started.endpoint_id,
+                        _connection_id: started.connection_id,
+                        _request_id: started.request_id,
+                        _item_index: started.item_index,
                         hash_short: started.hash_short,
                         total_bytes: started.total_bytes.max(1),
                         done_bytes: 0,
@@ -1309,10 +1308,10 @@ pub fn sendme_send(
                         sender_requests
                             .entry(key)
                             .or_insert_with(|| SenderRequestRenderState {
-                                endpoint_id: "?".to_string(),
-                                connection_id: progress_evt.connection_id,
-                                request_id: progress_evt.request_id,
-                                item_index: 0,
+                                _endpoint_id: "?".to_string(),
+                                _connection_id: progress_evt.connection_id,
+                                _request_id: progress_evt.request_id,
+                                _item_index: 0,
                                 hash_short: "?".to_string(),
                                 total_bytes: progress_evt.done_bytes.max(1),
                                 done_bytes: 0,
@@ -1835,10 +1834,6 @@ pub fn sendme_has_local_blob(ticket_str: &str) -> bool {
 
 pub fn cleanup_sendme_receive_artifacts_for_ticket(ticket_str: &str) {
     native_cleanup_sendme_receive_artifacts_for_ticket(ticket_str)
-}
-
-pub fn local_ticket_exists_on_disk() -> bool {
-    native_has_any_local_ticket_on_disk(None)
 }
 
 
