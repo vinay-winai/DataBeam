@@ -967,9 +967,14 @@ pub fn croc_send(
                 cmd.arg(text);
             }
         } else {
-            for p in &opts.paths {
-                cmd.arg(p);
-            }
+            let (send_path, _staging_dir) = match create_staging_dir(&opts.paths) {
+                Ok((path, dir)) => (path, Some(dir)),
+                Err(e) => {
+                    let _ = tx.send(TransferMsg::Error(format!("Failed to stage files: {}", e)));
+                    return;
+                }
+            };
+            cmd.arg(send_path);
         }
 
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -1141,15 +1146,11 @@ pub fn sendme_send(
     let child_pid = Arc::new(std::sync::Mutex::new(None));
 
     let _worker = thread::spawn(move || {
-        let (send_path, _staging_dir) = if opts.paths.len() == 1 {
-            (opts.paths[0].clone(), None)
-        } else {
-            match create_staging_dir(&opts.paths) {
-                Ok((path, dir)) => (path, Some(dir)),
-                Err(e) => {
-                    let _ = tx.send(TransferMsg::Error(format!("Failed to stage files: {}", e)));
-                    return;
-                }
+        let (send_path, _staging_dir) = match create_staging_dir(&opts.paths) {
+            Ok((path, dir)) => (path, Some(dir)),
+            Err(e) => {
+                let _ = tx.send(TransferMsg::Error(format!("Failed to stage files: {}", e)));
+                return;
             }
         };
 
