@@ -961,20 +961,22 @@ pub fn croc_send(
         if let Some(code) = &opts.custom_code {
             cmd.env("CROC_SECRET", code);
         }
+        let mut _staging_holder = None;
         if opts.text_mode {
             cmd.arg("--text");
             if let Some(text) = &opts.text_value {
                 cmd.arg(text);
             }
         } else {
-            let (send_path, _staging_dir) = match create_staging_dir(&opts.paths) {
-                Ok((path, dir)) => (path, Some(dir)),
+            let (send_path, staging) = match create_staging_dir(&opts.paths) {
+                Ok((path, dir)) => (path, dir),
                 Err(e) => {
                     let _ = tx.send(TransferMsg::Error(format!("Failed to stage files: {}", e)));
                     return;
                 }
             };
-            cmd.arg(send_path);
+            cmd.arg(&send_path);
+            _staging_holder = Some(staging);
         }
 
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
