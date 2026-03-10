@@ -18,6 +18,7 @@ use sendme_native::{
     check_and_export_local_in as native_check_and_export_local_in,
     download as native_sendme_download,
     local_ticket_exists_on_disk as native_local_ticket_exists_on_disk,
+    local_ticket_size_on_disk as native_local_ticket_size_on_disk,
     start_share as native_sendme_start_share,
     cleanup_sendme_receive_artifacts_for_ticket as native_cleanup_sendme_receive_artifacts_for_ticket,
     AddrInfoOptions as NativeAddrInfoOptions, AppHandle as NativeSendmeAppHandle,
@@ -1834,6 +1835,10 @@ pub fn sendme_has_local_blob(ticket_str: &str) -> bool {
 
 pub fn cleanup_sendme_receive_artifacts_for_ticket(ticket_str: &str) {
     native_cleanup_sendme_receive_artifacts_for_ticket(ticket_str)
+}
+
+pub fn get_sendme_blob_directory_size(ticket_str: &str) -> u64 {
+    native_local_ticket_size_on_disk(ticket_str)
 }
 
 

@@ -88,7 +88,6 @@ impl SendItem {
 pub struct EazyCacheEntry {
     pub ticket: String,
     pub payload_size: u64,
-    pub recv_size: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -735,15 +734,10 @@ impl DataBeamApp {
             let code_key = self.receive_code.trim().to_string();
             let mut sizes_changed = false;
             let t_bytes = self.transfer_total_bytes.unwrap_or(0);
-            let d_bytes = self.transfer_done_bytes.unwrap_or(0);
             
             if let Some(entry) = self.eazysendme_code_ticket_map.get_mut(&code_key) {
                 if t_bytes > 0 && entry.payload_size != t_bytes {
                     entry.payload_size = t_bytes;
-                    sizes_changed = true;
-                }
-                if entry.recv_size != d_bytes {
-                    entry.recv_size = d_bytes;
                     sizes_changed = true;
                 }
             }
@@ -763,7 +757,6 @@ impl DataBeamApp {
         self.eazy_next_retry_time = None;
         self.transfer_end_time = Some(self.animation_time);
         self.transfer_state = TransferState::Failed("Transfer cancelled".to_string());
-        self.update_eazy_cache_sizes();
     }
 
     fn fail_transfer(&mut self, e: String) {
@@ -838,7 +831,6 @@ impl DataBeamApp {
             self.transfer_state = TransferState::Failed(e);
         }
         self.transfer_end_time = Some(self.animation_time);
-        self.update_eazy_cache_sizes();
     }
 
     fn retry_send(&mut self, is_auto: bool) {
@@ -866,7 +858,6 @@ impl DataBeamApp {
                     self.eazysendme_code_ticket_map.insert(code_key, EazyCacheEntry {
                         ticket: ticket.clone(),
                         payload_size: 0, // This gets updated by update_eazy_cache_sizes
-                        recv_size: 0,
                     });
                     self.persist_user_settings();
                 }
@@ -1601,7 +1592,6 @@ impl DataBeamApp {
                                                     .insert(code_key, EazyCacheEntry {
                                                         ticket: normalized_ticket.clone(),
                                                         payload_size: 0,
-                                                        recv_size: 0,
                                                     });
                                                 self.persist_user_settings();
                                             }
@@ -1630,7 +1620,6 @@ impl DataBeamApp {
                                         if let Some(total) = self.transfer_total_bytes {
                                             self.transfer_done_bytes = Some(total);
                                         }
-                                        self.update_eazy_cache_sizes();
                                         
                                         // Once extraction completes successfully, remove the cache artifact immediately so it doesn't leave orphaned blob dirs.
                                         let code_key = self.receive_code.trim().to_string();
@@ -2160,7 +2149,8 @@ impl DataBeamApp {
                 // eazy_cached_ticket was captured BEFORE reset_transfer() cleared it.
                 if can_resume_locally {
                     if let Some(entry) = &eazy_cached_entry {
-                        if entry.payload_size > 0 && entry.recv_size == entry.payload_size {
+                        let disk_size = crate::backend::get_sendme_blob_directory_size(&entry.ticket);
+                        if entry.payload_size > 0 && disk_size >= entry.payload_size {
                             self.transfer_log
                                 .push("[Local] Cached ticket found and sizes match — checking local blob export"
                                     .to_string());
@@ -2516,9 +2506,10 @@ impl eframe::App for DataBeamApp {
                             
                             if let Ok(ticket_str) = std::fs::read_to_string(&ticket_path) {
                                 let ticket_str = ticket_str.trim();
+                                let size = dir_size(&path);
                                 for cache in map.values() {
                                     if cache.ticket == ticket_str {
-                                        if cache.payload_size > 0 && cache.recv_size >= cache.payload_size {
+                                        if cache.payload_size > 0 && size >= cache.payload_size {
                                             is_incomplete = false; // complete cache entry
                                         }
                                         break;
@@ -3593,7 +3584,12 @@ impl DataBeamApp {
                         }
                     }
                     if let Some(tick) = ticket_to_check {
-                        has_cached = crate::backend::sendme_has_local_blob(&tick);
+                        let disk_size = crate::backend::get_sendme_blob_directory_size(&tick);
+                        if let Some(entry) = self.eazysendme_code_ticket_map.get(&code_key) {
+                           if entry.payload_size > 0 && disk_size >= entry.payload_size {
+                               has_cached = true;
+                           }
+                        }
                     }
                 }
 

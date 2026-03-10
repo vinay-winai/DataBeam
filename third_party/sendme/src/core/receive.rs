@@ -618,6 +618,37 @@ pub fn local_ticket_exists_on_disk(ticket_str: &str) -> bool {
     std::env::temp_dir().join(expected_dir).exists()
 }
 
+/// Recursively calculates the size of a directory.
+fn calculate_dir_size(path: &std::path::Path) -> u64 {
+    let mut total = 0;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let metadata = entry.metadata().ok();
+            if let Some(m) = metadata {
+                if m.is_dir() {
+                    total += calculate_dir_size(&entry.path());
+                } else {
+                    total += m.len();
+                }
+            }
+        }
+    }
+    total
+}
+
+/// Returns the total size in bytes of the local blob directory for the given ticket.
+pub fn local_ticket_size_on_disk(ticket_str: &str) -> u64 {
+    let Ok(ticket) = BlobTicket::from_str(ticket_str) else {
+        return 0;
+    };
+    let expected_dir = format!(".sendme-recv-{}", ticket.hash().to_hex());
+    let path = std::env::temp_dir().join(expected_dir);
+    if !path.exists() {
+        return 0;
+    }
+    calculate_dir_size(&path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
