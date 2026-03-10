@@ -1796,6 +1796,7 @@ pub fn sendme_check_local(
                 }
                 Ok(NativeSendmeEvent::ReceiveCompleted) => {
                     let _ = tx.send(TransferMsg::Progress(1.0));
+                    break;
                 }
                 _ => {}
             }

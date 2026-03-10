@@ -679,6 +679,8 @@ impl DataBeamApp {
         self.sendme_stream_last_total = None;
         self.sendme_sender_payload_complete = false;
         self.last_done_speed_sample = None;
+        self.sendme_overwrite_approved = false;
+        self.receive_overwrite_prompt = false;
     }
 
     fn mark_sendme_sender_waiting(&mut self) {
@@ -865,7 +867,9 @@ impl DataBeamApp {
                 }
             }
         }
+        let was_approved = self.sendme_overwrite_approved;
         self.reset_transfer();
+        self.sendme_overwrite_approved = was_approved;
         self.start_receive(is_auto);
     }
 
@@ -3501,6 +3505,7 @@ impl DataBeamApp {
                     {
                         self.reset_transfer();
                         self.send_items.clear();
+                        self.croc_text_value.clear();
                     }
                 });
             }
