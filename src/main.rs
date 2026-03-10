@@ -1234,9 +1234,18 @@ impl DataBeamApp {
                 }
             }
             if self.croc_received_text.is_none() {
+                // Check current line first
+                if let Some(text) = extract_croc_received_text(line) {
+                    self.croc_received_text = Some(text);
+                    if self.selected_tool == SelectedTool::Croc {
+                        self.croc_text_popup_open = true;
+                    }
+                    self.croc_expect_text_payload = false;
+                    return true;
+                }
+                // Then check log
                 if let Some(text) = extract_croc_received_text_from_logs(&self.transfer_log) {
                     self.croc_received_text = Some(text);
-                    // self.croc_text_popup_open = true; // Don't pop up for EazySendme, just use it
                     if self.selected_tool == SelectedTool::Croc {
                         self.croc_text_popup_open = true;
                     }
@@ -1573,10 +1582,18 @@ impl DataBeamApp {
                                 } else {
                                     if self.selected_tool == SelectedTool::EazySendme
                                         && self.view == AppView::Receive
-                                        && self.transfer_phase == TransferPhase::Preparing
+                                        && self.eazysendme_ticket.is_none()
                                         && self.transfer_rx.is_none()
                                     {
                                         // Receiver side: Croc finished receiving the ticket
+                                        if self.croc_received_text.is_none() {
+                                            // Fallback: If Croc finished but we already had this ticket in cache (unlikely but possible during retries), reuse it.
+                                            let code_key = self.receive_code.trim().to_string();
+                                            if let Some(entry) = self.eazysendme_code_ticket_map.get(&code_key) {
+                                                self.croc_received_text = Some(entry.ticket.clone());
+                                            }
+                                        }
+
                                         if let Some(ticket) = self.croc_received_text.clone() {
                                             self.transfer_log.push(
                                                 "Ticket received via Croc. Starting Sendme..."
@@ -1603,7 +1620,8 @@ impl DataBeamApp {
                                                 output_dir: self.receive_output_dir.clone(),
                                                 overwrite: self.sendme_overwrite_approved,
                                             };
-                                            let (new_rx, new_handle) = sendme_receive(opts, "");
+                                            let sendme_binary = self.get_tool_binary(&Tool::Sendme).unwrap_or_default();
+                                            let (new_rx, new_handle) = sendme_receive(opts, &sendme_binary);
                                             self.transfer_rx = Some(new_rx);
                                             self.transfer_handle = Some(new_handle);
                                             self.transfer_phase = TransferPhase::Preparing;
@@ -2075,19 +2093,6 @@ impl DataBeamApp {
             return;
         }
 
-        // IMPORTANT: capture the EazySendme ticket BEFORE reset_transfer() wipes it.
-        // reset_transfer() sets eazysendme_ticket = None, so we read both the in-memory
-        // value and the persisted map here, before the reset happens.
-        // Done for BOTH auto and manual start — local cache is always preferred over Croc.
-        let eazy_cached_entry: Option<EazyCacheEntry> =
-            if self.selected_tool == SelectedTool::EazySendme {
-                let code_key = self.receive_code.trim().to_string();
-                self.eazysendme_code_ticket_map.get(&code_key).cloned()
-            } else {
-                None
-            };
-        let eazy_cached_ticket = self.eazysendme_ticket.clone().or_else(|| eazy_cached_entry.as_ref().map(|e| e.ticket.clone()));
-
         self.reset_transfer();
 
         // Persist receive code into recent history for Croc / EazySendme
@@ -2140,65 +2145,52 @@ impl DataBeamApp {
                 self.transfer_handle = Some(handle);
             }
             SelectedTool::EazySendme => {
-                // Verify if the underlying downloaded chunks actually exist on disk right now.
-                let mut can_resume_locally = false;
-                if let Some(entry) = &eazy_cached_entry {
-                    if crate::backend::sendme_has_local_blob(&entry.ticket) {
-                        can_resume_locally = true;
+                let code_key = self.receive_code.trim().to_string();
+                let mut ticket_from_cache = None;
+                let mut is_complete = false;
+
+                if let Some(entry) = self.eazysendme_code_ticket_map.get(&code_key) {
+                    let disk_size = crate::backend::get_sendme_blob_directory_size(&entry.ticket);
+                    if entry.payload_size > 0 && disk_size >= entry.payload_size {
+                        ticket_from_cache = Some(entry.ticket.clone());
+                        is_complete = true;
+                    } else if crate::backend::sendme_has_local_blob(&entry.ticket) {
+                        // Incomplete blob: User wants to wipe and start fresh Phase 1 (Croc) to get latest ticket.
+                         self.transfer_log.push("[Local] Incomplete local blob found — wiping cache entry to ensure fresh ticket from sender via Croc.".to_string());
+                         self.eazysendme_code_ticket_map.remove(&code_key);
+                         self.persist_user_settings();
                     }
                 }
 
-                // Always try local blob cache first — avoids wasting a Croc session.
-                // eazy_cached_ticket was captured BEFORE reset_transfer() cleared it.
-                if can_resume_locally {
-                    if let Some(entry) = &eazy_cached_entry {
-                        let disk_size = crate::backend::get_sendme_blob_directory_size(&entry.ticket);
-                        if entry.payload_size > 0 && disk_size >= entry.payload_size {
-                            self.transfer_log
-                                .push("[Local] Cached ticket found and sizes match — checking local blob export"
-                                    .to_string());
-                            let opts = SendmeReceiveOptions {
-                                ticket: entry.ticket.clone(),
-                                output_dir: self.receive_output_dir.clone(),
-                                overwrite: self.sendme_overwrite_approved,
-                            };
-                            let (rx, handle) = sendme_check_local(opts);
-                            self.transfer_rx = Some(rx);
-                            self.transfer_handle = Some(handle);
-                            self.transfer_phase = TransferPhase::Transferring;
-                            self.transfer_state = TransferState::Running;
-                            self.transfer_start_time = Some(self.animation_time);
-                            return;
-                        }
-                    }
-                }
-                
-                // If we already have the ticket cached (partial download) AND the blobs actually exist on disk, 
-                // the sender is likely still running `sendme serve`. Skip Croc entirely and resume directly.
-                if can_resume_locally {
-                    if let Some(ticket) = eazy_cached_ticket {
-                        self.transfer_phase = TransferPhase::Transferring;
-                        self.transfer_log.push("[Local] Resuming EazySendme from cached ticket...".to_string());
+                if is_complete {
+                    if let Some(ticket) = ticket_from_cache {
+                        self.transfer_log
+                            .push("[Local] Cached ticket found and sizes match — checking local blob export"
+                                .to_string());
                         let opts = SendmeReceiveOptions {
                             ticket,
                             output_dir: self.receive_output_dir.clone(),
                             overwrite: self.sendme_overwrite_approved,
                         };
-                        let (rx, handle) = sendme_receive(opts, &binary);
+                        let (rx, handle) = sendme_check_local(opts);
                         self.transfer_rx = Some(rx);
                         self.transfer_handle = Some(handle);
+                        self.transfer_phase = TransferPhase::Transferring;
+                        self.transfer_state = TransferState::Running;
+                        self.transfer_start_time = Some(self.animation_time);
+                        return;
                     }
-                } else {
-                    // Step 1: Start croc_receive to get the ticket
-                    let opts = CrocReceiveOptions {
-                        code: self.receive_code.trim().to_string(),
-                        output_dir: None, // Ticket is text, no dir needed
-                        overwrite: self.croc_overwrite,
-                    };
-                    let (rx, handle) = croc_receive(opts, &binary);
-                    self.transfer_rx = Some(rx);
-                    self.transfer_handle = Some(handle);
                 }
+
+                // Fall back to Phase 1 (Croc) for all other cases (including incomplete or no cache)
+                let opts = CrocReceiveOptions {
+                    code: code_key,
+                    output_dir: None, 
+                    overwrite: self.croc_overwrite,
+                };
+                let (rx, handle) = croc_receive(opts, &binary);
+                self.transfer_rx = Some(rx);
+                self.transfer_handle = Some(handle);
             }
         }
 
@@ -2282,11 +2274,19 @@ impl DataBeamApp {
             egui::Stroke::new(2.0, Color32::from_rgba_premultiplied(255, 140, 0, 110)),
             egui::StrokeKind::Inside,
         );
+        let is_croc_text = self.selected_tool == SelectedTool::Croc && self.croc_text_mode;
+        let text = if is_croc_text {
+            "TEXT MODE SELECTED"
+        } else {
+            "Drop files/folders here"
+        };
+        let font_size = if is_croc_text { 24.0 } else { 20.0 };
+        
         painter.text(
             screen.center(),
             egui::Align2::CENTER_CENTER,
-            "Drop files here",
-            egui::FontId::new(20.0, egui::FontFamily::Proportional),
+            text,
+            egui::FontId::new(font_size, egui::FontFamily::Proportional),
             Color32::from_rgba_premultiplied(255, 190, 120, 220),
         );
     }
@@ -4940,7 +4940,7 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([600.0, 640.0])
+            .with_inner_size([580.0, 720.0])
             .with_min_inner_size([420.0, 360.0])
             .with_title("DataBeam")
             .with_icon(databeam_icon())
