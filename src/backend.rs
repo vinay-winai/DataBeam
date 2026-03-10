@@ -562,6 +562,7 @@ pub enum TransferMsg {
     WaitingForReceiver,
     SenderTransferActivity,
     ActiveTransfers(usize),
+    Conflict(String),
 }
 
 // ── Transfer Options ───────────────────────────────────────────────
@@ -1027,7 +1028,7 @@ pub fn croc_send(
         }
     });
 
-    (rx, ProcessHandle { cancel, child_pid })
+    (rx, ProcessHandle { cancel, child_pid, stdin_tx: None })
 }
 
 // ── Croc Receive ───────────────────────────────────────────────────
@@ -1036,6 +1037,7 @@ pub fn croc_receive(
     opts: CrocReceiveOptions,
     binary_path: &str,
 ) -> (mpsc::Receiver<TransferMsg>, ProcessHandle) {
+    let (stdin_tx, stdin_rx) = mpsc::channel::<String>();
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel2 = cancel.clone();
@@ -1049,7 +1051,7 @@ pub fn croc_receive(
         // croc v10.3.1: code must be passed via CROC_SECRET env var
         // (passing code as CLI arg is no longer supported in non-classic mode)
         cmd.env("CROC_SECRET", &opts.code);
-        cmd.arg("--yes");
+        // We remove --yes to allow interactive prompts if --overwrite is not passed.
         if opts.overwrite {
             cmd.arg("--overwrite"); // auto-resume interrupted downloads without y/N prompt
         }
@@ -1058,7 +1060,7 @@ pub fn croc_receive(
             cmd.arg("--out").arg(dir);
         }
 
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::piped());
         // Use temp dir for execution to ensure croc can write/remove its internal temp files safely
         cmd.current_dir(std::env::temp_dir());
 
@@ -1072,6 +1074,16 @@ pub fn croc_receive(
 
                 let stderr = child.stderr.take();
                 let stdout = child.stdout.take();
+                let mut stdin = child.stdin.take();
+
+                let _stdin_thread = stdin.take().map(|mut s| {
+                    thread::spawn(move || {
+                        while let Ok(msg) = stdin_rx.recv() {
+                            let _ = s.write_all(msg.as_bytes());
+                            let _ = s.flush();
+                        }
+                    })
+                });
 
                 let tx2 = tx.clone();
                 let c2 = cancel2.clone();
@@ -1121,7 +1133,7 @@ pub fn croc_receive(
         }
     });
 
-    (rx, ProcessHandle { cancel, child_pid })
+    (rx, ProcessHandle { cancel, child_pid, stdin_tx: Some(stdin_tx) })
 }
 
 // ── Sendme Send ────────────────────────────────────────────────────
@@ -1468,7 +1480,7 @@ pub fn sendme_send(
         cleanup_sendme_temp_artifacts();
     });
 
-    (rx, ProcessHandle { cancel, child_pid })
+    (rx, ProcessHandle { cancel, child_pid, stdin_tx: None })
 }
 /// Create a staging directory with all items copied/linked into it for sendme
 fn create_staging_dir(paths: &[PathBuf]) -> Result<(PathBuf, tempfile::TempDir), String> {
@@ -1722,7 +1734,7 @@ pub fn sendme_receive(
         }
     });
 
-    (rx, ProcessHandle { cancel, child_pid })
+    (rx, ProcessHandle { cancel, child_pid, stdin_tx: None })
 }
 
 /// Tries to complete the receive by exporting blobs that are already fully cached locally.
@@ -1824,7 +1836,7 @@ pub fn sendme_check_local(
         }
     });
 
-    (rx, ProcessHandle { cancel, child_pid })
+    (rx, ProcessHandle { cancel, child_pid, stdin_tx: None })
 }
 
 
@@ -1856,6 +1868,17 @@ fn parse_croc_output(line: &str, tx: &mpsc::Sender<TransferMsg>) {
     }
 
     let _ = tx.send(TransferMsg::Output(trimmed.to_string()));
+
+    let lower = trimmed.to_lowercase();
+    // Auto-accept initial download prompts for files/folders and text messages
+    if (trimmed.starts_with("Accept") || trimmed.starts_with("Display")) {
+        let _ = tx.send(TransferMsg::Conflict("auto-accept-transfer".to_string()));
+    }
+
+    // Capture file overwrite conflicts for the UI modal
+    if (trimmed.starts_with("Overwrite") || trimmed.contains("--overwrite")) {
+        let _ = tx.send(TransferMsg::Conflict(trimmed.to_string()));
+    }
 }
 
 fn extract_croc_code(trimmed: &str) -> Option<String> {
@@ -2035,6 +2058,7 @@ fn strip_ansi(s: &str) -> String {
 pub struct ProcessHandle {
     pub cancel: Arc<AtomicBool>,
     pub child_pid: Arc<std::sync::Mutex<Option<u32>>>,
+    pub stdin_tx: Option<mpsc::Sender<String>>,
 }
 
 impl ProcessHandle {
@@ -2056,6 +2080,12 @@ impl ProcessHandle {
                     let _ = cmd.args(["/PID", &pid.to_string(), "/F", "/T"]).output();
                 }
             }
+        }
+    }
+
+    pub fn send_input(&self, input: String) {
+        if let Some(tx) = &self.stdin_tx {
+            let _ = tx.send(input);
         }
     }
 }
