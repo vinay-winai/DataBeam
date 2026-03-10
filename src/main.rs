@@ -757,6 +757,7 @@ impl DataBeamApp {
         self.eazy_next_retry_time = None;
         self.transfer_end_time = Some(self.animation_time);
         self.transfer_state = TransferState::Failed("Transfer cancelled".to_string());
+        self.sendme_overwrite_approved = false;
     }
 
     fn fail_transfer(&mut self, e: String) {
