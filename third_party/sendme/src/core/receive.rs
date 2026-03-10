@@ -260,6 +260,16 @@ pub async fn download(
         let output_dir = options.output_dir.unwrap_or_else(|| {
             dirs::download_dir().unwrap_or_else(|| std::env::current_dir().unwrap())
         });
+        
+        // Prevent overwriting existing files if the overwrite flag is false
+        if !options.overwrite {
+            for (name, _) in collection.iter() {
+                let target = get_export_path(&output_dir, name)?;
+                if target.exists() {
+                    anyhow::bail!("file already exists");
+                }
+            }
+        }
 
         emit_event(&app_handle, "receive-export-started");
         export(&db, collection, &output_dir, &app_handle).await?;
@@ -433,8 +443,19 @@ pub async fn check_and_export_local(
     output_dir: Option<PathBuf>,
     app_handle: AppHandle,
 ) -> anyhow::Result<bool> {
-    check_and_export_local_in(ticket_str, output_dir, app_handle, None, None).await
+    check_and_export_local_in(ticket_str, output_dir, app_handle, None, false, None).await
 }
+
+pub fn cleanup_sendme_receive_artifacts_for_ticket(ticket_str: &str) {
+    if let Ok(ticket) = BlobTicket::from_str(ticket_str) {
+        let dir_name = format!(".sendme-recv-{}", ticket.hash().to_hex());
+        let temp_candidate = std::env::temp_dir().join(&dir_name);
+        if temp_candidate.exists() {
+            let _ = std::fs::remove_dir_all(temp_candidate);
+        }
+    }
+}
+
 
 /// Same as `check_and_export_local` but also checks `extra_blob_dir` if the default
 /// temp-dir location doesn't have the blobs (e.g., user configured a custom blob dir).
@@ -443,6 +464,7 @@ pub async fn check_and_export_local_in(
     output_dir: Option<PathBuf>,
     app_handle: AppHandle,
     blob_dir: Option<PathBuf>,
+    overwrite: bool,
     cancel_token: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> anyhow::Result<bool> {
     let ticket = match BlobTicket::from_str(ticket_str) {
@@ -504,6 +526,9 @@ pub async fn check_and_export_local_in(
     for name in &file_names {
         if let Ok(target) = get_export_path(&output_dir, name) {
             if target.exists() {
+                if !overwrite {
+                    anyhow::bail!("file already exists");
+                }
                 if target.is_dir() {
                     let _ = tokio::fs::remove_dir_all(&target).await;
                 } else {

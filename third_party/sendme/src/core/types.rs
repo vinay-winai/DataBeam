@@ -46,6 +46,7 @@ pub struct ReceiveOptions {
     pub magic_ipv6_addr: Option<std::net::SocketAddrV6>,
     /// If set, iroh blob stores are created under this directory instead of std::env::temp_dir().
     pub blob_dir: Option<PathBuf>,
+    pub overwrite: bool,
 }
 
 #[derive(Clone, Debug)]

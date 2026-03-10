@@ -115,6 +115,8 @@ struct UserSettings {
     /// Persisted so local-blob retry works even after app restart or reset_transfer.
     #[serde(default)]
     eazysendme_code_ticket_map: HashMap<String, EazyCacheEntry>,
+    #[serde(default = "default_true")]
+    croc_overwrite: bool,
 }
 
 fn default_true() -> bool {
@@ -146,6 +148,9 @@ struct DataBeamApp {
     // Receive
     receive_code: String,
     receive_output_dir: Option<PathBuf>,
+    receive_overwrite_prompt: bool,
+    sendme_overwrite_approved: bool,
+    croc_overwrite: bool,
 
     // Transfer
     transfer_state: TransferState,
@@ -245,6 +250,9 @@ impl Default for DataBeamApp {
             croc_text_value: String::new(),
             receive_code: String::new(),
             receive_output_dir: None,
+            receive_overwrite_prompt: false,
+            sendme_overwrite_approved: false,
+            croc_overwrite: true,
             transfer_state: TransferState::Idle,
             transfer_progress: 0.0,
             transfer_code: None,
@@ -456,6 +464,7 @@ impl DataBeamApp {
             croc_custom_code: self.croc_custom_code.clone(),
             croc_use_custom_code: self.croc_use_custom_code,
             eazysendme_code_ticket_map: self.eazysendme_code_ticket_map.clone(),
+            croc_overwrite: self.croc_overwrite,
         };
         if let Ok(json) = serde_json::to_string_pretty(&settings) {
             let _ = fs::write(path, json);
@@ -748,6 +757,8 @@ impl DataBeamApp {
         if let Some(handle) = &self.transfer_handle {
             handle.request_cancel();
         }
+        self.transfer_rx = None;
+        self.transfer_handle = None;
         self.eazy_retry_count = 0;
         self.eazy_next_retry_time = None;
         self.transfer_end_time = Some(self.animation_time);
@@ -771,11 +782,21 @@ impl DataBeamApp {
             return;
         }
 
-        // "File already exists" should never auto-retry — it will fail identically every time.
-        let is_file_exists_error = e.contains("already exists")
+        // "File already exists" should be intercepted to show the overwrite modal.
+        let is_file_exists_error = e.to_lowercase().contains("already exists")
             || e.to_lowercase().contains("file exists")
             || e.to_lowercase().contains("os error 17") // EEXIST on Unix
             || e.to_lowercase().contains("os error 183"); // ERROR_ALREADY_EXISTS on Windows
+
+        if is_file_exists_error {
+            self.eazy_retry_count = 0;
+            self.receive_overwrite_prompt = true;
+            self.transfer_state = TransferState::Idle;
+            self.transfer_log.push("File conflict detected. Waiting for overwrite confirmation...".to_string());
+            // Intentionally not marking end_time so we can cleanly retry from Idle
+            // Or we could leave it as Failed. Let's make it Idle so the Retry button isn't the primary action.
+            return;
+        }
 
         if self.selected_tool == SelectedTool::EazySendme
             && self.eazysendme_auto_retry
@@ -800,13 +821,13 @@ impl DataBeamApp {
             self.eazy_next_retry_time = Some(self.animation_time + wait_secs);
             let retry_msg = if wait_secs == 0.0 {
                 format!(
-                    "Transfer failed. Auto-retrying {}/3 immediately...",
-                    self.eazy_retry_count
+                    "Transfer failed ({}). Auto-retrying {}/3 immediately...",
+                    e, self.eazy_retry_count
                 )
             } else {
                 format!(
-                    "Transfer failed. Auto-retrying {}/3 in {}s...",
-                    self.eazy_retry_count, wait_secs as u32
+                    "Transfer failed ({}). Auto-retrying {}/3 in {}s...",
+                    e, self.eazy_retry_count, wait_secs as u32
                 )
             };
             self.transfer_log.push(retry_msg.clone());
@@ -1587,6 +1608,7 @@ impl DataBeamApp {
                                             let opts = SendmeReceiveOptions {
                                                 ticket: normalized_ticket,
                                                 output_dir: self.receive_output_dir.clone(),
+                                                overwrite: self.sendme_overwrite_approved,
                                             };
                                             let (new_rx, new_handle) = sendme_receive(opts, "");
                                             self.transfer_rx = Some(new_rx);
@@ -1609,10 +1631,13 @@ impl DataBeamApp {
                                             self.transfer_done_bytes = Some(total);
                                         }
                                         self.update_eazy_cache_sizes();
-                                        // NOTE: do NOT evict map entry on success — the blob dir
-                                        // is cleaned up by iroh after export. If map entry lingers,
-                                        // check_and_export_local will safely return Ok(false) on
-                                        // next attempt (dir gone) and fall through to Croc.
+                                        
+                                        // Once extraction completes successfully, remove the cache artifact immediately so it doesn't leave orphaned blob dirs.
+                                        let code_key = self.receive_code.trim().to_string();
+                                        if let Some(entry) = self.eazysendme_code_ticket_map.remove(&code_key) {
+                                            self.persist_user_settings();
+                                            crate::backend::cleanup_sendme_receive_artifacts_for_ticket(&entry.ticket);
+                                        }
                                     }
                                 }
                             }
@@ -2106,6 +2131,7 @@ impl DataBeamApp {
                 let opts = CrocReceiveOptions {
                     code: self.receive_code.trim().to_string(),
                     output_dir: self.receive_output_dir.clone(),
+                    overwrite: self.croc_overwrite,
                 };
                 let (rx, handle) = croc_receive(opts, &binary);
                 self.transfer_rx = Some(rx);
@@ -2115,6 +2141,7 @@ impl DataBeamApp {
                 let opts = SendmeReceiveOptions {
                     ticket: self.receive_code.trim().to_string(),
                     output_dir: self.receive_output_dir.clone(),
+                    overwrite: self.sendme_overwrite_approved,
                 };
                 let (rx, handle) = sendme_receive(opts, &binary);
                 self.transfer_rx = Some(rx);
@@ -2131,7 +2158,7 @@ impl DataBeamApp {
 
                 // Always try local blob cache first — avoids wasting a Croc session.
                 // eazy_cached_ticket was captured BEFORE reset_transfer() cleared it.
-                if !is_auto && can_resume_locally {
+                if can_resume_locally {
                     if let Some(entry) = &eazy_cached_entry {
                         if entry.payload_size > 0 && entry.recv_size == entry.payload_size {
                             self.transfer_log
@@ -2140,6 +2167,7 @@ impl DataBeamApp {
                             let opts = SendmeReceiveOptions {
                                 ticket: entry.ticket.clone(),
                                 output_dir: self.receive_output_dir.clone(),
+                                overwrite: self.sendme_overwrite_approved,
                             };
                             let (rx, handle) = sendme_check_local(opts);
                             self.transfer_rx = Some(rx);
@@ -2160,6 +2188,7 @@ impl DataBeamApp {
                         let opts = SendmeReceiveOptions {
                             ticket,
                             output_dir: self.receive_output_dir.clone(),
+                            overwrite: self.sendme_overwrite_approved,
                         };
                         let (rx, handle) = sendme_receive(opts, &binary);
                         self.transfer_rx = Some(rx);
@@ -2170,6 +2199,7 @@ impl DataBeamApp {
                     let opts = CrocReceiveOptions {
                         code: self.receive_code.trim().to_string(),
                         output_dir: None, // Ticket is text, no dir needed
+                        overwrite: self.croc_overwrite,
                     };
                     let (rx, handle) = croc_receive(opts, &binary);
                     self.transfer_rx = Some(rx);
@@ -2276,6 +2306,49 @@ impl DataBeamApp {
         }
         if self.cleanup_prompt_open {
             self.render_cleanup_popup(ctx);
+        }
+        if self.receive_overwrite_prompt {
+             self.render_overwrite_popup(ctx);
+        }
+    }
+
+    fn render_overwrite_popup(&mut self, ctx: &egui::Context) {
+        let mut open = self.receive_overwrite_prompt;
+        if !open {
+            return;
+        }
+        let mut close_modal = false;
+        let mut approved = false;
+        
+        egui::Window::new("File Conflict Warning")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label("Existing files were found in the destination folder.");
+                ui.add_space(8.0);
+                ui.label(RichText::new("Would you like to retry the transfer and overwrite the existing files?").strong());
+                
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if accent_button_sized(ui, "Yes, Overwrite", Color32::from_rgb(200, 60, 60), Vec2::new(120.0, 32.0)).clicked() {
+                        approved = true;
+                        close_modal = true;
+                    }
+                    if ui.add_sized([80.0, 32.0], egui::Button::new("Cancel")).clicked() {
+                        close_modal = true;
+                    }
+                });
+            });
+            
+        if !open || close_modal {
+            self.receive_overwrite_prompt = false;
+            
+            if approved {
+               self.sendme_overwrite_approved = true;
+               self.retry_receive(false);
+            }
         }
     }
 
@@ -3591,6 +3664,18 @@ impl DataBeamApp {
                     }
                 });
             });
+            
+            if self.selected_tool == SelectedTool::Croc {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.checkbox(
+                        &mut self.croc_overwrite,
+                        RichText::new("Automatically overwrite existing files (--overwrite)").size(11.0),
+                    ).changed() {
+                        self.persist_user_settings();
+                    }
+                });
+            }
         });
         if self.selected_tool == SelectedTool::Croc {
             let text = self
@@ -3816,10 +3901,6 @@ impl DataBeamApp {
                         } else {
                             pulsing_progress_bar(ui, self.animation_time, accent);
                         }
-                        if let Some(raw) = &self.latest_cli_progress_line {
-                            ui.add_space(3.0);
-                            ui.label(RichText::new(raw).monospace().size(10.0).color(TEXT_MUTED));
-                        }
                         let pct_text = format!("{:>5.1}%", effective_progress * 100.0);
                         ui.horizontal_wrapped(|ui| match self.transfer_phase {
                             TransferPhase::Preparing
@@ -3965,10 +4046,6 @@ impl DataBeamApp {
                                 );
                             }
                         });
-                        if let Some(raw) = &self.latest_cli_progress_line {
-                            ui.add_space(3.0);
-                            ui.label(RichText::new(raw).monospace().size(10.0).color(TEXT_MUTED));
-                        }
                     }
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {

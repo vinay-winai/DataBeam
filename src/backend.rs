@@ -18,9 +18,9 @@ use sendme_native::{
     check_and_export_local_in as native_check_and_export_local_in,
     download as native_sendme_download,
     has_any_local_ticket_on_disk as native_has_any_local_ticket_on_disk,
-    scan_for_local_ticket as native_scan_for_local_ticket,
     local_ticket_exists_on_disk as native_local_ticket_exists_on_disk,
     start_share as native_sendme_start_share,
+    cleanup_sendme_receive_artifacts_for_ticket as native_cleanup_sendme_receive_artifacts_for_ticket,
     AddrInfoOptions as NativeAddrInfoOptions, AppHandle as NativeSendmeAppHandle,
     EventEmitter as NativeSendmeEventEmitter, ReceiveOptions as NativeReceiveOptions,
     RelayModeOption as NativeRelayModeOption, SendOptions as NativeSendOptions,
@@ -578,6 +578,7 @@ pub struct CrocSendOptions {
 pub struct CrocReceiveOptions {
     pub code: String,
     pub output_dir: Option<PathBuf>,
+    pub overwrite: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -590,6 +591,7 @@ pub struct SendmeSendOptions {
 pub struct SendmeReceiveOptions {
     pub ticket: String,
     pub output_dir: Option<PathBuf>,
+    pub overwrite: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -816,20 +818,15 @@ fn format_sender_request_bar(done: u64, total: u64, width: usize) -> String {
 }
 
 fn format_sender_request_line(state: &SenderRequestRenderState) -> String {
-    let spinner = match (state.done_bytes / (256 * 1024)).wrapping_rem(4) {
+    let _spinner = match (state.done_bytes / (256 * 1024)).wrapping_rem(4) {
         0 => '-',
         1 => '\\',
         2 => '|',
         _ => '/',
     };
     format!(
-        "n {} r {}/{} i {} # {}{} [{}] [{}] {}/{}",
-        state.endpoint_id,
-        state.connection_id,
-        state.request_id,
-        state.item_index,
+        "{} [{}]  [{}] {}/{}",
         state.hash_short,
-        spinner,
         format_elapsed_precise(state.started_at.elapsed()),
         format_sender_request_bar(state.done_bytes, state.total_bytes, 36),
         format_size_unit(state.done_bytes),
@@ -1053,7 +1050,9 @@ pub fn croc_receive(
         // (passing code as CLI arg is no longer supported in non-classic mode)
         cmd.env("CROC_SECRET", &opts.code);
         cmd.arg("--yes");
-        cmd.arg("--overwrite"); // auto-resume interrupted downloads without y/N prompt
+        if opts.overwrite {
+            cmd.arg("--overwrite"); // auto-resume interrupted downloads without y/N prompt
+        }
 
         if let Some(dir) = &opts.output_dir {
             cmd.arg("--out").arg(dir);
@@ -1626,6 +1625,7 @@ pub fn sendme_receive(
                 magic_ipv4_addr: None,
                 magic_ipv6_addr: None,
                 blob_dir: None,
+                overwrite: opts.overwrite,
             },
             app_handle,
         ));
@@ -1757,9 +1757,10 @@ pub fn sendme_check_local(
 
         let ticket = opts.ticket.clone();
         let output_dir = opts.output_dir.clone();
+        let overwrite = opts.overwrite;
         let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<()>();
         let task = runtime.spawn(async move {
-            native_check_and_export_local_in(&ticket, output_dir, app_handle, None, Some(abort_rx)).await
+            native_check_and_export_local_in(&ticket, output_dir, app_handle, None, overwrite, Some(abort_rx)).await
         });
 
         // Forward events to the transfer channel while task runs
@@ -1826,148 +1827,21 @@ pub fn sendme_check_local(
     (rx, ProcessHandle { cancel, child_pid })
 }
 
-/// Cheap synchronous check: are there any blob dirs on disk that have a `ticket.txt`?
-/// Used only for the UI badge — does not spin up a Tokio runtime.
-pub fn scan_for_local_ticket(extra_blob_dir: Option<&Path>) -> Vec<String> {
-    native_scan_for_local_ticket(extra_blob_dir)
-}
+
 
 pub fn sendme_has_local_blob(ticket_str: &str) -> bool {
     native_local_ticket_exists_on_disk(ticket_str)
+}
+
+pub fn cleanup_sendme_receive_artifacts_for_ticket(ticket_str: &str) {
+    native_cleanup_sendme_receive_artifacts_for_ticket(ticket_str)
 }
 
 pub fn local_ticket_exists_on_disk() -> bool {
     native_has_any_local_ticket_on_disk(None)
 }
 
-/// Scans disk for the first complete blob whose `ticket.txt` passes integrity checks,
-/// then exports it directly. Sends `Completed` on success or `blobs-incomplete` if nothing found.
-pub fn sendme_scan_and_export_local(
-    output_dir: Option<std::path::PathBuf>,
-) -> (mpsc::Receiver<TransferMsg>, ProcessHandle) {
-    let (tx, rx) = mpsc::channel();
-    let cancel = Arc::new(AtomicBool::new(false));
-    let cancel2 = cancel.clone();
-    let child_pid = Arc::new(std::sync::Mutex::new(None));
 
-    let _worker = thread::spawn(move || {
-        let _ = tx.send(TransferMsg::Started);
-        let runtime = match tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => {
-                let _ = tx.send(TransferMsg::Error(format!("Failed to create runtime: {}", e)));
-                return;
-            }
-        };
-
-        let (evt_tx, evt_rx) = mpsc::channel::<NativeSendmeEvent>();
-        let app_handle: NativeSendmeAppHandle =
-            Some(Arc::new(NativeSendmeEmitter::new(evt_tx)));
-
-        let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<()>();
-        // Using Arc/Mutex just to allow the sync loop to share ownership if we had to send it over multiple iterations, 
-        // but inside this worker thread we only need to pass one channel if there's only one successful match.
-        // Actually since we loop through tickets and await each one, we can just instantiate the abort token
-        // inside the loop, or better yet, since the UI cancel cancels the whole background thread, 
-        // we can share an Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>> to abort the active one.
-        let active_abort_tx: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>> = Arc::new(std::sync::Mutex::new(None));
-        let active_abort_tx_clone = active_abort_tx.clone();
-
-        let task = runtime.spawn(async move {
-            // Find ALL valid ticket.txt on disk (O(1) operation).
-            let tickets = native_scan_for_local_ticket(None);
-            if tickets.is_empty() {
-                return Ok::<bool, Box<dyn std::error::Error + Send + Sync>>(false);
-            }
-            // Export the first one that is complete.
-            for ticket in tickets {
-                let (tx_inner, rx_inner) = tokio::sync::oneshot::channel::<()>();
-                {
-                    let mut lock = active_abort_tx_clone.lock().unwrap();
-                    *lock = Some(tx_inner);
-                }
-                
-                let success = native_check_and_export_local_in(
-                    &ticket,
-                    output_dir.clone(),
-                    app_handle.clone(),
-                    None,
-                    Some(rx_inner)
-                )
-                .await.unwrap_or(false);
-                
-                if success {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        });
-
-        // Forward events while waiting — use recv_timeout to avoid CPU spin.
-        loop {
-            if cancel2.load(Ordering::Relaxed) {
-                // Send abort signal if active export is running
-                if let Ok(mut lock) = active_abort_tx.lock() {
-                    if let Some(tx) = lock.take() {
-                        let _ = tx.send(());
-                    }
-                }
-                task.abort();
-                let _ = tx.send(TransferMsg::Error("Transfer cancelled".to_string()));
-                return;
-            }
-            match evt_rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(NativeSendmeEvent::ReceiveStarted) => {
-                    let _ = tx.send(TransferMsg::Output("[Local] Exporting from local cache...".to_string()));
-                }
-                Ok(NativeSendmeEvent::ReceiveExportStarted) => {
-                    let _ = tx.send(TransferMsg::Output("[Local] Writing files to disk...".to_string()));
-                }
-                Ok(NativeSendmeEvent::ReceiveExportProgress { done, total }) => {
-                    let _ = tx.send(TransferMsg::Output(format!(
-                        "[Local] Writing... {} / {}",
-                        format_size_unit(done),
-                        format_size_unit(total.max(done).max(1))
-                    )));
-                    if total > 0 {
-                        let _ = tx.send(TransferMsg::Progress(
-                            (done as f32 / total as f32).clamp(0.0, 1.0),
-                        ));
-                    }
-                }
-                Ok(NativeSendmeEvent::ReceiveCompleted) => {
-                    let _ = tx.send(TransferMsg::Progress(1.0));
-                }
-                _ => {}
-            }
-            if task.is_finished() {
-                break;
-            }
-        }
-
-        let result = runtime.block_on(async { task.await });
-        match result {
-            Ok(Ok(true)) => {
-                let _ = tx.send(TransferMsg::Progress(1.0));
-                let _ = tx.send(TransferMsg::Completed);
-            }
-            Ok(Ok(false)) => {
-                let _ = tx.send(TransferMsg::Error("blobs-incomplete".to_string()));
-            }
-            Ok(Err(e)) => {
-                let _ = tx.send(TransferMsg::Error(format!("{e}")));
-            }
-            Err(e) => {
-                let _ = tx.send(TransferMsg::Error(format!("Scan task failed: {e}")));
-            }
-        }
-    });
-
-    (rx, ProcessHandle { cancel, child_pid })
-}
 
 
 fn parse_croc_output(line: &str, tx: &mpsc::Sender<TransferMsg>) {
