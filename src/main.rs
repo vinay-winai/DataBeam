@@ -2347,25 +2347,8 @@ impl DataBeamApp {
             self.receive_overwrite_prompt = false;
             
             if approved {
-                if self.selected_tool == SelectedTool::Croc {
-                    if let Some(handle) = &self.transfer_handle {
-                        handle.send_input("y\n".to_string());
-                    } else {
-                        // Restart with overwrite if the process died
-                        self.croc_overwrite = true;
-                        self.retry_receive(false);
-                    }
-                } else {
-                    self.sendme_overwrite_approved = true;
-                    self.retry_receive(false);
-                }
-            } else if close_modal && !approved {
-                // If user cancelled, send 'n' to croc to let it exit/skip if still running
-                if self.selected_tool == SelectedTool::Croc {
-                    if let Some(handle) = &self.transfer_handle {
-                        handle.send_input("n\n".to_string());
-                    }
-                }
+                self.sendme_overwrite_approved = true;
+                self.retry_receive(false);
             }
         }
     }
@@ -3845,7 +3828,7 @@ impl DataBeamApp {
     }
 
     fn show_transfer_status(&mut self, ui: &mut egui::Ui) {
-        let mut wants_cancel = false;
+        let wants_cancel = false;
         let mut wants_show_qr = false;
 
         card_frame(ui, |ui| {
