@@ -3464,6 +3464,7 @@ impl DataBeamApp {
 
                 ui.add_enabled_ui(enabled, |ui| {
                     if accent_button(ui, &label, color).clicked() {
+                        self.sendme_overwrite_approved = false;
                         self.start_send(false);
                     }
                 });
@@ -3486,6 +3487,7 @@ impl DataBeamApp {
                     .clicked()
                 {
                     self.reset_transfer();
+                    self.sendme_overwrite_approved = false;
                 }
             }
             TransferState::Failed(_) => {
@@ -3495,12 +3497,14 @@ impl DataBeamApp {
                     let accent = self.engine_color();
                     if accent_button_sized(ui, "🔄 Retry", accent, Vec2::new(100.0, 32.0)).clicked()
                     {
+                        self.sendme_overwrite_approved = false;
                         self.retry_send(false);
                     }
                     if accent_button_sized(ui, "🆕 New", accent, Vec2::new(100.0, 32.0)).clicked()
                     {
                         self.reset_transfer();
                         self.send_items.clear();
+                        self.sendme_overwrite_approved = false;
                     }
                 });
             }
@@ -3752,6 +3756,7 @@ impl DataBeamApp {
                     SelectedTool::EazySendme => (EAZYSENDME_COLOR, "⚡ Receive"),
                 };
                 if accent_button(ui, label, color).clicked() {
+                    self.sendme_overwrite_approved = false;
                     self.start_receive(false);
                 }
             }
@@ -3772,6 +3777,7 @@ impl DataBeamApp {
                     {
                         self.reset_transfer();
                         self.receive_code.clear();
+                        self.sendme_overwrite_approved = false;
                     }
                     if let Some(dir) = self.effective_receive_folder() {
                         if accent_button_sized(
@@ -3796,6 +3802,7 @@ impl DataBeamApp {
                     {
                         self.reset_transfer();
                         self.receive_code.clear();
+                        self.sendme_overwrite_approved = false;
                     }
                     if accent_button_sized(
                         ui,
@@ -3805,6 +3812,7 @@ impl DataBeamApp {
                     )
                     .clicked()
                     {
+                        self.sendme_overwrite_approved = false;
                         self.retry_receive(false);
                     }
                 });
