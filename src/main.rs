@@ -114,13 +114,8 @@ struct UserSettings {
     /// Persisted so local-blob retry works even after app restart or reset_transfer.
     #[serde(default)]
     eazysendme_code_ticket_map: HashMap<String, EazyCacheEntry>,
-    #[serde(default = "default_false")]
-    croc_overwrite: bool,
 }
 
-fn default_false() -> bool {
-    false
-}
 
 fn default_true() -> bool {
     true
@@ -153,7 +148,6 @@ struct DataBeamApp {
     receive_output_dir: Option<PathBuf>,
     receive_overwrite_prompt: bool,
     sendme_overwrite_approved: bool,
-    croc_overwrite: bool,
 
     // Transfer
     transfer_state: TransferState,
@@ -255,7 +249,6 @@ impl Default for DataBeamApp {
             receive_output_dir: None,
             receive_overwrite_prompt: false,
             sendme_overwrite_approved: false,
-            croc_overwrite: false,
             transfer_state: TransferState::Idle,
             transfer_progress: 0.0,
             transfer_code: None,
@@ -444,7 +437,6 @@ impl DataBeamApp {
             map = map.into_iter().take(20).collect();
         }
         self.eazysendme_code_ticket_map = map;
-        self.croc_overwrite = settings.croc_overwrite;
     }
 
     fn persist_user_settings(&self) {
@@ -468,7 +460,6 @@ impl DataBeamApp {
             croc_custom_code: self.croc_custom_code.clone(),
             croc_use_custom_code: self.croc_use_custom_code,
             eazysendme_code_ticket_map: self.eazysendme_code_ticket_map.clone(),
-            croc_overwrite: self.croc_overwrite,
         };
         if let Ok(json) = serde_json::to_string_pretty(&settings) {
             let _ = fs::write(path, json);
@@ -684,7 +675,6 @@ impl DataBeamApp {
         self.sendme_stream_last_total = None;
         self.sendme_sender_payload_complete = false;
         self.last_done_speed_sample = None;
-        self.croc_overwrite = false;
     }
 
     fn mark_sendme_sender_waiting(&mut self) {
@@ -767,6 +757,13 @@ impl DataBeamApp {
     }
 
     fn fail_transfer(&mut self, e: String) {
+        // Don't let generic cancellation message overwrite a more specific error already set.
+        if e == "Transfer cancelled" {
+            if let TransferState::Failed(_) = self.transfer_state {
+                return;
+            }
+        }
+
         // "blobs-incomplete" is a sentinel from sendme_check_local: it means the blob store
         // check found the data is not fully cached locally. Immediately fall through to the
         // full Croc receive path without charging a retry or waiting.
@@ -790,11 +787,19 @@ impl DataBeamApp {
 
         if is_file_exists_error {
             self.eazy_retry_count = 0;
-            self.receive_overwrite_prompt = true;
-            self.transfer_state = TransferState::Idle;
-            self.transfer_log.push("File conflict detected. Waiting for overwrite confirmation...".to_string());
-            // Intentionally not marking end_time so we can cleanly retry from Idle
-            // Or we could leave it as Failed. Let's make it Idle so the Retry button isn't the primary action.
+            if self.selected_tool == SelectedTool::Croc {
+                self.transfer_state = TransferState::Failed("The file/folder you intended to download has the same name as another item at the destination. Rename that item and try a new transfer.".to_string());
+            } else {
+                self.receive_overwrite_prompt = true;
+                self.transfer_state = TransferState::Idle;
+                self.transfer_log.push("File conflict detected. Waiting for overwrite confirmation...".to_string());
+            }
+            return;
+        }
+
+        if e == "conflict-detected" {
+            self.eazy_retry_count = 0;
+            self.transfer_state = TransferState::Failed("The file/folder you intended to download has the same name as another item at the destination. Rename that item and try a new transfer.".to_string());
             return;
         }
 
@@ -2135,7 +2140,6 @@ impl DataBeamApp {
                 let opts = CrocReceiveOptions {
                     code: self.receive_code.trim().to_string(),
                     output_dir: self.receive_output_dir.clone(),
-                    overwrite: self.croc_overwrite,
                 };
                 let (rx, handle) = croc_receive(opts, &binary);
                 self.transfer_rx = Some(rx);
@@ -2193,7 +2197,6 @@ impl DataBeamApp {
                 let opts = CrocReceiveOptions {
                     code: code_key,
                     output_dir: None, 
-                    overwrite: self.croc_overwrite,
                 };
                 let (rx, handle) = croc_receive(opts, &binary);
                 self.transfer_rx = Some(rx);
@@ -3672,18 +3675,6 @@ impl DataBeamApp {
                     }
                 });
             });
-            
-            if self.selected_tool == SelectedTool::Croc {
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.checkbox(
-                        &mut self.croc_overwrite,
-                        RichText::new("Automatically overwrite existing files (--overwrite)").size(11.0),
-                    ).changed() {
-                        self.persist_user_settings();
-                    }
-                });
-            }
         });
         if self.selected_tool == SelectedTool::Croc {
             let text = self

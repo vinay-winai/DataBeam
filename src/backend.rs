@@ -578,7 +578,6 @@ pub struct CrocSendOptions {
 pub struct CrocReceiveOptions {
     pub code: String,
     pub output_dir: Option<PathBuf>,
-    pub overwrite: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -839,7 +838,7 @@ fn format_sender_request_line(state: &SenderRequestRenderState) -> String {
 fn read_lines_cr_aware(
     reader: impl Read + Send + 'static,
     tx: mpsc::Sender<TransferMsg>,
-    parser: fn(&str, &mpsc::Sender<TransferMsg>),
+    parser: fn(&str, &mpsc::Sender<TransferMsg>, &Arc<AtomicBool>),
     cancel: Arc<AtomicBool>,
 ) {
     let mut reader = BufReader::new(reader);
@@ -856,7 +855,7 @@ fn read_lines_cr_aware(
                 if byte[0] == b'\n' || byte[0] == b'\r' {
                     if !buf.is_empty() {
                         let line = String::from_utf8_lossy(&buf).to_string();
-                        parser(&line, &tx);
+                        parser(&line, &tx, &cancel);
                         buf.clear();
                     }
                 } else {
@@ -868,7 +867,7 @@ fn read_lines_cr_aware(
     }
     if !buf.is_empty() {
         let line = String::from_utf8_lossy(&buf).to_string();
-        parser(&line, &tx);
+        parser(&line, &tx, &cancel);
     }
 }
 
@@ -881,7 +880,7 @@ fn run_sendme_with_pty(
     tx: &mpsc::Sender<TransferMsg>,
     cancel: Arc<AtomicBool>,
     pid_handle: Arc<std::sync::Mutex<Option<u32>>>,
-    parser: fn(&str, &mpsc::Sender<TransferMsg>),
+    parser: fn(&str, &mpsc::Sender<TransferMsg>, &Arc<AtomicBool>),
 ) -> Result<(bool, String), String> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -1050,9 +1049,6 @@ pub fn croc_receive(
         // (passing code as CLI arg is no longer supported in non-classic mode)
         cmd.env("CROC_SECRET", &opts.code);
         cmd.arg("--yes");
-        if opts.overwrite {
-            cmd.arg("--overwrite"); // auto-resume interrupted downloads without y/N prompt
-        }
 
         if let Some(dir) = &opts.output_dir {
             cmd.arg("--out").arg(dir);
@@ -1844,10 +1840,17 @@ pub fn get_sendme_blob_directory_size(ticket_str: &str) -> u64 {
 
 
 
-fn parse_croc_output(line: &str, tx: &mpsc::Sender<TransferMsg>) {
+fn parse_croc_output(line: &str, tx: &mpsc::Sender<TransferMsg>, cancel: &Arc<AtomicBool>) {
     let cleaned = strip_ansi(line);
     let trimmed = cleaned.trim();
     if trimmed.is_empty() {
+        return;
+    }
+
+    let lower = trimmed.to_lowercase();
+    if lower.starts_with("overwrite") || lower.contains("use --overwrite") {
+        let _ = tx.send(TransferMsg::Error("conflict-detected".to_string()));
+        cancel.store(true, Ordering::Relaxed);
         return;
     }
 
@@ -1930,7 +1933,7 @@ fn parse_sendme_common(line: &str, tx: &mpsc::Sender<TransferMsg>) -> Option<(St
 }
 
 #[allow(dead_code)]
-fn parse_sendme_send_output(line: &str, tx: &mpsc::Sender<TransferMsg>) {
+fn parse_sendme_send_output(line: &str, tx: &mpsc::Sender<TransferMsg>, _cancel: &Arc<AtomicBool>) {
     let Some((trimmed, lower)) = parse_sendme_common(line, tx) else {
         return;
     };
@@ -1954,7 +1957,7 @@ fn parse_sendme_send_output(line: &str, tx: &mpsc::Sender<TransferMsg>) {
 }
 
 #[allow(dead_code)]
-fn parse_sendme_receive_output(line: &str, tx: &mpsc::Sender<TransferMsg>) {
+fn parse_sendme_receive_output(line: &str, tx: &mpsc::Sender<TransferMsg>, _cancel: &Arc<AtomicBool>) {
     let cleaned = strip_ansi(line);
     let trimmed = cleaned.trim();
     if trimmed.is_empty() {
