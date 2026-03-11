@@ -3541,9 +3541,14 @@ impl DataBeamApp {
                     if let Some(tick) = ticket_to_check {
                         let disk_size = crate::backend::get_sendme_blob_directory_size(&tick);
                         if let Some(entry) = self.eazysendme_code_ticket_map.get(&code_key) {
-                           if entry.payload_size > 0 && disk_size >= entry.payload_size {
+                           // If we have a payload size, respect it. 
+                           // If not (first time seeing this code), if we have SOME disk size, assume we have a cache.
+                           if (entry.payload_size > 0 && disk_size >= entry.payload_size) || (entry.payload_size == 0 && disk_size > 0) {
                                has_cached = true;
                            }
+                        } else if disk_size > 0 {
+                           // Folder exists but not in our current map session? Still show as cached.
+                           has_cached = true;
                         }
                     }
                 }

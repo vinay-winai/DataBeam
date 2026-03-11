@@ -276,7 +276,7 @@ pub async fn download(
                 let name = if attempt == 1 {
                     dir_component.to_string()
                 } else {
-                    format!("{}_{}", attempt, dir_component)
+                    format!("{}_{}", attempt - 1, dir_component)
                 };
                 
                 let check_path = output_dir_base.join(&name);
@@ -330,8 +330,6 @@ pub async fn download(
         }
     };
 
-    let _ = tokio::fs::remove_dir_all(&iroh_data_dir).await;
-
     Ok(ReceiveResult {
         message: format!("Downloaded {} files, {} bytes", total_files, payload_size),
         file_path: output_dir,
@@ -347,6 +345,15 @@ async fn export(
 ) -> anyhow::Result<()> {
     // Ensure the output directory exists
     tokio::fs::create_dir_all(output_dir).await?;
+
+    // Write the signature hash BEFORE starting the export loop
+    // This serves as the 'Smart Overwrite' fingerprint
+    let signature_path = output_dir.join("databeam_hash.txt");
+    if let Err(e) = tokio::fs::write(&signature_path, content_hash.as_bytes()).await {
+        tracing::error!("Failed to write smart-overwrite signature to {}: {}", signature_path.display(), e);
+    } else {
+        tracing::info!("Wrote smart-overwrite signature to {}", signature_path.display());
+    }
 
     for (_i, (name, hash)) in collection.iter().enumerate() {
         // The sender always wraps items in a 'databeam_' folder.
@@ -446,14 +453,6 @@ async fn export(
             anyhow::bail!("error exporting {}: {}", name, err);
         }
     }
-
-    // Write the signature hash (temporarily) so the receiver can detect it
-    // then delete it after we are done
-    let signature_path = output_dir.join("databeam_hash.txt");
-    let _ = tokio::fs::write(&signature_path, content_hash.as_bytes()).await;
-    
-    // We actually delete it immediately after successful write to keep folder clean as requested
-    let _ = tokio::fs::remove_file(&signature_path).await;
 
     Ok(())
 }
@@ -598,7 +597,7 @@ pub async fn check_and_export_local_in(
             let name = if attempt == 1 {
                 dir_component.to_string()
             } else {
-                format!("{}_{}", attempt, dir_component)
+                format!("{}_{}", attempt - 1, dir_component)
             };
             
             let check_path = output_dir.join(&name);
