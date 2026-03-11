@@ -261,12 +261,20 @@ pub async fn download(
             dirs::download_dir().unwrap_or_else(|| std::env::current_dir().unwrap())
         });
         
-        // Prevent overwriting existing files if the overwrite flag is false
-        if !options.overwrite {
-            for (name, _) in collection.iter() {
-                let target = get_export_path(&output_dir, name)?;
-                if target.exists() {
+        // Prevent overwriting existing files if the overwrite flag is false.
+        // Special case: "databeam_*" folders are app-managed and safe to auto-overwrite.
+        for (name, _) in collection.iter() {
+            let target = get_export_path(&output_dir, name)?;
+            if target.exists() {
+                if !options.overwrite && !name.starts_with("databeam_") {
                     anyhow::bail!("file already exists");
+                }
+                // If we are proceeding (either overwrite=true or databeam_*), 
+                // we must remove the existing item so the export can succeed.
+                if target.is_dir() {
+                    let _ = tokio::fs::remove_dir_all(&target).await;
+                } else {
+                    let _ = tokio::fs::remove_file(&target).await;
                 }
             }
         }
@@ -526,7 +534,7 @@ pub async fn check_and_export_local_in(
     for name in &file_names {
         if let Ok(target) = get_export_path(&output_dir, name) {
             if target.exists() {
-                if !overwrite {
+                if !overwrite && !name.starts_with("databeam_") {
                     anyhow::bail!("file already exists");
                 }
                 if target.is_dir() {

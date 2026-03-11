@@ -146,8 +146,6 @@ struct DataBeamApp {
     // Receive
     receive_code: String,
     receive_output_dir: Option<PathBuf>,
-    receive_overwrite_prompt: bool,
-    sendme_overwrite_approved: bool,
 
     // Transfer
     transfer_state: TransferState,
@@ -247,8 +245,6 @@ impl Default for DataBeamApp {
             croc_text_value: String::new(),
             receive_code: String::new(),
             receive_output_dir: None,
-            receive_overwrite_prompt: false,
-            sendme_overwrite_approved: false,
             transfer_state: TransferState::Idle,
             transfer_progress: 0.0,
             transfer_code: None,
@@ -753,7 +749,6 @@ impl DataBeamApp {
         self.eazy_next_retry_time = None;
         self.transfer_end_time = Some(self.animation_time);
         self.transfer_state = TransferState::Failed("Transfer cancelled".to_string());
-        self.sendme_overwrite_approved = false;
     }
 
     fn fail_transfer(&mut self, e: String) {
@@ -793,10 +788,6 @@ impl DataBeamApp {
             self.eazy_retry_count = 0;
             if self.selected_tool == SelectedTool::Croc {
                 self.transfer_state = TransferState::Failed("The file/folder you intended to download has the same name as another item at the destination. Rename that item and try a new transfer.".to_string());
-            } else {
-                self.receive_overwrite_prompt = true;
-                self.transfer_state = TransferState::Idle;
-                self.transfer_log.push("File conflict detected. Waiting for overwrite confirmation...".to_string());
             }
             return;
         }
@@ -2153,7 +2144,7 @@ impl DataBeamApp {
                 let opts = SendmeReceiveOptions {
                     ticket: self.receive_code.trim().to_string(),
                     output_dir: self.receive_output_dir.clone(),
-                    overwrite: self.sendme_overwrite_approved,
+                    overwrite: false,
                 };
                 let (rx, handle) = sendme_receive(opts, &binary);
                 self.transfer_rx = Some(rx);
@@ -2185,7 +2176,7 @@ impl DataBeamApp {
                         let opts = SendmeReceiveOptions {
                             ticket,
                             output_dir: self.receive_output_dir.clone(),
-                            overwrite: self.sendme_overwrite_approved,
+                            overwrite: false,
                         };
                         let (rx, handle) = sendme_check_local(opts);
                         self.transfer_rx = Some(rx);
@@ -2314,49 +2305,6 @@ impl DataBeamApp {
         }
         if self.cleanup_prompt_open {
             self.render_cleanup_popup(ctx);
-        }
-        if self.receive_overwrite_prompt {
-             self.render_overwrite_popup(ctx);
-        }
-    }
-
-    fn render_overwrite_popup(&mut self, ctx: &egui::Context) {
-        let mut open = self.receive_overwrite_prompt;
-        if !open {
-            return;
-        }
-        let mut close_modal = false;
-        let mut approved = false;
-        
-        egui::Window::new("File Conflict Warning")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.label("Existing files were found in the destination folder.");
-                ui.add_space(8.0);
-                ui.label(RichText::new("Would you like to retry the transfer and overwrite the existing files?").strong());
-                
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    if accent_button_sized(ui, "Yes, Overwrite", Color32::from_rgb(200, 60, 60), Vec2::new(120.0, 32.0)).clicked() {
-                        approved = true;
-                        close_modal = true;
-                    }
-                    if ui.add_sized([80.0, 32.0], egui::Button::new("Cancel")).clicked() {
-                        close_modal = true;
-                    }
-                });
-            });
-            
-        if !open || close_modal {
-            self.receive_overwrite_prompt = false;
-            
-            if approved {
-                self.sendme_overwrite_approved = true;
-                self.retry_receive(false);
-            }
         }
     }
 
@@ -3478,7 +3426,6 @@ impl DataBeamApp {
 
                 ui.add_enabled_ui(enabled, |ui| {
                     if accent_button(ui, &label, color).clicked() {
-                        self.sendme_overwrite_approved = false;
                         self.start_send(false);
                     }
                 });
@@ -3501,7 +3448,6 @@ impl DataBeamApp {
                     .clicked()
                 {
                     self.reset_transfer();
-                    self.sendme_overwrite_approved = false;
                 }
             }
             TransferState::Failed(_) => {
@@ -3511,14 +3457,12 @@ impl DataBeamApp {
                     let accent = self.engine_color();
                     if accent_button_sized(ui, "🔄 Retry", accent, Vec2::new(100.0, 32.0)).clicked()
                     {
-                        self.sendme_overwrite_approved = false;
                         self.retry_send(false);
                     }
                     if accent_button_sized(ui, "🆕 New", accent, Vec2::new(100.0, 32.0)).clicked()
                     {
                         self.reset_transfer();
                         self.send_items.clear();
-                        self.sendme_overwrite_approved = false;
                     }
                 });
             }
@@ -3758,7 +3702,6 @@ impl DataBeamApp {
                     SelectedTool::EazySendme => (EAZYSENDME_COLOR, "⚡ Receive"),
                 };
                 if accent_button(ui, label, color).clicked() {
-                    self.sendme_overwrite_approved = false;
                     self.start_receive(false);
                 }
             }
@@ -3779,7 +3722,6 @@ impl DataBeamApp {
                     {
                         self.reset_transfer();
                         self.receive_code.clear();
-                        self.sendme_overwrite_approved = false;
                     }
                     if let Some(dir) = self.effective_receive_folder() {
                         if accent_button_sized(
@@ -3804,7 +3746,6 @@ impl DataBeamApp {
                     {
                         self.reset_transfer();
                         self.receive_code.clear();
-                        self.sendme_overwrite_approved = false;
                     }
                     if accent_button_sized(
                         ui,
@@ -3814,7 +3755,6 @@ impl DataBeamApp {
                     )
                     .clicked()
                     {
-                        self.sendme_overwrite_approved = false;
                         self.retry_receive(false);
                     }
                 });
