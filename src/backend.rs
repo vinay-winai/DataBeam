@@ -961,22 +961,22 @@ pub fn croc_send(
         if let Some(code) = &opts.custom_code {
             cmd.env("CROC_SECRET", code);
         }
-        let mut _staging_holder = None;
+        let mut _staging_holder: Option<PathBuf> = None;
         if opts.text_mode {
             cmd.arg("--text");
             if let Some(text) = &opts.text_value {
                 cmd.arg(text);
             }
         } else {
-            let (send_path, staging) = match create_staging_dir(&opts.paths) {
-                Ok((path, dir)) => (path, dir),
+            let send_path = match create_staging_dir(&opts.paths) {
+                Ok(path) => path,
                 Err(e) => {
                     let _ = tx.send(TransferMsg::Error(format!("Failed to stage files: {}", e)));
                     return;
                 }
             };
             cmd.arg(&send_path);
-            _staging_holder = Some(staging);
+            // No _staging_holder needed as we use deterministic directories in Temp
         }
 
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -1149,7 +1149,7 @@ pub fn sendme_send(
 
     let _worker = thread::spawn(move || {
         let (send_path, _staging_dir_path) = match create_staging_dir(&opts.paths) {
-            Ok(path) => (path, None), // We keep path, but we don't have a TempDir object anymore as it's deterministic
+            Ok(path) => (path, None::<PathBuf>), // We keep path, but we don't have a TempDir object anymore as it's deterministic
             Err(e) => {
                 let _ = tx.send(TransferMsg::Error(format!("Failed to stage files: {}", e)));
                 return;
@@ -2137,7 +2137,9 @@ mod tests {
         parse_sendme_send_output, sendme_send, SendmeSendOptions, TransferMsg,
     };
     use std::fs;
-    use std::sync::mpsc;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -2207,7 +2209,8 @@ mod tests {
     #[test]
     fn sendme_send_parser_marks_finished_sending_as_disconnected() {
         let (tx, rx) = mpsc::channel();
-        parse_sendme_send_output("finished sending to client", &tx);
+        let cancel = Arc::new(AtomicBool::new(false));
+        parse_sendme_send_output("finished sending to client", &tx, &cancel);
 
         let mut saw_disconnect = false;
         for _ in 0..4 {
@@ -2230,7 +2233,8 @@ mod tests {
     #[test]
     fn sendme_send_parser_marks_client_disconnected_as_disconnected() {
         let (tx, rx) = mpsc::channel();
-        parse_sendme_send_output("client disconnected", &tx);
+        let cancel = Arc::new(AtomicBool::new(false));
+        parse_sendme_send_output("client disconnected", &tx, &cancel);
 
         let mut saw_disconnect = false;
         for _ in 0..4 {
@@ -2253,7 +2257,8 @@ mod tests {
     #[test]
     fn sendme_send_parser_emits_waiting_for_receiver_signal() {
         let (tx, rx) = mpsc::channel();
-        parse_sendme_send_output("waiting for incoming transfer", &tx);
+        let cancel = Arc::new(AtomicBool::new(false));
+        parse_sendme_send_output("waiting for incoming transfer", &tx, &cancel);
 
         let mut saw_waiting = false;
         for _ in 0..6 {
@@ -2276,9 +2281,11 @@ mod tests {
     #[test]
     fn sendme_send_parser_emits_sender_transfer_activity() {
         let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
         parse_sendme_send_output(
             "[3/4] Uploading ... [00:03] [###>---] 300.00 MiB/600.00 MiB 10.00 MiB/s",
             &tx,
+            &cancel,
         );
 
         let mut saw_activity = false;
@@ -2302,9 +2309,11 @@ mod tests {
     #[test]
     fn sendme_receive_parser_emits_high_frequency_noise_lines() {
         let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
         parse_sendme_receive_output(
             "n 99549f9de3 r 31724666896/0 i 474 # f9ffee9093 [] 8 B/8 B",
             &tx,
+            &cancel,
         );
 
         match rx.try_recv() {
@@ -2316,7 +2325,8 @@ mod tests {
     #[test]
     fn sendme_receive_parser_marks_downloaded_files_as_completed() {
         let (tx, rx) = mpsc::channel();
-        parse_sendme_receive_output("downloaded 7 files, 595.45 MiB. took 5 seconds", &tx);
+        let cancel = Arc::new(AtomicBool::new(false));
+        parse_sendme_receive_output("downloaded 7 files, 595.45 MiB. took 5 seconds", &tx, &cancel);
 
         let mut saw_completed = false;
         for _ in 0..6 {
@@ -2339,7 +2349,8 @@ mod tests {
     #[test]
     fn sendme_receive_parser_emits_error_message_for_error_prefix_line() {
         let (tx, rx) = mpsc::channel();
-        parse_sendme_receive_output("error: ticket not found", &tx);
+        let cancel = Arc::new(AtomicBool::new(false));
+        parse_sendme_receive_output("error: ticket not found", &tx, &cancel);
 
         let mut saw_error = false;
         for _ in 0..6 {

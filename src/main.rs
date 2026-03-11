@@ -1625,7 +1625,7 @@ impl DataBeamApp {
                                             let opts = SendmeReceiveOptions {
                                                 ticket: normalized_ticket,
                                                 output_dir: self.receive_output_dir.clone(),
-                                                overwrite: self.sendme_overwrite_approved,
+                                                overwrite: true, // Smart overwrite is now the default
                                             };
                                             let sendme_binary = self.get_tool_binary(&Tool::Sendme).unwrap_or_default();
                                             let (new_rx, new_handle) = sendme_receive(opts, &sendme_binary);

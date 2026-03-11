@@ -256,15 +256,20 @@ pub async fn download(
             emit_event_with_payload(&app_handle, "receive-file-names", &file_names_json);
         }
 
+        // Determine output directory
+        let output_dir_base = options.output_dir.clone().unwrap_or_else(|| {
+            dirs::download_dir().unwrap_or_else(|| std::env::current_dir().unwrap())
+        });
+
         // 1. Calculate Content Hash (Collection Hash)
         // We use the ticket's data hash as the unique signature for this specific payload.
         let content_hash = ticket.hash().to_hex().to_string();
 
         // 2. Resolve destination with smart incrementing logic
-        let mut final_output_dir = output_dir.to_path_buf();
+        let mut final_output_dir = output_dir_base.to_path_buf();
         if !collection.is_empty() {
-            let root_name = collection.iter().next().unwrap().0;
-            let dir_component = root_name.split('/').next().unwrap_or(root_name);
+            let root_name = collection.iter().next().unwrap().0.clone();
+            let dir_component = root_name.split('/').next().unwrap_or(&root_name);
             
             let mut attempt = 1;
             loop {
@@ -274,7 +279,7 @@ pub async fn download(
                     format!("{}_{}", attempt, dir_component)
                 };
                 
-                let check_path = output_dir.join(&name);
+                let check_path = output_dir_base.join(&name);
                 if !check_path.exists() {
                     final_output_dir = check_path;
                     break;
@@ -303,7 +308,7 @@ pub async fn download(
         // Emit completion event AFTER everything is done
         emit_event(&app_handle, "receive-completed");
 
-        anyhow::Ok((total_files, payload_size, stats, output_dir))
+        anyhow::Ok((total_files, payload_size, stats, final_output_dir))
     };
 
     let (total_files, payload_size, _stats, output_dir) = select! {
@@ -524,7 +529,7 @@ pub async fn check_and_export_local_in(
     output_dir: Option<PathBuf>,
     app_handle: AppHandle,
     blob_dir: Option<PathBuf>,
-    overwrite: bool,
+    _overwrite: bool,
     cancel_token: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> anyhow::Result<bool> {
     let ticket = match BlobTicket::from_str(ticket_str) {
@@ -585,8 +590,8 @@ pub async fn check_and_export_local_in(
     let mut final_output_dir = output_dir.to_path_buf();
     
     if !collection.is_empty() {
-        let root_name = collection.iter().next().unwrap().0;
-        let dir_component = root_name.split('/').next().unwrap_or(root_name);
+        let root_name = collection.iter().next().unwrap().0.clone();
+        let dir_component = root_name.split('/').next().unwrap_or(&root_name);
         
         let mut attempt = 1;
         loop {

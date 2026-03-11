@@ -131,7 +131,7 @@ pub fn get_or_create_secret() -> anyhow::Result<iroh::SecretKey> {
 
     let key = iroh::SecretKey::generate(&mut rand::rng());
     let _ = std::fs::create_dir_all(&data_dir);
-    let _ = std::fs::write(&secret_path, key.to_string());
+    let _ = std::fs::write(&secret_path, hex::encode(key.to_bytes()));
     
     Ok(key)
 }
