@@ -85,9 +85,11 @@ impl SendItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EazyCacheEntry {
-    pub ticket: String,
-    pub payload_size: u64,
+struct EazyCacheEntry {
+    ticket: String,
+    payload_size: u64,
+    #[serde(default)]
+    complete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -428,11 +430,8 @@ impl DataBeamApp {
         self.croc_custom_code = settings.croc_custom_code;
         self.croc_use_custom_code = settings.croc_use_custom_code;
         // Limit map size to 20 entries (keep newest)
-        let mut map = settings.eazysendme_code_ticket_map;
-        if map.len() > 20 {
-            map = map.into_iter().take(20).collect();
-        }
-        self.eazysendme_code_ticket_map = map;
+        // Accept the full map; 20 entries is tiny for JSON anyway.
+        self.eazysendme_code_ticket_map = settings.eazysendme_code_ticket_map;
     }
 
     fn persist_user_settings(&self) {
@@ -726,10 +725,15 @@ impl DataBeamApp {
             let code_key = self.receive_code.trim().to_string();
             let mut sizes_changed = false;
             let t_bytes = self.transfer_total_bytes.unwrap_or(0);
+            let is_finished = self.transfer_progress >= 0.999 || self.transfer_state == TransferState::Completed;
             
             if let Some(entry) = self.eazysendme_code_ticket_map.get_mut(&code_key) {
                 if t_bytes > 0 && entry.payload_size != t_bytes {
                     entry.payload_size = t_bytes;
+                    sizes_changed = true;
+                }
+                if is_finished && !entry.complete {
+                    entry.complete = true;
                     sizes_changed = true;
                 }
             }
@@ -862,11 +866,16 @@ impl DataBeamApp {
             // Persist the in-memory ticket to the map so start_receive can find it.
             if let Some(ticket) = &self.eazysendme_ticket {
                 if !code_key.is_empty() {
-                    let existing_size = self.eazysendme_code_ticket_map.get(&code_key).map(|e| e.payload_size).unwrap_or(0);
+                    let existing_entry = self.eazysendme_code_ticket_map.get(&code_key);
+                    let existing_size = existing_entry.map(|e| e.payload_size).unwrap_or(0);
+                    let existing_complete = existing_entry.map(|e| e.complete).unwrap_or(false);
                     let final_size = self.transfer_total_bytes.unwrap_or(existing_size);
+                    let final_complete = existing_complete || self.transfer_state == TransferState::Completed;
+
                     self.eazysendme_code_ticket_map.insert(code_key, EazyCacheEntry {
                         ticket: ticket.clone(),
                         payload_size: final_size,
+                        complete: final_complete,
                     });
                     self.persist_user_settings();
                 }
@@ -1440,6 +1449,9 @@ impl DataBeamApp {
                                         }
                                     }
                                 }
+                                if p >= 1.0 {
+                                    self.update_eazy_cache_sizes();
+                                }
                             }
                             TransferMsg::Code(code) => {
                                 let should_replace = if is_masked_croc_code(&code) {
@@ -1614,11 +1626,21 @@ impl DataBeamApp {
                                             // works even after reset_transfer clears the ticket.
                                             let code_key = self.receive_code.trim().to_string();
                                             if !code_key.is_empty() {
-                                                let existing_size = self.eazysendme_code_ticket_map.get(&code_key).map(|e| e.payload_size).unwrap_or(0);
+                                                let existing = self.eazysendme_code_ticket_map.get(&code_key);
+                                                let is_new_ticket = existing.map(|e| e.ticket != normalized_ticket).unwrap_or(true);
+                                                
+                                                let (size, complete) = if is_new_ticket {
+                                                    (0, false)
+                                                } else {
+                                                    (existing.map(|e| e.payload_size).unwrap_or(0), 
+                                                     existing.map(|e| e.complete).unwrap_or(false))
+                                                };
+
                                                 self.eazysendme_code_ticket_map
                                                     .insert(code_key, EazyCacheEntry {
                                                         ticket: normalized_ticket.clone(),
-                                                        payload_size: existing_size,
+                                                        payload_size: size,
+                                                        complete,
                                                     });
                                                 self.persist_user_settings();
                                             }
@@ -2101,6 +2123,7 @@ impl DataBeamApp {
         }
 
         self.reset_transfer();
+        self.transfer_code = Some(self.receive_code.trim().to_string());
 
         // Persist receive code into recent history for Croc / EazySendme
         if self.selected_tool == SelectedTool::Croc
@@ -2152,29 +2175,24 @@ impl DataBeamApp {
             }
             SelectedTool::EazySendme => {
                 let code_key = self.receive_code.trim().to_string();
-                let mut ticket_from_cache = None;
-                let mut is_complete = false;
 
                 if let Some(entry) = self.eazysendme_code_ticket_map.get(&code_key) {
                     let disk_size = crate::backend::get_sendme_blob_directory_size(&entry.ticket);
-                    if entry.payload_size > 0 && disk_size >= entry.payload_size {
-                        ticket_from_cache = Some(entry.ticket.clone());
-                        is_complete = true;
-                    } else if crate::backend::sendme_has_local_blob(&entry.ticket) {
-                        // Incomplete blob: User wants to wipe and start fresh Phase 1 (Croc) to get latest ticket.
-                         self.transfer_log.push("[Local] Incomplete local blob found — wiping cache entry to ensure fresh ticket from sender via Croc.".to_string());
-                         self.eazysendme_code_ticket_map.remove(&code_key);
-                         self.persist_user_settings();
-                    }
-                }
+                    
+                    println!("EazyReceive DEBUG: code={} disk={} payload={} complete={}", 
+                        code_key, disk_size, entry.payload_size, entry.complete
+                    );
 
-                if is_complete {
-                    if let Some(ticket) = ticket_from_cache {
+                    // If it's 100% complete, try the direct local export (fast path).
+                    if entry.complete && disk_size > 0 {
                         self.transfer_log
-                            .push("[Local] Cached ticket found and sizes match — checking local blob export"
-                                .to_string());
+                            .push(format!("[Local] Full blobs cached ({} bytes) — exporting directly", disk_size));
+                        
+                        // Set the ticket now to prevent "ghost" Croc restarts later
+                        self.eazysendme_ticket = Some(entry.ticket.clone());
+
                         let opts = SendmeReceiveOptions {
-                            ticket,
+                            ticket: entry.ticket.clone(),
                             output_dir: self.receive_output_dir.clone(),
                             overwrite: false,
                         };
@@ -2185,10 +2203,12 @@ impl DataBeamApp {
                         self.transfer_state = TransferState::Running;
                         self.transfer_start_time = Some(self.animation_time);
                         return;
+                    } else if disk_size > 0 {
+                        self.transfer_log.push(format!("[Local] Partial blobs found ({} bytes) — resuming via network", disk_size));
                     }
                 }
 
-                // Fall back to Phase 1 (Croc) for all other cases (including incomplete or no cache)
+                // Fall back to Phase 1 (Croc)
                 let opts = CrocReceiveOptions {
                     code: code_key,
                     output_dir: None, 
@@ -2474,7 +2494,7 @@ impl eframe::App for DataBeamApp {
                                 let size = dir_size(&path);
                                 for cache in map.values() {
                                     if cache.ticket == ticket_str {
-                                        if cache.payload_size > 0 && size >= cache.payload_size {
+                                        if cache.complete || (cache.payload_size > 0 && size >= cache.payload_size) {
                                             is_incomplete = false; // complete cache entry
                                         }
                                         break;
@@ -3485,10 +3505,12 @@ impl DataBeamApp {
             ui.add_space(3.0);
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("Clear").clicked() {
+                    let running = self.transfer_state == TransferState::Running || self.transfer_state == TransferState::Completed;
+                    if ui.add_enabled(!running, egui::Button::new("Clear").small()).clicked() {
                         self.receive_code.clear();
                     }
-                    ui.add(
+                    ui.add_enabled(
+                        !running,
                         egui::TextEdit::singleline(&mut self.receive_code)
                             .hint_text(hint)
                             .desired_width(ui.available_width())
@@ -3530,39 +3552,61 @@ impl DataBeamApp {
             ui.add_space(3.0);
             if self.selected_tool == SelectedTool::EazySendme {
                 let code_key = self.receive_code.trim().to_string();
-                let mut has_cached = false;
-                if !code_key.is_empty() {
-                    let mut ticket_to_check = self.eazysendme_ticket.clone();
-                    if ticket_to_check.is_none() {
-                        if let Some(entry) = self.eazysendme_code_ticket_map.get(&code_key) {
-                            ticket_to_check = Some(entry.ticket.clone());
-                        }
-                    }
+                let (icon, msg, color) = if !code_key.is_empty() {
+                    let active_ticket = self.eazysendme_ticket.clone();
+                    let active_code = self.transfer_code.as_deref().unwrap_or("").trim();
+                    let is_active = code_key == active_code;
+
+                    let ticket_to_check = if is_active && active_ticket.is_some() {
+                        active_ticket
+                    } else {
+                        self.eazysendme_code_ticket_map.get(&code_key).map(|e| e.ticket.clone())
+                    };
+
+                    let mut is_full = false;
+                    let mut has_cached = false;
                     if let Some(tick) = ticket_to_check {
                         let disk_size = crate::backend::get_sendme_blob_directory_size(&tick);
-                        if let Some(entry) = self.eazysendme_code_ticket_map.get(&code_key) {
-                           // If we have a payload size, respect it. 
-                           // If not (first time seeing this code), if we have SOME disk size, assume we have a cache.
-                           if (entry.payload_size > 0 && disk_size >= entry.payload_size) || (entry.payload_size == 0 && disk_size > 0) {
-                               has_cached = true;
-                           }
-                        } else if disk_size > 0 {
-                           // Folder exists but not in our current map session? Still show as cached.
-                           has_cached = true;
+                        if disk_size > 0 {
+                            has_cached = true;
+                        
+                            let entry = self.eazysendme_code_ticket_map.get(&code_key);
+                            let p_size = if is_active && self.transfer_total_bytes.unwrap_or(0) > 0 {
+                                self.transfer_total_bytes.unwrap_or(0)
+                            } else {
+                                entry.map(|e| e.payload_size).unwrap_or(0)
+                            };
+                            let is_marked_complete = entry.map(|e| e.complete).unwrap_or(false);
+
+                            if is_marked_complete || (p_size > 0 && disk_size >= p_size.saturating_sub(1024)) {
+                                is_full = true;
+                            }
                         }
                     }
-                }
 
-                let (icon, msg, color) = if has_cached {
-                    (
-                        "🟢",
-                        "Local blobs cached — retry will export without sender",
-                        Color32::from_rgb(100, 200, 120),
-                    )
+                    if is_full {
+                        (
+                            "🟢",
+                            "Local blobs cached (Full) — retry will export without sender",
+                            Color32::from_rgb(100, 200, 120),
+                        )
+                    } else if has_cached {
+                        (
+                            "🟡",
+                            "Local blobs cached (Partial) — retry will resume",
+                            Color32::from_rgb(220, 200, 80),
+                        )
+                    } else {
+                        (
+                            "○",
+                            "No local cache for this code",
+                            TEXT_MUTED,
+                        )
+                    }
                 } else {
                     (
                         "○",
-                        "No local cache for this code",
+                        "No code entered",
                         TEXT_MUTED,
                     )
                 };
@@ -4868,9 +4912,9 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([580.0, 720.0])
-            .with_min_inner_size([420.0, 360.0])
-            .with_title("DataBeam")
+            .with_inner_size([620.0, 820.0])
+            .with_min_inner_size([460.0, 400.0])
+            .with_title("DataBeam — Secure & Fast Transfer")
             .with_icon(databeam_icon())
             .with_drag_and_drop(true),
         ..Default::default()

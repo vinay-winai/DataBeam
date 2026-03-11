@@ -17,7 +17,6 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use sendme_native::{
     check_and_export_local_in as native_check_and_export_local_in,
     download as native_sendme_download,
-    local_ticket_exists_on_disk as native_local_ticket_exists_on_disk,
     local_ticket_size_on_disk as native_local_ticket_size_on_disk,
     start_share as native_sendme_start_share,
     cleanup_sendme_receive_artifacts_for_ticket as native_cleanup_sendme_receive_artifacts_for_ticket,
@@ -1892,9 +1891,6 @@ pub fn sendme_check_local(
 
 
 
-pub fn sendme_has_local_blob(ticket_str: &str) -> bool {
-    native_local_ticket_exists_on_disk(ticket_str)
-}
 
 pub fn cleanup_sendme_receive_artifacts_for_ticket(ticket_str: &str) {
     native_cleanup_sendme_receive_artifacts_for_ticket(ticket_str)
@@ -2137,8 +2133,7 @@ mod tests {
         parse_sendme_send_output, sendme_send, SendmeSendOptions, TransferMsg,
     };
     use std::fs;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
     use std::sync::{mpsc, Arc};
     use std::time::{Duration, Instant};
 
