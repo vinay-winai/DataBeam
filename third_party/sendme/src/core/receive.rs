@@ -305,6 +305,10 @@ pub async fn download(
         emit_event(&app_handle, "receive-export-started");
         export(&db, collection, &final_output_dir, &app_handle, &content_hash).await?;
 
+        // Remove the smart-overwrite signature file now that export is finished
+        let signature_path = final_output_dir.join("databeam_hash.txt");
+        let _ = tokio::fs::remove_file(&signature_path).await;
+
         // Emit completion event AFTER everything is done
         emit_event(&app_handle, "receive-completed");
 
@@ -638,6 +642,10 @@ pub async fn check_and_export_local_in(
     }
 
     emit_event(&app_handle, "receive-completed");
+    
+    // Remove the smart-overwrite signature file now that export is finished
+    let signature_path = final_output_dir.join("databeam_hash.txt");
+    let _ = tokio::fs::remove_file(&signature_path).await;
 
     // Clean up the temporary blob store after successful local export
     if let Ok(ticket) = BlobTicket::from_str(ticket_str) {
