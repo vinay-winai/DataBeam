@@ -116,7 +116,8 @@ pub fn get_or_create_secret() -> anyhow::Result<iroh::SecretKey> {
         return iroh::SecretKey::from_str(&secret).context("invalid secret from env");
     }
 
-    // Persist the secret key in the app's data directory for stable Node IDs
+    // Disabled persistence for now to allow multiple instances on same device.
+    /*
     let data_dir = dirs::data_dir()
         .map(|d| d.join("databeam"))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
@@ -128,10 +129,13 @@ pub fn get_or_create_secret() -> anyhow::Result<iroh::SecretKey> {
             return Ok(key);
         }
     }
+    */
 
     let key = iroh::SecretKey::generate(&mut rand::rng());
+    /*
     let _ = std::fs::create_dir_all(&data_dir);
     let _ = std::fs::write(&secret_path, hex::encode(key.to_bytes()));
+    */
     
     Ok(key)
 }
