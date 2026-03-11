@@ -1148,8 +1148,8 @@ pub fn sendme_send(
     let child_pid = Arc::new(std::sync::Mutex::new(None));
 
     let _worker = thread::spawn(move || {
-        let (send_path, _staging_dir) = match create_staging_dir(&opts.paths) {
-            Ok((path, dir)) => (path, Some(dir)),
+        let (send_path, _staging_dir_path) = match create_staging_dir(&opts.paths) {
+            Ok(path) => (path, None), // We keep path, but we don't have a TempDir object anymore as it's deterministic
             Err(e) => {
                 let _ = tx.send(TransferMsg::Error(format!("Failed to stage files: {}", e)));
                 return;
@@ -1472,25 +1472,62 @@ pub fn sendme_send(
         }
 
         let _ = fs::remove_dir_all(&share.blobs_data_dir);
+        let _ = fs::remove_dir_all(&send_path); // Clean up the deterministic staging folder too
         cleanup_sendme_send_dirs(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         cleanup_sendme_temp_artifacts();
     });
 
     (rx, ProcessHandle { cancel, child_pid })
 }
-/// Create a staging directory with all items copied/linked into it for sendme
-fn create_staging_dir(paths: &[PathBuf]) -> Result<(PathBuf, tempfile::TempDir), String> {
-    let staging = tempfile::Builder::new()
-        .prefix("databeam_")
-        .tempdir()
-        .map_err(|e| format!("Could not create temp dir: {}", e))?;
+/// Create a deterministic staging directory with all items copied/linked into it for sendme
+fn create_staging_dir(paths: &[PathBuf]) -> Result<PathBuf, String> {
+    if paths.is_empty() {
+        return Err("No paths provided".to_string());
+    }
 
-    let staging_path = staging.path().to_path_buf();
+    // 1. Find the largest item to serve as the name base
+    let mut largest_item = &paths[0];
+    let mut largest_size = 0u64;
+
+    for p in paths {
+        let size = if p.is_dir() {
+            get_dir_size(p)
+        } else {
+            fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+        };
+        if size > largest_size {
+            largest_size = size;
+            largest_item = p;
+        }
+    }
+
+    // 2. Construct deterministic name
+    let base_name = largest_item
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("files");
+    
+    // Cap name to 20 chars
+    let mut name_slug: String = base_name.chars().take(20).collect();
+    if paths.len() > 1 {
+        name_slug.push_str("_and_more");
+    }
+    name_slug.push_str("_databeam");
+
+    // 3. Create the staging directory in Temp (not auto-deleted by TempDir object, but manual)
+    let temp_base = std::env::temp_dir();
+    let staging_path = temp_base.join(&name_slug);
+    
+    // Clear any previous STALE staging attempt for this specific payload
+    // Note: We don't remove it if we want to skip linking, but linking is cheap,
+    // so clearing ensures we don't have old files from a modified payload.
+    let _ = fs::remove_dir_all(&staging_path);
+    fs::create_dir_all(&staging_path).map_err(|e| format!("Could not create staging dir: {}", e))?;
 
     for src in paths {
-        // Prevent recursion: if staging dir is inside source dir
+        // Prevent recursion
         if staging_path.starts_with(src) {
-            return Err(format!("Staging directory recursion detected. The temp dir {:?} is inside list of files to send. Please choose a different source or temp location.", staging_path));
+             continue;
         }
 
         let name = src
@@ -1501,12 +1538,30 @@ fn create_staging_dir(paths: &[PathBuf]) -> Result<(PathBuf, tempfile::TempDir),
         if src.is_dir() {
             copy_dir_recursive(src, &dest)
                 .map_err(|e| format!("Failed to copy {}: {}", src.display(), e))?;
-        } else if fs::hard_link(src, &dest).is_err() {
-            fs::copy(src, &dest).map_err(|e| format!("Failed to copy {}: {}", src.display(), e))?;
+        } else {
+            // Try hard link first, fallback to copy
+            if fs::hard_link(src, &dest).is_err() {
+                fs::copy(src, &dest).map_err(|e| format!("Failed to copy {}: {}", src.display(), e))?;
+            }
         }
     }
 
-    Ok((staging_path, staging))
+    Ok(staging_path)
+}
+
+fn get_dir_size(path: &Path) -> u64 {
+    let mut total = 0;
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                total += get_dir_size(&p);
+            } else if let Ok(m) = entry.metadata() {
+                total += m.len();
+            }
+        }
+    }
+    total
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {

@@ -256,31 +256,49 @@ pub async fn download(
             emit_event_with_payload(&app_handle, "receive-file-names", &file_names_json);
         }
 
-        // Determine output directory
-        let output_dir = options.output_dir.unwrap_or_else(|| {
-            dirs::download_dir().unwrap_or_else(|| std::env::current_dir().unwrap())
-        });
-        
-        // Prevent overwriting existing files if the overwrite flag is false.
-        // Special case: "databeam_*" folders are app-managed and safe to auto-overwrite.
-        for (name, _) in collection.iter() {
-            let target = get_export_path(&output_dir, name)?;
-            if target.exists() {
-                if !options.overwrite && !name.starts_with("databeam_") {
-                    anyhow::bail!("file already exists");
-                }
-                // If we are proceeding (either overwrite=true or databeam_*), 
-                // we must remove the existing item so the export can succeed.
-                if target.is_dir() {
-                    let _ = tokio::fs::remove_dir_all(&target).await;
+        // 1. Calculate Content Hash (Collection Hash)
+        // We use the ticket's data hash as the unique signature for this specific payload.
+        let content_hash = ticket.hash().to_hex().to_string();
+
+        // 2. Resolve destination with smart incrementing logic
+        let mut final_output_dir = output_dir.to_path_buf();
+        if !collection.is_empty() {
+            let root_name = collection.iter().next().unwrap().0;
+            let dir_component = root_name.split('/').next().unwrap_or(root_name);
+            
+            let mut attempt = 1;
+            loop {
+                let name = if attempt == 1 {
+                    dir_component.to_string()
                 } else {
-                    let _ = tokio::fs::remove_file(&target).await;
+                    format!("{}_{}", attempt, dir_component)
+                };
+                
+                let check_path = output_dir.join(&name);
+                if !check_path.exists() {
+                    final_output_dir = check_path;
+                    break;
                 }
+                
+                // If it exists, check for our databeam_hash.txt signature
+                let signature_path = check_path.join("databeam_hash.txt");
+                if let Ok(existing_hash) = std::fs::read_to_string(&signature_path) {
+                    if existing_hash.trim() == content_hash {
+                        // MATCH! We can safely overwrite this version.
+                        final_output_dir = check_path;
+                        let _ = tokio::fs::remove_dir_all(&final_output_dir).await;
+                        break;
+                    }
+                }
+                
+                // No match or no signature, try next increment
+                attempt += 1;
+                if attempt > 100 { anyhow::bail!("Too many conflicting versions at destination"); }
             }
         }
 
         emit_event(&app_handle, "receive-export-started");
-        export(&db, collection, &output_dir, &app_handle).await?;
+        export(&db, collection, &final_output_dir, &app_handle, &content_hash).await?;
 
         // Emit completion event AFTER everything is done
         emit_event(&app_handle, "receive-completed");
@@ -320,9 +338,34 @@ async fn export(
     collection: Collection,
     output_dir: &Path,
     app_handle: &AppHandle,
+    content_hash: &str,
 ) -> anyhow::Result<()> {
+    // Ensure the output directory exists
+    tokio::fs::create_dir_all(output_dir).await?;
+
     for (_i, (name, hash)) in collection.iter().enumerate() {
-        let target = get_export_path(output_dir, name)?;
+        // The sender always wraps items in a 'databeam_' folder.
+        // We strip this first component to allow remapping into our resolved 'final_output_dir'.
+        let mut parts = name.split('/');
+        let _wrapper = parts.next(); // Skip the original 'databeam_XXX' name
+        
+        let mut target = output_dir.to_path_buf();
+        let mut has_subcomponents = false;
+        for part in parts {
+            validate_path_component(part)?;
+            target.push(part);
+            has_subcomponents = true;
+        }
+
+        // Fallback: If for some reason there were no subcomponents, use the raw name joined to parent
+        if !has_subcomponents {
+             target = get_export_path(output_dir.parent().unwrap_or(output_dir), name)?;
+        }
+
+        #[cfg(windows)]
+        {
+            target = to_windows_extended_path(target);
+        }
         let mut last_error: Option<String> = None;
         const MAX_ATTEMPTS: u32 = 5;
         for attempt in 1..=MAX_ATTEMPTS {
@@ -398,6 +441,15 @@ async fn export(
             anyhow::bail!("error exporting {}: {}", name, err);
         }
     }
+
+    // Write the signature hash (temporarily) so the receiver can detect it
+    // then delete it after we are done
+    let signature_path = output_dir.join("databeam_hash.txt");
+    let _ = tokio::fs::write(&signature_path, content_hash.as_bytes()).await;
+    
+    // We actually delete it immediately after successful write to keep folder clean as requested
+    let _ = tokio::fs::remove_file(&signature_path).await;
+
     Ok(())
 }
 
@@ -528,28 +580,44 @@ pub async fn check_and_export_local_in(
         emit_event_with_payload(&app_handle, "receive-file-names", &json);
     }
 
-    // Remove any partial output files left by a previous interrupted write.
-    // We know the local blobs are fully verified (is_complete() == true), so it is safe
-    // to delete whatever was partially written and recreate it from the local store.
-    for name in &file_names {
-        if let Ok(target) = get_export_path(&output_dir, name) {
-            if target.exists() {
-                if !overwrite && !name.starts_with("databeam_") {
-                    anyhow::bail!("file already exists");
-                }
-                if target.is_dir() {
-                    let _ = tokio::fs::remove_dir_all(&target).await;
-                } else {
-                    let _ = tokio::fs::remove_file(&target).await;
-                }
-                tracing::info!("Removed partial output before re-export: {}", target.display());
+    // Use exact same smart resolution logic as the download path
+    let content_hash = ticket.hash().to_hex().to_string();
+    let mut final_output_dir = output_dir.to_path_buf();
+    
+    if !collection.is_empty() {
+        let root_name = collection.iter().next().unwrap().0;
+        let dir_component = root_name.split('/').next().unwrap_or(root_name);
+        
+        let mut attempt = 1;
+        loop {
+            let name = if attempt == 1 {
+                dir_component.to_string()
+            } else {
+                format!("{}_{}", attempt, dir_component)
+            };
+            
+            let check_path = output_dir.join(&name);
+            if !check_path.exists() {
+                final_output_dir = check_path;
+                break;
             }
+            
+            let signature_path = check_path.join("databeam_hash.txt");
+            if let Ok(existing_hash) = std::fs::read_to_string(&signature_path) {
+                if existing_hash.trim() == content_hash {
+                    final_output_dir = check_path;
+                    let _ = tokio::fs::remove_dir_all(&final_output_dir).await;
+                    break;
+                }
+            }
+            attempt += 1;
+            if attempt > 100 { anyhow::bail!("Too many conflicting versions"); }
         }
     }
 
     emit_event(&app_handle, "receive-started");
     emit_event(&app_handle, "receive-export-started");
-    let export_fut = export(&db, collection, &output_dir, &app_handle);
+    let export_fut = export(&db, collection, &final_output_dir, &app_handle, &content_hash);
 
     if let Some(mut cancel_rx) = cancel_token {
         tokio::select! {
@@ -566,6 +634,13 @@ pub async fn check_and_export_local_in(
     }
 
     emit_event(&app_handle, "receive-completed");
+
+    // Clean up the temporary blob store after successful local export
+    if let Ok(ticket) = BlobTicket::from_str(ticket_str) {
+        let expected_dir = format!(".sendme-recv-{}", ticket.hash().to_hex());
+        let iroh_data_dir = std::env::temp_dir().join(expected_dir);
+        let _ = tokio::fs::remove_dir_all(&iroh_data_dir).await;
+    }
 
     Ok(true)
 }

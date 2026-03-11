@@ -112,13 +112,28 @@ pub fn apply_options(addr: &mut iroh::EndpointAddr, opts: AddrInfoOptions) {
 }
 
 pub fn get_or_create_secret() -> anyhow::Result<iroh::SecretKey> {
-    match std::env::var("IROH_SECRET") {
-        Ok(secret) => iroh::SecretKey::from_str(&secret).context("invalid secret"),
-        Err(_) => {
-            let key = iroh::SecretKey::generate(&mut rand::rng());
-            Ok(key)
+    if let Ok(secret) = std::env::var("IROH_SECRET") {
+        return iroh::SecretKey::from_str(&secret).context("invalid secret from env");
+    }
+
+    // Persist the secret key in the app's data directory for stable Node IDs
+    let data_dir = dirs::data_dir()
+        .map(|d| d.join("databeam"))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    
+    let secret_path = data_dir.join("node_secret.txt");
+    
+    if let Ok(saved) = std::fs::read_to_string(&secret_path) {
+        if let Ok(key) = iroh::SecretKey::from_str(saved.trim()) {
+            return Ok(key);
         }
     }
+
+    let key = iroh::SecretKey::generate(&mut rand::rng());
+    let _ = std::fs::create_dir_all(&data_dir);
+    let _ = std::fs::write(&secret_path, key.to_string());
+    
+    Ok(key)
 }
 
 use anyhow::Context;
