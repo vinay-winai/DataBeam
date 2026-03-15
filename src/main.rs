@@ -3352,16 +3352,11 @@ impl DataBeamApp {
 
         if self.selected_tool == SelectedTool::Sendme {
             ui.add_space(4.0);
-            ui.add_enabled_ui(!send_locked, |ui| {
-                let changed = ui
-                    .checkbox(
-                        &mut self.sendme_one_shot,
-                        RichText::new("Stop after single transfer").size(12.0),
-                    )
-                    .changed();
-                if changed {
-                    self.persist_user_settings();
-                }
+            ui.add_enabled_ui(false, |ui| {
+                let _ = ui.checkbox(
+                    &mut self.sendme_one_shot,
+                    RichText::new("Stop after single transfer (Disabled)").size(12.0),
+                );
                 if !self.sendme_one_shot {
                     ui.label(
                         RichText::new(
@@ -3747,12 +3742,14 @@ impl DataBeamApp {
             TransferState::Idle => {
                 let (color, label) = match self.selected_tool {
                     SelectedTool::Croc => (CROC_COLOR, "🐊 Receive"),
-                    SelectedTool::Sendme => (SENDME_COLOR, "📡 Receive"),
+                    SelectedTool::Sendme => (SENDME_COLOR, "📡 Receive (Disabled)"),
                     SelectedTool::EazySendme => (EAZYSENDME_COLOR, "⚡ Receive"),
                 };
-                if accent_button(ui, label, color).clicked() {
-                    self.start_receive(false);
-                }
+                ui.add_enabled_ui(self.selected_tool != SelectedTool::Sendme, |ui| {
+                    if accent_button(ui, label, color).clicked() {
+                        self.start_receive(false);
+                    }
+                });
             }
             TransferState::Running => {
                 self.show_transfer_status(ui);
