@@ -2486,14 +2486,13 @@ impl eframe::App for DataBeamApp {
                             let path = entry.path();
                             if !path.is_dir() { continue; }
                             
-                            let ticket_path = path.join("ticket.txt");
+                            let hex_hash = name.strip_prefix(".sendme-recv-").unwrap_or("");
                             let mut is_incomplete = true;
                             
-                            if let Ok(ticket_str) = std::fs::read_to_string(&ticket_path) {
-                                let ticket_str = ticket_str.trim();
-                                let size = dir_size(&path);
-                                for cache in map.values() {
-                                    if cache.ticket == ticket_str {
+                            let size = dir_size(&path);
+                            for cache in map.values() {
+                                if let Some(h) = native_ticket_to_hex_hash(&cache.ticket) {
+                                    if h == hex_hash {
                                         if cache.complete || (cache.payload_size > 0 && size >= cache.payload_size) {
                                             is_incomplete = false; // complete cache entry
                                         }

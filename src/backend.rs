@@ -24,6 +24,7 @@ use sendme_native::{
     EventEmitter as NativeSendmeEventEmitter, ReceiveOptions as NativeReceiveOptions,
     RelayModeOption as NativeRelayModeOption, SendOptions as NativeSendOptions,
 };
+pub use sendme_native::ticket_to_hex_hash as native_ticket_to_hex_hash;
 use serde::Deserialize;
 
 #[cfg(target_os = "windows")]
