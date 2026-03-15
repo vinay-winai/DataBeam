@@ -90,6 +90,8 @@ struct EazyCacheEntry {
     payload_size: u64,
     #[serde(default)]
     complete: bool,
+    #[serde(default)]
+    timestamp: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -459,6 +461,28 @@ impl DataBeamApp {
         if let Ok(json) = serde_json::to_string_pretty(&settings) {
             let _ = fs::write(path, json);
         }
+    }
+
+    fn cleanup_eazy_cache_by_hash(&mut self, hash: &str, delete_blobs: bool) {
+        let mut ticket_to_cleanup = None;
+        self.eazysendme_code_ticket_map.retain(|_, v| {
+            if let Some(h) = native_ticket_to_hex_hash(&v.ticket) {
+                if h == hash {
+                    if delete_blobs && ticket_to_cleanup.is_none() {
+                        ticket_to_cleanup = Some(v.ticket.clone());
+                    }
+                    false
+                } else {
+                    true
+                }
+            } else {
+                true
+            }
+        });
+        if let Some(ticket) = ticket_to_cleanup {
+            crate::backend::cleanup_sendme_receive_artifacts_for_ticket(&ticket);
+        }
+        self.persist_user_settings();
     }
 
     fn get_tool_binary(&self, tool: &Tool) -> Option<String> {
@@ -872,10 +896,15 @@ impl DataBeamApp {
                     let final_size = self.transfer_total_bytes.unwrap_or(existing_size);
                     let final_complete = existing_complete || self.transfer_state == TransferState::Completed;
 
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
                     self.eazysendme_code_ticket_map.insert(code_key, EazyCacheEntry {
                         ticket: ticket.clone(),
                         payload_size: final_size,
                         complete: final_complete,
+                        timestamp: now,
                     });
                     self.persist_user_settings();
                 }
@@ -1636,12 +1665,18 @@ impl DataBeamApp {
                                                      existing.map(|e| e.complete).unwrap_or(false))
                                                 };
 
-                                                self.eazysendme_code_ticket_map
-                                                    .insert(code_key, EazyCacheEntry {
-                                                        ticket: normalized_ticket.clone(),
-                                                        payload_size: size,
-                                                        complete,
-                                                    });
+                                                                                                 let now = std::time::SystemTime::now()
+                                                     .duration_since(std::time::UNIX_EPOCH)
+                                                     .unwrap_or_default()
+                                                     .as_secs();
+
+                                                 self.eazysendme_code_ticket_map
+                                                     .insert(code_key, EazyCacheEntry {
+                                                         ticket: normalized_ticket.clone(),
+                                                         payload_size: size,
+                                                         complete,
+                                                         timestamp: now,
+                                                     });
                                                 self.persist_user_settings();
                                             }
                                             let opts = SendmeReceiveOptions {
@@ -1671,12 +1706,18 @@ impl DataBeamApp {
                                             self.transfer_done_bytes = Some(total);
                                         }
                                         
-                                        // Once extraction completes successfully, remove the cache artifact immediately so it doesn't leave orphaned blob dirs.
-                                        let code_key = self.receive_code.trim().to_string();
-                                        if let Some(entry) = self.eazysendme_code_ticket_map.remove(&code_key) {
-                                            self.persist_user_settings();
-                                            crate::backend::cleanup_sendme_receive_artifacts_for_ticket(&entry.ticket);
-                                        }
+                                                                                 // Once extraction completes successfully, remove the cache artifact immediately so it doesn't leave orphaned blob dirs.
+                                         let code_key = self.receive_code.trim().to_string();
+                                         if let Some(entry) = self.eazysendme_code_ticket_map.get(&code_key).cloned() {
+                                             if let Some(hash) = native_ticket_to_hex_hash(&entry.ticket) {
+                                                 self.cleanup_eazy_cache_by_hash(&hash, true);
+                                             } else {
+                                                 // Fallback
+                                                 self.eazysendme_code_ticket_map.remove(&code_key);
+                                                 crate::backend::cleanup_sendme_receive_artifacts_for_ticket(&entry.ticket);
+                                                 self.persist_user_settings();
+                                             }
+                                         }
                                     }
                                 }
                             }
@@ -2453,6 +2494,24 @@ impl eframe::App for DataBeamApp {
                 format!("Running DataBeam v{} (Fixed Build)", APP_VERSION),
                 SUCCESS,
             );
+
+            // Silent aging cleanup: remove entries older than 1 week
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let one_week_secs = 7 * 24 * 3600;
+            let mut expired_hashes = std::collections::HashSet::new();
+            for entry in self.eazysendme_code_ticket_map.values() {
+                if entry.timestamp > 0 && now > entry.timestamp + one_week_secs {
+                    if let Some(h) = native_ticket_to_hex_hash(&entry.ticket) {
+                        expired_hashes.insert(h);
+                    }
+                }
+            }
+            for hash in expired_hashes {
+                self.cleanup_eazy_cache_by_hash(&hash, true);
+            }
 
             // Background check for orphaned/incomplete temp downloads
             let (tx, rx) = std::sync::mpsc::channel();
