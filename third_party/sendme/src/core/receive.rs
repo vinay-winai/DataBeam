@@ -237,6 +237,24 @@ pub async fn download(
         };
 
         let collection = Collection::load(hash_and_format.hash, db.as_ref()).await?;
+        
+        // If we skipped download (blobs were already complete), calculate the real payload size now
+        let mut final_payload_size = payload_size;
+        if payload_size == 0 && !collection.is_empty() {
+             use iroh_blobs::api::blobs::BlobStatus;
+             let mut sum = 0;
+             for (_name, hash) in collection.iter() {
+                 if let Ok(BlobStatus::Complete { size }) = db.status(*hash).await {
+                     sum += size;
+                 }
+             }
+             final_payload_size = sum;
+        }
+
+        if payload_size == 0 && final_payload_size > 0 {
+             // We are already at 100% for the download phase
+             emit_progress_event(&app_handle, final_payload_size, final_payload_size, 0.0);
+        }
 
         // Extract file names from collection and emit them BEFORE export
         // This allows the UI to show file names during the export phase

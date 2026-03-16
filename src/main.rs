@@ -2242,6 +2242,7 @@ impl DataBeamApp {
                         self.transfer_handle = Some(handle);
                         self.transfer_phase = TransferPhase::Transferring;
                         self.transfer_state = TransferState::Running;
+                        self.transfer_total_bytes = Some(entry.payload_size);
                         self.transfer_start_time = Some(self.animation_time);
                         return;
                     } else if disk_size > 0 {

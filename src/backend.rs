@@ -1739,6 +1739,10 @@ pub fn sendme_receive(
                         format_size_unit(done),
                         format_size_unit(total.max(done).max(1))
                     )));
+                    if total > 0 {
+                        let progress = (done as f32 / total as f32).clamp(0.0, 1.0);
+                        let _ = tx.send(TransferMsg::Progress(progress));
+                    }
                 }
                 Ok(NativeSendmeEvent::TransferStarted)
                 | Ok(NativeSendmeEvent::TransferProgress { .. })
