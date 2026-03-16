@@ -1,13 +1,11 @@
 # Troubleshooting DataBeam
 
-## Common Transfer Issues
-- If the receiver is not connected within like 15 seconds of sender transfer initiation, the transfer may fail. In that case, please request the sender to transfer again.
-
-## Sendme / EazySendme Transfer Issues
-- If senders or receivers are transferring when vpn is active , it may lead to failure of transfer. So disable vpn during transfer. This happens because some free vpn plans block p2p connections. croc may work in that case as they maintain public relay servers.
+## EazySendme specific Transfer Issues
+- Transfers will likely fail in networks that actively block p2p traffic like most free vpns . Croc may work in this case as they maintain public relay servers.
+- if Local blobs cached (Full) — retry will export without sender is shown but download is stuck, close app and retry with same croc code. If it still does not resolve the issue, try new transfer with different code, do not worry the downloaded filed will still be preserved.
 
 ## Croc / EazySendme Transfer Issues
-- If transfer not succeeding and logs show room not found or room is currently full, sender should use a different custom code. Avoid using simple codes like 1234567 or aaaaaaa.
+- If transfer does not start and logs show room not found or room unavailable/peer left, sender should retry with a different custom code. Avoid using simple codes like 1234567 or aaaaaaa.
 
 ## Common UI Issues
 - If app width is small , UI persentation may not be desirable. In that case , please resize the app window.

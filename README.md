@@ -1,26 +1,25 @@
 # DataBeam
 
-DataBeam is a compact desktop GUI for `croc` and `sendme`.
+The ultimate desktop GUI combining the convenience of Croc with the modern transfer speeds and resume across the network changes feature of Sendme. Send files anywhere instantly across wifi/network changes, power failure shutdowns.
 
 It gives you:
-- the convenience of Croc
-- the modern transfer model of Sendme
-- an EasySendMe mode that combines both ideas
+- the EasySendMe mode that combines,
+- the convenience of Croc PAKE's small secret code
+- the modern transfer model (iroh blobs, blake3, hole-punching) of Sendme
 
-## What It Does
-
-DataBeam is built for people who want fast file transfer without living in the terminal.
 
 You can:
-- use Croc directly
-- use Sendme directly
 - use EasySendMe, where Sendme handles the transfer but user shares a short croc code (can even create 7 length custom code) instead of the super long sendme ticket
+- use Croc directly
+- there is also a sendme broadcast mode which acts as a file server, although current sendme receiver is disabled.
 
 ## Features
 
 - EasySendMe mode: Croc-style convenience with the modern improvements of Sendme
+- auto-retry system when network fails.
+- automatic safe file overwrite confilct resolution system.
 - small executables, typically in the single-digit MB range
-- standalone `croc` and `sendme` are still available if you want to use them for specific situations
+- standalone `croc` mode and `sendme` broadcast mode are still available if you want to use them for specific situations
 - sending text in Croc mode
 - support for custom code as short as 7 characters in croc and easysendme modes
 - support for transferring multiple files/folders at once
@@ -28,59 +27,3 @@ You can:
 - modern native desktop UI with no browser runtime
 - visible transfer logs inside the app
 
-## Modes
-
-### Croc
-
-Use Croc when you want:
-- simple code-based sharing
-- text sending
-- a familiar relay-based workflow
-
-### Sendme
-
-Use Sendme when you want:
-- modern peer-to-peer transfer behavior
-- native in-app Sendme support
-- reusable multi broadcast-style sending when single transfer mode is disabled
-
-### EasySendMe
-
-EasySendMe is the convenience mode.
-
-It is meant to feel closer to Croc from a user-flow perspective while still using Sendme for the actual file transfer.
-
-In short:
-- Croc helps share the code more conveniently
-- Sendme does the transfer work
-
-## Build
-
-```bash
-cargo build --release
-```
-
-Release binary:
-- `target/release/databeam`
-- on Windows: `target/release/databeam.exe`
-
-## Why DataBeam
-
-DataBeam is for users who want:
-- one app for both Croc and Sendme
-- a desktop-first workflow
-- lightweight binaries
-- logs and transfer state visible in the UI
-- QR-based handoff available when sharing codes or tickets
-
-## Issues And Future Improvements(not ordered by priority)
-
-- a website to download this app
-- refining UX/UI after gathering user feedback
-- adding helpful pointers
-- fixing drag/drop in Linux
-- more target os/arch binary releases
-
-## Notes
-
-DataBeam is a GUI wrapper and workflow layer around Croc and Sendme for people not comfortable with cli apps.
