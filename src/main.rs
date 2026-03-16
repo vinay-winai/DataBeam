@@ -2235,7 +2235,7 @@ impl DataBeamApp {
                         let opts = SendmeReceiveOptions {
                             ticket: entry.ticket.clone(),
                             output_dir: self.receive_output_dir.clone(),
-                            overwrite: false,
+                            overwrite: true, // Use smart overwrite for local exports too
                         };
                         let (rx, handle) = sendme_check_local(opts);
                         self.transfer_rx = Some(rx);
