@@ -120,6 +120,15 @@ body {
     align-items: center;
 }
 
+.hero-lead {
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--primary);
+    text-transform: uppercase;
+    letter-spacing: 0.15em;
+    margin-bottom: 12px;
+}
+
 .badge {
     display: inline-block;
     padding: 6px 16px;
