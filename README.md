@@ -1,6 +1,6 @@
 # DataBeam
 
-The ultimate desktop GUI combining the convenience of Croc with the modern transfer speeds and resume across the network changes feature of Sendme. Send files anywhere instantly across wifi/network changes, power failure shutdowns.
+The ultimate desktop GUI app combining the convenience of Croc with the high speeds and resilience (across the network changes) features of Sendme. Send files/data anywhere instantly across wifi/network changes, resume downloads after network drops and power failure shutdowns.
 
 It gives you:
 - the EasySendMe mode that combines,
@@ -16,7 +16,7 @@ You can:
 ## Features
 
 - EasySendMe mode: Croc-style convenience with the modern improvements of Sendme
-- auto-retry system when network fails.
+- auto-retry system when network disconnections.
 - automatic safe file overwrite confilct resolution system.
 - small executables, typically in the single-digit MB range
 - standalone `croc` mode and `sendme` broadcast mode are still available if you want to use them for specific situations
