@@ -39,9 +39,10 @@ pub const SPACING: Vec2 = Vec2::new(10.0, 8.0);
 // ── Style Application ──────────────────────────────────────────────
 
 pub fn configure_fonts(ctx: &egui::Context) {
-    let mut fonts = FontDefinitions::default();
-    fonts.families.entry(FontFamily::Proportional).or_default();
-    fonts.families.entry(FontFamily::Monospace).or_default();
+    // We already have decent defaults from egui/eframe. 
+    // If we don't have custom .ttf files to load, it is better to leave them as-is
+    // or properly add to the built-in collections.
+    let fonts = FontDefinitions::default();
     ctx.set_fonts(fonts);
 }
 

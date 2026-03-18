@@ -2725,7 +2725,7 @@ impl eframe::App for DataBeamApp {
                     ui.horizontal(|ui| {
                         let phase = (self.animation_time * 3.0) as usize % 4;
                         ui.label(
-                            RichText::new(["⠋", "⠙", "⠹", "⠸"][phase])
+                            RichText::new(["◐", "◓", "◑", "◒"][phase])
                                 .color(accent)
                                 .monospace(),
                         );
@@ -3640,32 +3640,33 @@ impl DataBeamApp {
 
                     if is_full {
                         (
-                            "🟢",
-                            "Local blobs cached (Full) — retry will export without sender",
+                            true,
+                            "Local blobs cached (Full) - retry will export without sender",
                             Color32::from_rgb(100, 200, 120),
                         )
                     } else if has_cached {
                         (
-                            "🟡",
-                            "Local blobs cached (Partial) — retry will resume",
+                            true,
+                            "Local blobs cached (Partial) - retry will resume",
                             Color32::from_rgb(220, 200, 80),
                         )
                     } else {
-                        (
-                            "○",
-                            "No local cache for this code",
-                            TEXT_MUTED,
-                        )
+                        (false, "No local cache for this code", TEXT_MUTED)
                     }
                 } else {
-                    (
-                        "○",
-                        "No code entered",
-                        TEXT_MUTED,
-                    )
+                    (false, "No code entered", TEXT_MUTED)
                 };
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(icon).size(9.0));
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                    let center = rect.center();
+                    if icon {
+                        ui.painter().circle_filled(center, 3.0, color);
+                    } else {
+                        ui.painter()
+                            .circle_stroke(center, 3.0, egui::Stroke::new(1.0, color));
+                    }
+                    ui.add_space(2.0);
                     ui.label(RichText::new(msg).color(color).size(10.0));
                 });
             } else {
@@ -3891,9 +3892,9 @@ impl DataBeamApp {
                     ui.horizontal(|ui| {
                         let phase = (self.animation_time * 3.0) as usize % 4;
                         ui.label(
-                            RichText::new(["⠋", "⠙", "⠹", "⠸"][phase])
+                            RichText::new(["◐", "◓", "◑", "◒"][phase])
                                 .color(accent)
-                                .size(14.0),
+                                .monospace(),
                         );
 
                         let status_text = match self.transfer_phase {
