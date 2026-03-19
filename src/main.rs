@@ -87,9 +87,6 @@ impl SendItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct EazyCacheEntry {
     ticket: String,
-    payload_size: u64,
-    #[serde(default)]
-    complete: bool,
     #[serde(default)]
     timestamp: u64,
 }
@@ -174,6 +171,7 @@ struct DataBeamApp {
     eazysendme_auto_retry: bool,
     eazy_retry_count: u8,
     eazy_next_retry_time: Option<f64>,
+    eazy_local_check_started_at: Option<f64>,
     croc_qr_popup_open: bool,
     croc_text_popup_open: bool,
 
@@ -271,6 +269,7 @@ impl Default for DataBeamApp {
             eazysendme_auto_retry: true,
             eazy_retry_count: 0,
             eazy_next_retry_time: None,
+            eazy_local_check_started_at: None,
             croc_qr_popup_open: false,
             croc_text_popup_open: false,
             toast_msg: None,
@@ -673,6 +672,7 @@ impl DataBeamApp {
         self.transfer_payload_start_time = None;
         self.transfer_end_time = None;
         self.croc_qr_popup_open = false;
+        self.eazy_local_check_started_at = None;
         self.eazysendme_ticket = None;
         self.eazysendme_croc_handle = None;
         self.eazysendme_croc_rx = None;
@@ -744,29 +744,6 @@ impl DataBeamApp {
         // exist and check_and_export_local will return Ok(false), falling through to Croc.
     }
 
-    fn update_eazy_cache_sizes(&mut self) {
-        if self.selected_tool == SelectedTool::EazySendme && self.view == AppView::Receive {
-            let code_key = self.receive_code.trim().to_string();
-            let mut sizes_changed = false;
-            let t_bytes = self.transfer_total_bytes.unwrap_or(0);
-            let is_finished = self.transfer_progress >= 0.999 || self.transfer_state == TransferState::Completed;
-            
-            if let Some(entry) = self.eazysendme_code_ticket_map.get_mut(&code_key) {
-                if t_bytes > 0 && entry.payload_size != t_bytes {
-                    entry.payload_size = t_bytes;
-                    sizes_changed = true;
-                }
-                if is_finished && !entry.complete {
-                    entry.complete = true;
-                    sizes_changed = true;
-                }
-            }
-            if sizes_changed {
-                self.persist_user_settings();
-            }
-        }
-    }
-
     fn cancel_transfer(&mut self) {
         if let Some(handle) = &self.transfer_handle {
             handle.request_cancel();
@@ -798,6 +775,12 @@ impl DataBeamApp {
             && self.selected_tool == SelectedTool::EazySendme
             && self.view == AppView::Receive
         {
+            // Prevent auto-retry from re-inserting the same ticket and looping local-check forever.
+            self.eazysendme_ticket = None;
+            let code_key = self.receive_code.trim().to_string();
+            if !code_key.is_empty() && self.eazysendme_code_ticket_map.remove(&code_key).is_some() {
+                self.persist_user_settings();
+            }
             self.transfer_log
                 .push("Local blobs incomplete, starting full receive...".to_string());
             self.eazy_next_retry_time = Some(self.animation_time); // trigger immediately
@@ -890,23 +873,22 @@ impl DataBeamApp {
             // Persist the in-memory ticket to the map so start_receive can find it.
             if let Some(ticket) = &self.eazysendme_ticket {
                 if !code_key.is_empty() {
-                    let existing_entry = self.eazysendme_code_ticket_map.get(&code_key);
-                    let existing_size = existing_entry.map(|e| e.payload_size).unwrap_or(0);
-                    let existing_complete = existing_entry.map(|e| e.complete).unwrap_or(false);
-                    let final_size = self.transfer_total_bytes.unwrap_or(existing_size);
-                    let final_complete = existing_complete || self.transfer_state == TransferState::Completed;
-
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    self.eazysendme_code_ticket_map.insert(code_key, EazyCacheEntry {
-                        ticket: ticket.clone(),
-                        payload_size: final_size,
-                        complete: final_complete,
-                        timestamp: now,
-                    });
-                    self.persist_user_settings();
+                    let should_update = self
+                        .eazysendme_code_ticket_map
+                        .get(&code_key)
+                        .map(|e| e.ticket != *ticket)
+                        .unwrap_or(true);
+                    if should_update {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        self.eazysendme_code_ticket_map.insert(code_key, EazyCacheEntry {
+                            ticket: ticket.clone(),
+                            timestamp: now,
+                        });
+                        self.persist_user_settings();
+                    }
                 }
             }
         }
@@ -916,7 +898,6 @@ impl DataBeamApp {
 
     fn update_transfer_metrics_from_log(&mut self, line: &str) {
         let lower = line.to_lowercase();
-        let old_total = self.transfer_total_bytes;
         let eazy_receive_pre_ticket = self.selected_tool == SelectedTool::EazySendme
             && self.view == AppView::Receive
             && self.eazysendme_ticket.is_none();
@@ -1240,9 +1221,6 @@ impl DataBeamApp {
             self.sendme_had_transfer = true;
         }
         
-        if old_total.is_none() && self.transfer_total_bytes.is_some() {
-            self.update_eazy_cache_sizes();
-        }
     }
 
     fn update_croc_received_text_from_log(&mut self, line: &str) -> bool {
@@ -1320,6 +1298,9 @@ impl DataBeamApp {
                 }
                 match rx.try_recv() {
                     Ok(msg) => {
+                        if self.eazy_local_check_started_at.is_some() {
+                            self.eazy_local_check_started_at = Some(self.animation_time);
+                        }
                         processed += 1;
                         match msg {
                             TransferMsg::Output(line) => {
@@ -1477,9 +1458,6 @@ impl DataBeamApp {
                                             self.update_derived_speed_from_done_bytes();
                                         }
                                     }
-                                }
-                                if p >= 1.0 {
-                                    self.update_eazy_cache_sizes();
                                 }
                             }
                             TransferMsg::Code(code) => {
@@ -1655,26 +1633,14 @@ impl DataBeamApp {
                                             // works even after reset_transfer clears the ticket.
                                             let code_key = self.receive_code.trim().to_string();
                                             if !code_key.is_empty() {
-                                                let existing = self.eazysendme_code_ticket_map.get(&code_key);
-                                                let is_new_ticket = existing.map(|e| e.ticket != normalized_ticket).unwrap_or(true);
-                                                
-                                                let (size, complete) = if is_new_ticket {
-                                                    (0, false)
-                                                } else {
-                                                    (existing.map(|e| e.payload_size).unwrap_or(0), 
-                                                     existing.map(|e| e.complete).unwrap_or(false))
-                                                };
-
-                                                                                                 let now = std::time::SystemTime::now()
-                                                     .duration_since(std::time::UNIX_EPOCH)
-                                                     .unwrap_or_default()
-                                                     .as_secs();
+                                                let now = std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .unwrap_or_default()
+                                                    .as_secs();
 
                                                  self.eazysendme_code_ticket_map
                                                      .insert(code_key, EazyCacheEntry {
                                                          ticket: normalized_ticket.clone(),
-                                                         payload_size: size,
-                                                         complete,
                                                          timestamp: now,
                                                      });
                                                 self.persist_user_settings();
@@ -2219,35 +2185,32 @@ impl DataBeamApp {
 
                 if let Some(entry) = self.eazysendme_code_ticket_map.get(&code_key) {
                     let disk_size = crate::backend::get_sendme_blob_directory_size(&entry.ticket);
-                    
-                    println!("EazyReceive DEBUG: code={} disk={} payload={} complete={}", 
-                        code_key, disk_size, entry.payload_size, entry.complete
-                    );
 
-                    // If it's 100% complete, try the direct local export (fast path).
-                    if entry.complete && disk_size > 0 {
-                        self.transfer_log
-                            .push(format!("[Local] Full blobs cached ({} bytes) — exporting directly", disk_size));
-                        
-                        // Set the ticket now to prevent "ghost" Croc restarts later
-                        self.eazysendme_ticket = Some(entry.ticket.clone());
+                    self.transfer_log.push(if disk_size > 0 {
+                        format!(
+                            "[Local] Found cached blobs ({} bytes). Verifying local completeness...",
+                            disk_size
+                        )
+                    } else {
+                        "[Local] Cached ticket found. Verifying local completeness...".to_string()
+                    });
 
-                        let opts = SendmeReceiveOptions {
-                            ticket: entry.ticket.clone(),
-                            output_dir: self.receive_output_dir.clone(),
-                            overwrite: true, // Use smart overwrite for local exports too
-                        };
-                        let (rx, handle) = sendme_check_local(opts);
-                        self.transfer_rx = Some(rx);
-                        self.transfer_handle = Some(handle);
-                        self.transfer_phase = TransferPhase::Transferring;
-                        self.transfer_state = TransferState::Running;
-                        self.transfer_total_bytes = Some(entry.payload_size);
-                        self.transfer_start_time = Some(self.animation_time);
-                        return;
-                    } else if disk_size > 0 {
-                        self.transfer_log.push(format!("[Local] Partial blobs found ({} bytes) — resuming via network", disk_size));
-                    }
+                    // Set the ticket now to prevent "ghost" Croc restarts later
+                    self.eazysendme_ticket = Some(entry.ticket.clone());
+
+                    let opts = SendmeReceiveOptions {
+                        ticket: entry.ticket.clone(),
+                        output_dir: self.receive_output_dir.clone(),
+                        overwrite: true, // Use smart overwrite for local exports too
+                    };
+                    let (rx, handle) = sendme_check_local(opts);
+                    self.transfer_rx = Some(rx);
+                    self.transfer_handle = Some(handle);
+                    self.eazy_local_check_started_at = Some(self.animation_time);
+                    self.transfer_phase = TransferPhase::Transferring;
+                    self.transfer_state = TransferState::Running;
+                    self.transfer_start_time = Some(self.animation_time);
+                    return;
                 }
 
                 // Fall back to Phase 1 (Croc)
@@ -2548,14 +2511,10 @@ impl eframe::App for DataBeamApp {
                             
                             let hex_hash = name.strip_prefix(".sendme-recv-").unwrap_or("");
                             let mut is_incomplete = true;
-                            
-                            let size = dir_size(&path);
                             for cache in map.values() {
                                 if let Some(h) = native_ticket_to_hex_hash(&cache.ticket) {
                                     if h == hex_hash {
-                                        if cache.complete || (cache.payload_size > 0 && size >= cache.payload_size) {
-                                            is_incomplete = false; // complete cache entry
-                                        }
+                                        is_incomplete = false; // managed cache entry
                                         break;
                                     }
                                 }
@@ -2601,6 +2560,19 @@ impl eframe::App for DataBeamApp {
         self.handle_dropped_files(ctx);
         self.poll_size_updates();
         self.poll_transfer();
+        if let Some(started_at) = self.eazy_local_check_started_at {
+            let local_check_running = self.selected_tool == SelectedTool::EazySendme
+                && self.view == AppView::Receive
+                && self.transfer_state == TransferState::Running;
+            if local_check_running && self.animation_time - started_at >= 10.0 {
+                self.eazy_local_check_started_at = None;
+                self.transfer_log.push(
+                    "[Local] Verification timed out after 10s. Retrying...".to_string(),
+                );
+                self.retry_receive(false);
+                return;
+            }
+        }
 
         if let TransferState::Failed(_) = self.transfer_state {
             if let Some(retry_time) = self.eazy_next_retry_time {
@@ -3617,39 +3589,21 @@ impl DataBeamApp {
                         self.eazysendme_code_ticket_map.get(&code_key).map(|e| e.ticket.clone())
                     };
 
-                    let mut is_full = false;
-                    let mut has_cached = false;
                     if let Some(tick) = ticket_to_check {
                         let disk_size = crate::backend::get_sendme_blob_directory_size(&tick);
                         if disk_size > 0 {
-                            has_cached = true;
-                        
-                            let entry = self.eazysendme_code_ticket_map.get(&code_key);
-                            let p_size = if is_active && self.transfer_total_bytes.unwrap_or(0) > 0 {
-                                self.transfer_total_bytes.unwrap_or(0)
-                            } else {
-                                entry.map(|e| e.payload_size).unwrap_or(0)
-                            };
-                            let is_marked_complete = entry.map(|e| e.complete).unwrap_or(false);
-
-                            if is_marked_complete || (p_size > 0 && disk_size >= p_size.saturating_sub(1024)) {
-                                is_full = true;
-                            }
+                            (
+                                true,
+                                "Local blob cache found - retry will verify and export if complete",
+                                Color32::from_rgb(100, 200, 120),
+                            )
+                        } else {
+                            (
+                                false,
+                                "Cached ticket found - no local blob data yet",
+                                TEXT_MUTED,
+                            )
                         }
-                    }
-
-                    if is_full {
-                        (
-                            true,
-                            "Local blobs cached (Full) - retry will export without sender",
-                            Color32::from_rgb(100, 200, 120),
-                        )
-                    } else if has_cached {
-                        (
-                            true,
-                            "Local blobs cached (Partial) - retry will resume",
-                            Color32::from_rgb(220, 200, 80),
-                        )
                     } else {
                         (false, "No local cache for this code", TEXT_MUTED)
                     }
