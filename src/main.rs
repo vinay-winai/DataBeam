@@ -1298,13 +1298,17 @@ impl DataBeamApp {
                 }
                 match rx.try_recv() {
                     Ok(msg) => {
-                        if self.eazy_local_check_started_at.is_some() {
-                            self.eazy_local_check_started_at = Some(self.animation_time);
-                        }
                         processed += 1;
                         match msg {
                             TransferMsg::Output(line) => {
                                 let lower = line.to_lowercase();
+                                if self.eazy_local_check_started_at.is_some()
+                                    && (lower.contains("[local] blobs complete locally, exporting")
+                                        || lower.contains("[4/4] writing files to disk")
+                                        || lower.contains("[4/4] writing..."))
+                                {
+                                    self.eazy_local_check_started_at = None;
+                                }
                                 let sendme_counter_activity =
                                     parse_sendme_r_counter(&line).is_some();
                                 if self.transfer_state == TransferState::Running {
@@ -1432,6 +1436,9 @@ impl DataBeamApp {
                                 }
                             }
                             TransferMsg::Progress(p) => {
+                                if self.eazy_local_check_started_at.is_some() && p > 0.0 {
+                                    self.eazy_local_check_started_at = None;
+                                }
                                 let sendme_broadcast_sender = (self.selected_tool
                                     == SelectedTool::Sendme
                                     || self.selected_tool == SelectedTool::EazySendme)
@@ -1596,6 +1603,7 @@ impl DataBeamApp {
                                 }
                             }
                             TransferMsg::Completed => {
+                                self.eazy_local_check_started_at = None;
                                 self.transfer_end_time = Some(self.animation_time);
                                 if self.selected_tool == SelectedTool::Croc
                                     && self.view == AppView::Send
@@ -1756,6 +1764,7 @@ impl DataBeamApp {
                                 }
                             }
                             TransferMsg::Error(e) => {
+                                self.eazy_local_check_started_at = None;
                                 if self.transfer_state == TransferState::Completed {
                                     // Ignore late process-shutdown errors after completion.
                                 } else if e == "Transfer cancelled" {
@@ -2570,7 +2579,9 @@ impl eframe::App for DataBeamApp {
                     "[Local] Verification timed out after 10s. Retrying...".to_string(),
                 );
                 self.retry_receive(false);
-                return;
+                // Keep drawing the current frame so the UI doesn't flash blank while the
+                // replacement receive flow is being launched.
+                ctx.request_repaint();
             }
         }
 
@@ -5506,5 +5517,66 @@ mod parse_tests {
         app.poll_transfer();
 
         assert_eq!(app.transfer_state, TransferState::Completed);
+    }
+
+    #[test]
+    fn eazy_local_check_watch_stays_armed_during_verification_silence() {
+        let mut app = DataBeamApp::default();
+        app.selected_tool = SelectedTool::EazySendme;
+        app.view = AppView::Receive;
+        app.transfer_state = TransferState::Running;
+        app.transfer_phase = TransferPhase::Transferring;
+        app.eazy_local_check_started_at = Some(12.0);
+        let (tx, rx) = mpsc::channel();
+        app.transfer_rx = Some(rx);
+        tx.send(TransferMsg::Output(
+            "[Local] still checking cached blobs".to_string(),
+        ))
+        .expect("send output");
+        drop(tx);
+
+        app.poll_transfer();
+
+        assert_eq!(app.eazy_local_check_started_at, Some(12.0));
+    }
+
+    #[test]
+    fn eazy_local_check_watch_clears_when_local_export_starts() {
+        let mut app = DataBeamApp::default();
+        app.selected_tool = SelectedTool::EazySendme;
+        app.view = AppView::Receive;
+        app.transfer_state = TransferState::Running;
+        app.transfer_phase = TransferPhase::Transferring;
+        app.eazy_local_check_started_at = Some(12.0);
+        let (tx, rx) = mpsc::channel();
+        app.transfer_rx = Some(rx);
+        tx.send(TransferMsg::Output(
+            "[local] Blobs complete locally, exporting...".to_string(),
+        ))
+        .expect("send output");
+        drop(tx);
+
+        app.poll_transfer();
+
+        assert!(app.eazy_local_check_started_at.is_none());
+    }
+
+    #[test]
+    fn eazy_local_check_watch_clears_on_local_export_progress() {
+        let mut app = DataBeamApp::default();
+        app.selected_tool = SelectedTool::EazySendme;
+        app.view = AppView::Receive;
+        app.transfer_state = TransferState::Running;
+        app.transfer_phase = TransferPhase::Transferring;
+        app.eazy_local_check_started_at = Some(12.0);
+        let (tx, rx) = mpsc::channel();
+        app.transfer_rx = Some(rx);
+        tx.send(TransferMsg::Progress(0.25))
+            .expect("send progress");
+        drop(tx);
+
+        app.poll_transfer();
+
+        assert!(app.eazy_local_check_started_at.is_none());
     }
 }
