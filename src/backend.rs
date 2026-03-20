@@ -2134,13 +2134,12 @@ impl ProcessHandle {
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_sendme_send_dirs, init_bundled_binaries, parse_sendme_receive_output,
-        parse_sendme_send_output, sendme_send, SendmeSendOptions, TransferMsg,
+        cleanup_sendme_send_dirs, parse_sendme_receive_output, parse_sendme_send_output,
+        TransferMsg,
     };
     use std::fs;
     use std::sync::atomic::AtomicBool;
     use std::sync::{mpsc, Arc};
-    use std::time::{Duration, Instant};
 
     #[test]
     fn cleanup_removes_only_sendme_send_dirs() {
@@ -2163,47 +2162,6 @@ mod tests {
         assert!(!sendme_b.exists());
         assert!(keep_dir.exists());
         assert!(keep_file.exists());
-    }
-
-    #[test]
-    #[ignore = "manual smoke test for local sendme behavior"]
-    fn sendme_send_does_not_complete_immediately() {
-        let (_, sendme_path) = init_bundled_binaries();
-        let Some(binary) = sendme_path else {
-            eprintln!("sendme binary unavailable on this platform; skipping");
-            return;
-        };
-
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let sample = tmp.path().join("sample.txt");
-        fs::write(&sample, b"hello").expect("write sample");
-
-        let (rx, handle) = sendme_send(
-            SendmeSendOptions {
-                paths: vec![sample],
-                one_shot: true,
-            },
-            &binary.to_string_lossy(),
-        );
-
-        let start = Instant::now();
-        let mut saw_early_completion = false;
-        while start.elapsed() < Duration::from_secs(3) {
-            match rx.try_recv() {
-                Ok(TransferMsg::Completed | TransferMsg::PeerDisconnected) => {
-                    saw_early_completion = true;
-                    break;
-                }
-                Ok(_) => {}
-                Err(_) => std::thread::sleep(Duration::from_millis(30)),
-            }
-        }
-
-        handle.request_cancel();
-        assert!(
-            !saw_early_completion,
-            "sendme_send emitted completion/disconnect too early"
-        );
     }
 
     #[test]

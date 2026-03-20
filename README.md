@@ -11,7 +11,7 @@ It gives you:
 You can:
 - use EasySendMe, where Sendme handles the transfer but user shares a short croc code (can even create 7 length custom code) instead of the super long sendme ticket
 - use Croc directly
-- there is also a sendme broadcast mode which acts as a file server, although current sendme receiver is disabled.
+- there is also a sendme broadcast mode which acts as a file server.
 
 ## Features
 
@@ -19,7 +19,7 @@ You can:
 - auto-retry system when network disconnections.
 - automatic safe file overwrite confilct resolution system.
 - small executables, typically in the single-digit MB range
-- standalone `croc` mode and `sendme` broadcast mode are still available if you want to use them for specific situations
+- standalone `croc` mode and `sendme` modes are still available if you want to use them for specific situations
 - sending text in Croc mode
 - support for custom code as short as 7 characters in croc and easysendme modes
 - support for transferring multiple files/folders at once

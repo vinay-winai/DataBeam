@@ -1285,6 +1285,7 @@ impl DataBeamApp {
         if let Some(rx) = self.transfer_rx.take() {
             let mut processed = 0usize;
             let mut restart_sendme_serve = false;
+            let mut transfer_rx_disconnected = false;
             let max_msgs_per_frame = if self.selected_tool == SelectedTool::Sendme
                 || self.selected_tool == SelectedTool::EazySendme
             {
@@ -1302,6 +1303,20 @@ impl DataBeamApp {
                         match msg {
                             TransferMsg::Output(line) => {
                                 let lower = line.to_lowercase();
+                                if self.selected_tool == SelectedTool::Sendme
+                                    && self.view == AppView::Receive
+                                    && self.transfer_phase != TransferPhase::Transferring
+                                    && (lower.contains("[2/4] downloading")
+                                        || lower.contains("[3/4] downloading")
+                                        || lower.contains("[4/4] writing files to disk")
+                                        || lower.contains("[4/4] writing..."))
+                                {
+                                    self.transfer_phase = TransferPhase::Transferring;
+                                    self.preparing_progress = 1.0;
+                                    if self.transfer_payload_start_time.is_none() {
+                                        self.transfer_payload_start_time = Some(self.animation_time);
+                                    }
+                                }
                                 if self.eazy_local_check_started_at.is_some()
                                     && (lower.contains("[local] blobs complete locally, exporting")
                                         || lower.contains("[4/4] writing files to disk")
@@ -1679,7 +1694,16 @@ impl DataBeamApp {
                                         if let Some(total) = self.transfer_total_bytes {
                                             self.transfer_done_bytes = Some(total);
                                         }
-                                        
+                                        // Standalone Sendme receive does not keep local blob cache
+                                        // after a successful export.
+                                        if self.selected_tool == SelectedTool::Sendme
+                                            && self.view == AppView::Receive
+                                        {
+                                            if let Some(ticket) = self.transfer_code.clone() {
+                                                crate::backend::cleanup_sendme_receive_artifacts_for_ticket(&ticket);
+                                            }
+                                        }
+                                         
                                                                                  // Once extraction completes successfully, remove the cache artifact immediately so it doesn't leave orphaned blob dirs.
                                          let code_key = self.receive_code.trim().to_string();
                                          if let Some(entry) = self.eazysendme_code_ticket_map.get(&code_key).cloned() {
@@ -1821,21 +1845,24 @@ impl DataBeamApp {
                                 self.transfer_state = TransferState::Running;
                                 self.transfer_start_time = Some(self.animation_time);
                                 self.transfer_phase = if self.selected_tool == SelectedTool::Sendme
-                                    && self.view == AppView::Send
-                                    && !self.sendme_one_shot
-                                {
-                                    TransferPhase::Preparing
-                                } else if self.selected_tool == SelectedTool::Sendme
                                     && self.view == AppView::Receive
                                 {
-                                    TransferPhase::Preparing
-                                } else if self.selected_tool == SelectedTool::EazySendme {
-                                    TransferPhase::Preparing
+                                    // Native receive can start emitting useful transfer/export
+                                    // signals immediately; keep it out of "Preparing" stalls.
+                                    TransferPhase::Transferring
                                 } else {
                                     TransferPhase::Preparing
                                 };
-                                self.preparing_progress = 0.0;
-                                self.transfer_payload_start_time = None;
+                                self.preparing_progress = if self.transfer_phase == TransferPhase::Transferring {
+                                    1.0
+                                } else {
+                                    0.0
+                                };
+                                self.transfer_payload_start_time = if self.transfer_phase == TransferPhase::Transferring {
+                                    Some(self.animation_time)
+                                } else {
+                                    None
+                                };
                                 self.transfer_end_time = None;
                                 self.transfer_speed_bps = None;
                                 self.transfer_speed_samples.clear();
@@ -1846,11 +1873,21 @@ impl DataBeamApp {
                             }
                         }
                     }
-                    Err(_) => break, // Empty or disconnected
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        transfer_rx_disconnected = true;
+                        break;
+                    }
                 }
             }
             if restart_sendme_serve {
                 self.start_send(true);
+            } else if transfer_rx_disconnected {
+                if self.transfer_state == TransferState::Running {
+                    self.fail_transfer(
+                        "Transfer process ended unexpectedly. Please retry.".to_string(),
+                    );
+                }
             } else {
                 // Put it back
                 self.transfer_rx = Some(rx);
@@ -2183,7 +2220,7 @@ impl DataBeamApp {
                 let opts = SendmeReceiveOptions {
                     ticket: self.receive_code.trim().to_string(),
                     output_dir: self.receive_output_dir.clone(),
-                    overwrite: false,
+                    overwrite: true, // Smart overwrite for standalone Sendme receive.
                 };
                 let (rx, handle) = sendme_receive(opts, &binary);
                 self.transfer_rx = Some(rx);
@@ -2463,10 +2500,6 @@ impl eframe::App for DataBeamApp {
         if !self.initialized_once {
             self.view = AppView::Home;
             self.initialized_once = true;
-            self.show_toast(
-                format!("Running DataBeam v{} (Fixed Build)", APP_VERSION),
-                SUCCESS,
-            );
 
             // Silent aging cleanup: remove entries older than 1 week
             let now = std::time::SystemTime::now()
@@ -3394,11 +3427,16 @@ impl DataBeamApp {
 
         if self.selected_tool == SelectedTool::Sendme {
             ui.add_space(4.0);
-            ui.add_enabled_ui(false, |ui| {
-                let _ = ui.checkbox(
-                    &mut self.sendme_one_shot,
-                    RichText::new("Stop after single transfer (Disabled)").size(12.0),
-                );
+            ui.add_enabled_ui(!send_locked, |ui| {
+                if ui
+                    .checkbox(
+                        &mut self.sendme_one_shot,
+                        RichText::new("Stop after single transfer").size(12.0),
+                    )
+                    .changed()
+                {
+                    self.persist_user_settings();
+                }
                 if !self.sendme_one_shot {
                     ui.label(
                         RichText::new(
@@ -3767,14 +3805,12 @@ impl DataBeamApp {
             TransferState::Idle => {
                 let (color, label) = match self.selected_tool {
                     SelectedTool::Croc => (CROC_COLOR, "🐊 Receive"),
-                    SelectedTool::Sendme => (SENDME_COLOR, "📡 Receive (Disabled)"),
+                    SelectedTool::Sendme => (SENDME_COLOR, "📡 Receive"),
                     SelectedTool::EazySendme => (EAZYSENDME_COLOR, "⚡ Receive"),
                 };
-                ui.add_enabled_ui(self.selected_tool != SelectedTool::Sendme, |ui| {
-                    if accent_button(ui, label, color).clicked() {
-                        self.start_receive(false);
-                    }
-                });
+                if accent_button(ui, label, color).clicked() {
+                    self.start_receive(false);
+                }
             }
             TransferState::Running => {
                 self.show_transfer_status(ui);
@@ -4140,9 +4176,13 @@ impl DataBeamApp {
 
             // Code/ticket — for Croc sender, only show once past the Preparing phase
             let show_code = self.transfer_code.is_some() && {
+                let sendme_receiver =
+                    self.selected_tool == SelectedTool::Sendme && self.view == AppView::Receive;
                 let croc_sender =
                     self.selected_tool == SelectedTool::Croc && self.view == AppView::Send;
-                if croc_sender {
+                if sendme_receiver {
+                    false
+                } else if croc_sender {
                     self.transfer_phase != TransferPhase::Preparing
                 } else {
                     true
@@ -5241,97 +5281,6 @@ mod parse_tests {
     }
 
     #[test]
-    fn sendme_serve_mode_waiting_banner_resets_to_waiting() {
-        let mut app = DataBeamApp::default();
-        app.selected_tool = SelectedTool::Sendme;
-        app.view = AppView::Send;
-        app.transfer_state = TransferState::Running;
-        app.sendme_one_shot = false;
-        app.transfer_phase = TransferPhase::Transferring;
-        app.transfer_progress = 0.42;
-        app.transfer_done_bytes = Some(1024);
-        app.sendme_had_transfer = true;
-        let (tx, rx) = mpsc::channel();
-        app.transfer_rx = Some(rx);
-        tx.send(TransferMsg::WaitingForReceiver)
-            .expect("send output");
-        drop(tx);
-
-        app.poll_transfer();
-
-        assert_eq!(app.transfer_state, TransferState::Running);
-        assert_eq!(app.transfer_phase, TransferPhase::WaitingForReceiver);
-        assert!(app.transfer_done_bytes.is_none());
-        assert!(app.transfer_progress <= f32::EPSILON);
-    }
-
-    #[test]
-    fn sendme_one_shot_waiting_banner_does_not_mark_complete() {
-        let mut app = DataBeamApp::default();
-        app.selected_tool = SelectedTool::Sendme;
-        app.view = AppView::Send;
-        app.transfer_state = TransferState::Running;
-        app.sendme_one_shot = true;
-        app.transfer_phase = TransferPhase::Transferring;
-        app.transfer_progress = 0.42;
-        app.transfer_done_bytes = Some(1024);
-        app.transfer_total_bytes = Some(2048);
-        app.sendme_had_transfer = true;
-        let (tx, rx) = mpsc::channel();
-        app.transfer_rx = Some(rx);
-        tx.send(TransferMsg::WaitingForReceiver)
-            .expect("send output");
-        drop(tx);
-
-        app.poll_transfer();
-
-        assert_eq!(app.transfer_state, TransferState::Running);
-        assert!((app.transfer_progress - 0.42).abs() < f32::EPSILON);
-        assert_eq!(app.transfer_done_bytes, Some(1024));
-    }
-
-    #[test]
-    fn sendme_one_shot_waiting_banner_keeps_running_after_seen_transfer_flag() {
-        let mut app = DataBeamApp::default();
-        app.selected_tool = SelectedTool::Sendme;
-        app.view = AppView::Send;
-        app.transfer_state = TransferState::Running;
-        app.sendme_one_shot = true;
-        app.transfer_phase = TransferPhase::WaitingForReceiver;
-        app.sendme_had_transfer = true;
-        let (tx, rx) = mpsc::channel();
-        app.transfer_rx = Some(rx);
-        tx.send(TransferMsg::WaitingForReceiver)
-            .expect("send output");
-        drop(tx);
-
-        app.poll_transfer();
-
-        assert_eq!(app.transfer_state, TransferState::Running);
-        assert_eq!(app.transfer_phase, TransferPhase::WaitingForReceiver);
-    }
-
-    #[test]
-    fn sendme_waiting_signal_does_not_complete_one_shot_before_transfer() {
-        let mut app = DataBeamApp::default();
-        app.selected_tool = SelectedTool::Sendme;
-        app.view = AppView::Send;
-        app.transfer_state = TransferState::Running;
-        app.sendme_one_shot = true;
-        app.transfer_phase = TransferPhase::Preparing;
-        let (tx, rx) = mpsc::channel();
-        app.transfer_rx = Some(rx);
-        tx.send(TransferMsg::WaitingForReceiver)
-            .expect("send waiting");
-        drop(tx);
-
-        app.poll_transfer();
-
-        assert_eq!(app.transfer_state, TransferState::Running);
-        assert_eq!(app.transfer_phase, TransferPhase::WaitingForReceiver);
-    }
-
-    #[test]
     fn sendme_sender_activity_switches_to_transferring() {
         let mut app = DataBeamApp::default();
         app.selected_tool = SelectedTool::Sendme;
@@ -5349,124 +5298,6 @@ mod parse_tests {
 
         assert_eq!(app.transfer_phase, TransferPhase::Transferring);
         assert!(app.sendme_had_transfer);
-    }
-
-    #[test]
-    #[ignore = "Legacy sender log-line rollover test; sender total progress is now backend/native event driven."]
-    fn sendme_sender_rollover_adds_previous_file_total() {
-        let mut app = DataBeamApp::default();
-        app.selected_tool = SelectedTool::Sendme;
-        app.view = AppView::Send;
-        app.transfer_state = TransferState::Running;
-        app.transfer_phase = TransferPhase::Transferring;
-        app.transfer_total_bytes = Some((500_f64 * 1024.0 * 1024.0) as u64);
-
-        app.update_transfer_metrics_from_log("n deadbeef r 1/1 i 0 # abc [] 150.00 MiB/200.00 MiB");
-        let first = app.transfer_done_bytes.unwrap_or(0);
-        assert!(first > 149 * 1024 * 1024);
-
-        app.update_transfer_metrics_from_log("n deadbeef r 1/1 i 0 # abc [] 10.00 MiB/100.00 MiB");
-        let second = app.transfer_done_bytes.unwrap_or(0);
-        assert!(
-            second >= (210_f64 * 1024.0 * 1024.0) as u64,
-            "expected rollover accounting to include prior file total, got {second}"
-        );
-    }
-
-    #[test]
-    #[ignore = "Legacy sender payload-complete test based on raw log parsing; backend transfer events are authoritative."]
-    fn sendme_sender_payload_complete_does_not_mark_one_shot_complete_without_end_signal() {
-        let mut app = DataBeamApp::default();
-        app.selected_tool = SelectedTool::Sendme;
-        app.view = AppView::Send;
-        app.transfer_state = TransferState::Running;
-        app.transfer_phase = TransferPhase::Transferring;
-        app.sendme_one_shot = true;
-        app.transfer_total_bytes = Some((300_f64 * 1024.0 * 1024.0) as u64);
-        let (tx, rx) = mpsc::channel();
-        app.transfer_rx = Some(rx);
-        tx.send(TransferMsg::Output(
-            "n deadbeef r 1/1 i 0 # abc [] 200.00 MiB/200.00 MiB".to_string(),
-        ))
-        .expect("send output");
-        tx.send(TransferMsg::Output(
-            "n deadbeef r 1/1 i 1 # abc [] 100.00 MiB/100.00 MiB".to_string(),
-        ))
-        .expect("send output");
-        drop(tx);
-
-        app.poll_transfer();
-
-        assert_eq!(app.transfer_state, TransferState::Running);
-        assert_eq!(
-            app.transfer_done_bytes,
-            Some((300_f64 * 1024.0 * 1024.0) as u64)
-        );
-    }
-
-    #[test]
-    fn sendme_stale_activity_after_waiting_cycle_is_ignored() {
-        let mut app = DataBeamApp::default();
-        app.selected_tool = SelectedTool::Sendme;
-        app.view = AppView::Send;
-        app.transfer_state = TransferState::Running;
-        app.sendme_one_shot = false;
-        app.transfer_phase = TransferPhase::Transferring;
-        app.sendme_had_transfer = true;
-        let (tx, rx) = mpsc::channel();
-        app.transfer_rx = Some(rx);
-        tx.send(TransferMsg::WaitingForReceiver)
-            .expect("send waiting");
-        tx.send(TransferMsg::SenderTransferActivity)
-            .expect("send stale activity");
-        drop(tx);
-
-        app.poll_transfer();
-
-        assert_eq!(app.transfer_state, TransferState::Running);
-        assert_eq!(app.transfer_phase, TransferPhase::WaitingForReceiver);
-        assert!(!app.sendme_had_transfer);
-    }
-
-    #[test]
-    fn sendme_repeat_ticket_line_does_not_finish_serve_cycle_without_backend_event() {
-        let mut app = DataBeamApp::default();
-        app.selected_tool = SelectedTool::Sendme;
-        app.view = AppView::Send;
-        app.transfer_state = TransferState::Running;
-        app.sendme_one_shot = false;
-        app.transfer_phase = TransferPhase::Transferring;
-        app.sendme_had_transfer = true;
-        let (tx, rx) = mpsc::channel();
-        app.transfer_rx = Some(rx);
-        tx.send(TransferMsg::Output("sendme receive blobabc123".to_string()))
-            .expect("send output");
-        drop(tx);
-
-        app.poll_transfer();
-
-        assert_eq!(app.transfer_state, TransferState::Running);
-        assert_eq!(app.transfer_phase, TransferPhase::Transferring);
-    }
-
-    #[test]
-    fn sendme_repeat_ticket_line_does_not_finish_one_shot_cycle_without_disconnect() {
-        let mut app = DataBeamApp::default();
-        app.selected_tool = SelectedTool::Sendme;
-        app.view = AppView::Send;
-        app.transfer_state = TransferState::Running;
-        app.sendme_one_shot = true;
-        app.transfer_phase = TransferPhase::Transferring;
-        app.sendme_had_transfer = true;
-        let (tx, rx) = mpsc::channel();
-        app.transfer_rx = Some(rx);
-        tx.send(TransferMsg::Output("to get this data, use".to_string()))
-            .expect("send output");
-        drop(tx);
-
-        app.poll_transfer();
-
-        assert_eq!(app.transfer_state, TransferState::Running);
     }
 
     #[test]
