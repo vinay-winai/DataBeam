@@ -8,6 +8,7 @@
 
 ## Common UI Issues
 - If app width is small , UI persentation may not be desirable. In that case , please resize the app window.
+- progress bar/status is broken, acts funky if retry during export. But don't worry the core functionality is not disrupted. Just an UI issue.
 
 ## Suggestions
 - Use Standalone Sendme mode for sensitive data transfers.
