@@ -16,8 +16,10 @@ use flate2::read::GzDecoder;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use sendme_native::{
     check_and_export_local_in as native_check_and_export_local_in,
+    cleanup_sendme_receive_artifacts_for_ticket_in as native_cleanup_sendme_receive_artifacts_for_ticket_in,
     download as native_sendme_download,
     local_ticket_size_on_disk as native_local_ticket_size_on_disk,
+    local_ticket_size_on_disk_in as native_local_ticket_size_on_disk_in,
     start_share as native_sendme_start_share,
     cleanup_sendme_receive_artifacts_for_ticket as native_cleanup_sendme_receive_artifacts_for_ticket,
     AddrInfoOptions as NativeAddrInfoOptions, AppHandle as NativeSendmeAppHandle,
@@ -584,13 +586,19 @@ pub struct CrocReceiveOptions {
 pub struct SendmeSendOptions {
     pub paths: Vec<PathBuf>,
     pub one_shot: bool,
+    pub blob_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SendmeReceiveOptions {
     pub ticket: String,
     pub output_dir: Option<PathBuf>,
+    pub blob_dir: Option<PathBuf>,
     pub overwrite: bool,
+}
+
+fn sender_blob_base_dir(base_dir: Option<&Path>) -> Option<PathBuf> {
+    base_dir.map(|dir| dir.join("databeam_sender_stuff"))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -968,7 +976,7 @@ pub fn croc_send(
                 cmd.arg(text);
             }
         } else {
-            let send_path = match create_staging_dir(&opts.paths) {
+            let send_path = match create_staging_dir(&opts.paths, None) {
                 Ok(path) => path,
                 Err(e) => {
                     let _ = tx.send(TransferMsg::Error(format!("Failed to stage files: {}", e)));
@@ -1148,7 +1156,9 @@ pub fn sendme_send(
     let child_pid = Arc::new(std::sync::Mutex::new(None));
 
     let _worker = thread::spawn(move || {
-        let (send_path, _staging_dir_path) = match create_staging_dir(&opts.paths) {
+        let sender_blob_dir = sender_blob_base_dir(opts.blob_dir.as_deref());
+        let (send_path, _staging_dir_path) =
+            match create_staging_dir(&opts.paths, sender_blob_dir.as_deref()) {
             Ok(path) => (path, None::<PathBuf>), // We keep path, but we don't have a TempDir object anymore as it's deterministic
             Err(e) => {
                 let _ = tx.send(TransferMsg::Error(format!("Failed to stage files: {}", e)));
@@ -1181,6 +1191,7 @@ pub fn sendme_send(
                 ticket_type: NativeAddrInfoOptions::RelayAndAddresses,
                 magic_ipv4_addr: None,
                 magic_ipv6_addr: None,
+                blob_dir: sender_blob_dir.clone(),
             },
             app_handle,
         ));
@@ -1473,14 +1484,18 @@ pub fn sendme_send(
 
         let _ = fs::remove_dir_all(&share.blobs_data_dir);
         let _ = fs::remove_dir_all(&send_path); // Clean up the deterministic staging folder too
-        cleanup_sendme_send_dirs(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-        cleanup_sendme_temp_artifacts();
+        if let Some(blob_base) = sender_blob_dir.as_ref() {
+            cleanup_sendme_send_dirs(blob_base);
+            cleanup_sendme_temp_artifacts(blob_base);
+        }
+        cleanup_sendme_send_dirs(&std::env::temp_dir());
+        cleanup_sendme_temp_artifacts(&std::env::temp_dir());
     });
 
     (rx, ProcessHandle { cancel, child_pid })
 }
 /// Create a deterministic staging directory with all items copied/linked into it for sendme
-fn create_staging_dir(paths: &[PathBuf]) -> Result<PathBuf, String> {
+fn create_staging_dir(paths: &[PathBuf], base_dir: Option<&Path>) -> Result<PathBuf, String> {
     if paths.is_empty() {
         return Err("No paths provided".to_string());
     }
@@ -1515,7 +1530,10 @@ fn create_staging_dir(paths: &[PathBuf]) -> Result<PathBuf, String> {
     name_slug.push_str("_databeam");
 
     // 3. Create the staging directory in Temp (not auto-deleted by TempDir object, but manual)
-    let temp_base = std::env::temp_dir();
+    let temp_base = base_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    fs::create_dir_all(&temp_base).map_err(|e| format!("Could not create staging base dir: {}", e))?;
     let staging_path = temp_base.join(&name_slug);
     
     // Clear any previous STALE staging attempt for this specific payload
@@ -1603,8 +1621,7 @@ fn cleanup_sendme_send_dirs(base_dir: &Path) {
     }
 }
 
-fn cleanup_sendme_temp_artifacts() {
-    let temp_base = std::env::temp_dir();
+fn cleanup_sendme_temp_artifacts(temp_base: &Path) {
     let Ok(entries) = fs::read_dir(&temp_base) else {
         return;
     };
@@ -1625,6 +1642,7 @@ fn cleanup_sendme_temp_artifacts() {
             let _ = fs::remove_file(path);
         }
     }
+    let _ = fs::remove_dir(temp_base);
 }
 
 #[allow(dead_code)]
@@ -1687,7 +1705,7 @@ pub fn sendme_receive(
                 relay_mode: NativeRelayModeOption::Default,
                 magic_ipv4_addr: None,
                 magic_ipv6_addr: None,
-                blob_dir: None,
+                blob_dir: opts.blob_dir.clone(),
                 overwrite: opts.overwrite,
             },
             app_handle,
@@ -1824,10 +1842,19 @@ pub fn sendme_check_local(
 
         let ticket = opts.ticket.clone();
         let output_dir = opts.output_dir.clone();
+        let blob_dir = opts.blob_dir.clone();
         let overwrite = opts.overwrite;
         let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<()>();
         let task = runtime.spawn(async move {
-            native_check_and_export_local_in(&ticket, output_dir, app_handle, None, overwrite, Some(abort_rx)).await
+            native_check_and_export_local_in(
+                &ticket,
+                output_dir,
+                app_handle,
+                blob_dir,
+                overwrite,
+                Some(abort_rx),
+            )
+            .await
         });
 
         // Forward events to the transfer channel while task runs
@@ -1897,12 +1924,21 @@ pub fn sendme_check_local(
 
 
 
-pub fn cleanup_sendme_receive_artifacts_for_ticket(ticket_str: &str) {
-    native_cleanup_sendme_receive_artifacts_for_ticket(ticket_str)
+pub fn cleanup_sendme_receive_artifacts_for_ticket(ticket_str: &str, blob_dir: Option<&Path>) {
+    match blob_dir {
+        Some(path) => native_cleanup_sendme_receive_artifacts_for_ticket_in(
+            ticket_str,
+            Some(path.to_path_buf()),
+        ),
+        None => native_cleanup_sendme_receive_artifacts_for_ticket(ticket_str),
+    }
 }
 
-pub fn get_sendme_blob_directory_size(ticket_str: &str) -> u64 {
-    native_local_ticket_size_on_disk(ticket_str)
+pub fn get_sendme_blob_directory_size(ticket_str: &str, blob_dir: Option<&Path>) -> u64 {
+    match blob_dir {
+        Some(path) => native_local_ticket_size_on_disk_in(ticket_str, Some(path.to_path_buf())),
+        None => native_local_ticket_size_on_disk(ticket_str),
+    }
 }
 
 

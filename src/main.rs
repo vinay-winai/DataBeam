@@ -59,6 +59,7 @@ enum PickerRequest {
     SendFolder,
     SendFiles,
     ReceiveFolder,
+    SendmeBlobFolder,
 }
 
 #[derive(Debug)]
@@ -66,6 +67,7 @@ enum PickerResult {
     SendFolder(Option<PathBuf>),
     SendFiles(Option<Vec<PathBuf>>),
     ReceiveFolder(Option<PathBuf>),
+    SendmeBlobFolder(Option<PathBuf>),
 }
 
 /// A file/folder entry with its cached size
@@ -91,6 +93,15 @@ struct EazyCacheEntry {
     timestamp: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum SendmeBlobDirMode {
+    #[default]
+    SystemTemp,
+    DownloadDir,
+    Custom,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UserSettings {
     #[serde(default)]
@@ -101,6 +112,10 @@ struct UserSettings {
     croc_receive_recent_codes: Vec<String>,
     #[serde(default)]
     receive_output_dir: Option<String>,
+    #[serde(default)]
+    sendme_blob_dir_mode: SendmeBlobDirMode,
+    #[serde(default)]
+    sendme_blob_custom_dir: Option<String>,
     #[serde(default = "default_sendme_one_shot")]
     sendme_one_shot: bool,
     #[serde(default)]
@@ -147,6 +162,8 @@ struct DataBeamApp {
     // Receive
     receive_code: String,
     receive_output_dir: Option<PathBuf>,
+    sendme_blob_dir_mode: SendmeBlobDirMode,
+    sendme_blob_custom_dir: Option<PathBuf>,
 
     // Transfer
     transfer_state: TransferState,
@@ -247,6 +264,8 @@ impl Default for DataBeamApp {
             croc_text_value: String::new(),
             receive_code: String::new(),
             receive_output_dir: None,
+            sendme_blob_dir_mode: SendmeBlobDirMode::SystemTemp,
+            sendme_blob_custom_dir: None,
             transfer_state: TransferState::Idle,
             transfer_progress: 0.0,
             transfer_code: None,
@@ -425,6 +444,12 @@ impl DataBeamApp {
             .as_ref()
             .map(PathBuf::from)
             .filter(|p| !p.as_os_str().is_empty());
+        self.sendme_blob_dir_mode = settings.sendme_blob_dir_mode;
+        self.sendme_blob_custom_dir = settings
+            .sendme_blob_custom_dir
+            .as_ref()
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty());
         self.sendme_one_shot = settings.sendme_one_shot;
         self.eazysendme_custom_code = settings.eazysendme_custom_code;
         self.eazysendme_auto_retry = true; // Always true on launch
@@ -448,6 +473,11 @@ impl DataBeamApp {
             croc_receive_recent_codes: self.croc_receive_recent_codes.clone(),
             receive_output_dir: self
                 .receive_output_dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            sendme_blob_dir_mode: self.sendme_blob_dir_mode,
+            sendme_blob_custom_dir: self
+                .sendme_blob_custom_dir
                 .as_ref()
                 .map(|p| p.to_string_lossy().to_string()),
             sendme_one_shot: self.sendme_one_shot,
@@ -479,7 +509,10 @@ impl DataBeamApp {
             }
         });
         if let Some(ticket) = ticket_to_cleanup {
-            crate::backend::cleanup_sendme_receive_artifacts_for_ticket(&ticket);
+            crate::backend::cleanup_sendme_receive_artifacts_for_ticket(
+                &ticket,
+                self.effective_sendme_blob_dir().as_deref(),
+            );
         }
         self.persist_user_settings();
     }
@@ -500,6 +533,42 @@ impl DataBeamApp {
         self.receive_output_dir
             .clone()
             .or_else(|| std::env::current_dir().ok())
+    }
+
+    fn effective_sendme_blob_dir(&self) -> Option<PathBuf> {
+        match self.sendme_blob_dir_mode {
+            SendmeBlobDirMode::SystemTemp => None,
+            SendmeBlobDirMode::DownloadDir => self.effective_receive_folder(),
+            SendmeBlobDirMode::Custom => self
+                .sendme_blob_custom_dir
+                .clone()
+                .filter(|p| !p.as_os_str().is_empty()),
+        }
+    }
+
+    fn sendme_blob_scan_roots(&self) -> Vec<PathBuf> {
+        let mut roots = vec![std::env::temp_dir()];
+        if let Some(custom) = self.effective_sendme_blob_dir() {
+            if !roots.iter().any(|root| root == &custom) {
+                roots.push(custom);
+            }
+        }
+        roots
+    }
+
+    fn sendme_blob_dir_summary(&self) -> String {
+        match self.sendme_blob_dir_mode {
+            SendmeBlobDirMode::SystemTemp => std::env::temp_dir().to_string_lossy().to_string(),
+            SendmeBlobDirMode::DownloadDir => self
+                .effective_receive_folder()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Same as download folder".to_string()),
+            SendmeBlobDirMode::Custom => self
+                .sendme_blob_custom_dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Choose a folder".to_string()),
+        }
     }
 
     fn update_derived_speed_from_done_bytes(&mut self) {
@@ -556,6 +625,9 @@ impl DataBeamApp {
                 PickerRequest::ReceiveFolder => {
                     PickerResult::ReceiveFolder(rfd::FileDialog::new().pick_folder())
                 }
+                PickerRequest::SendmeBlobFolder => {
+                    PickerResult::SendmeBlobFolder(rfd::FileDialog::new().pick_folder())
+                }
             };
             let _ = tx.send(result);
         });
@@ -582,9 +654,15 @@ impl DataBeamApp {
                         self.receive_output_dir = Some(path);
                         self.persist_user_settings();
                     }
+                    PickerResult::SendmeBlobFolder(Some(path)) => {
+                        self.sendme_blob_custom_dir = Some(path);
+                        self.sendme_blob_dir_mode = SendmeBlobDirMode::Custom;
+                        self.persist_user_settings();
+                    }
                     PickerResult::SendFolder(None)
                     | PickerResult::SendFiles(None)
-                    | PickerResult::ReceiveFolder(None) => {}
+                    | PickerResult::ReceiveFolder(None)
+                    | PickerResult::SendmeBlobFolder(None) => {}
                 }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -1671,6 +1749,7 @@ impl DataBeamApp {
                                             let opts = SendmeReceiveOptions {
                                                 ticket: normalized_ticket,
                                                 output_dir: self.receive_output_dir.clone(),
+                                                blob_dir: self.effective_sendme_blob_dir(),
                                                 overwrite: true, // Smart overwrite is now the default
                                             };
                                             let sendme_binary = self.get_tool_binary(&Tool::Sendme).unwrap_or_default();
@@ -1700,7 +1779,10 @@ impl DataBeamApp {
                                             && self.view == AppView::Receive
                                         {
                                             if let Some(ticket) = self.transfer_code.clone() {
-                                                crate::backend::cleanup_sendme_receive_artifacts_for_ticket(&ticket);
+                                                crate::backend::cleanup_sendme_receive_artifacts_for_ticket(
+                                                    &ticket,
+                                                    self.effective_sendme_blob_dir().as_deref(),
+                                                );
                                             }
                                         }
                                          
@@ -1712,9 +1794,12 @@ impl DataBeamApp {
                                              } else {
                                                  // Fallback
                                                  self.eazysendme_code_ticket_map.remove(&code_key);
-                                                 crate::backend::cleanup_sendme_receive_artifacts_for_ticket(&entry.ticket);
+                                                 crate::backend::cleanup_sendme_receive_artifacts_for_ticket(
+                                                     &entry.ticket,
+                                                     self.effective_sendme_blob_dir().as_deref(),
+                                                 );
                                                  self.persist_user_settings();
-                                             }
+                                              }
                                          }
                                     }
                                 }
@@ -2126,6 +2211,7 @@ impl DataBeamApp {
                 let opts = SendmeSendOptions {
                     paths: self.send_paths(),
                     one_shot: self.sendme_one_shot,
+                    blob_dir: self.effective_sendme_blob_dir(),
                 };
                 let (rx, handle) = sendme_send(opts, &binary);
                 self.transfer_rx = Some(rx);
@@ -2153,6 +2239,7 @@ impl DataBeamApp {
                 let opts = SendmeSendOptions {
                     paths: self.send_paths(),
                     one_shot: true,
+                    blob_dir: self.effective_sendme_blob_dir(),
                 };
                 let (rx, handle) = sendme_send(opts, &binary);
                 self.transfer_rx = Some(rx);
@@ -2220,6 +2307,7 @@ impl DataBeamApp {
                 let opts = SendmeReceiveOptions {
                     ticket: self.receive_code.trim().to_string(),
                     output_dir: self.receive_output_dir.clone(),
+                    blob_dir: self.effective_sendme_blob_dir(),
                     overwrite: true, // Smart overwrite for standalone Sendme receive.
                 };
                 let (rx, handle) = sendme_receive(opts, &binary);
@@ -2230,7 +2318,10 @@ impl DataBeamApp {
                 let code_key = self.receive_code.trim().to_string();
 
                 if let Some(entry) = self.eazysendme_code_ticket_map.get(&code_key) {
-                    let disk_size = crate::backend::get_sendme_blob_directory_size(&entry.ticket);
+                    let disk_size = crate::backend::get_sendme_blob_directory_size(
+                        &entry.ticket,
+                        self.effective_sendme_blob_dir().as_deref(),
+                    );
 
                     self.transfer_log.push(if disk_size > 0 {
                         format!(
@@ -2247,6 +2338,7 @@ impl DataBeamApp {
                     let opts = SendmeReceiveOptions {
                         ticket: entry.ticket.clone(),
                         output_dir: self.receive_output_dir.clone(),
+                        blob_dir: self.effective_sendme_blob_dir(),
                         overwrite: true, // Use smart overwrite for local exports too
                     };
                     let (rx, handle) = sendme_check_local(opts);
@@ -2523,11 +2615,11 @@ impl eframe::App for DataBeamApp {
             let (tx, rx) = std::sync::mpsc::channel();
             self.cleanup_scan_rx = Some(rx);
             let map = self.eazysendme_code_ticket_map.clone();
+            let scan_roots = self.sendme_blob_scan_roots();
             std::thread::spawn(move || {
                 let mut targets = Vec::new();
                 let mut total_bytes = 0;
-                let temp_dir = std::env::temp_dir();
-                
+
                 fn dir_size(path: &std::path::Path) -> u64 {
                     let mut total = 0;
                     if let Ok(entries) = std::fs::read_dir(path) {
@@ -2543,29 +2635,35 @@ impl eframe::App for DataBeamApp {
                     }
                     total
                 }
-                
-                if let Ok(entries) = std::fs::read_dir(&temp_dir) {
-                    for entry in entries.flatten() {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        if name.starts_with(".sendme-recv-") {
-                            let path = entry.path();
-                            if !path.is_dir() { continue; }
-                            
-                            let hex_hash = name.strip_prefix(".sendme-recv-").unwrap_or("");
-                            let mut is_incomplete = true;
-                            for cache in map.values() {
-                                if let Some(h) = native_ticket_to_hex_hash(&cache.ticket) {
-                                    if h == hex_hash {
-                                        is_incomplete = false; // managed cache entry
-                                        break;
+
+                for root in scan_roots {
+                    if let Ok(entries) = std::fs::read_dir(&root) {
+                        for entry in entries.flatten() {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            if name.starts_with(".sendme-recv-") {
+                                let path = entry.path();
+                                if !path.is_dir() {
+                                    continue;
+                                }
+
+                                let hex_hash = name.strip_prefix(".sendme-recv-").unwrap_or("");
+                                let mut is_incomplete = true;
+                                for cache in map.values() {
+                                    if let Some(h) = native_ticket_to_hex_hash(&cache.ticket) {
+                                        if h == hex_hash {
+                                            is_incomplete = false;
+                                            break;
+                                        }
                                     }
                                 }
-                            }
-                            // Empty temp dirs with size 0 aren't worth bothering the user about
-                            let size = dir_size(&path);
-                            if is_incomplete && size > 1024 * 1024 {
-                                targets.push(path);
-                                total_bytes += size;
+                                let size = dir_size(&path);
+                                if is_incomplete
+                                    && size > 1024 * 1024
+                                    && !targets.iter().any(|existing| existing == &path)
+                                {
+                                    targets.push(path);
+                                    total_bytes += size;
+                                }
                             }
                         }
                     }
@@ -3198,6 +3296,105 @@ impl DataBeamApp {
         });
     }
 
+    fn show_sendme_blob_dir_setup(&mut self, ui: &mut egui::Ui, locked: bool) {
+        if self.selected_tool != SelectedTool::Sendme
+            && self.selected_tool != SelectedTool::EazySendme
+        {
+            return;
+        }
+
+        card_frame(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Blob Cache")
+                        .color(TEXT_PRIMARY)
+                        .strong()
+                        .size(13.0),
+                );
+                ui.label(
+                    RichText::new(truncate_middle(&self.sendme_blob_dir_summary(), 46))
+                        .color(TEXT_MUTED)
+                        .size(11.0),
+                );
+            });
+            ui.add_space(4.0);
+            ui.add_enabled_ui(!locked, |ui| {
+                let mut changed = false;
+                changed |= ui
+                    .radio_value(
+                        &mut self.sendme_blob_dir_mode,
+                        SendmeBlobDirMode::SystemTemp,
+                        "Use OS temp folder",
+                    )
+                    .changed();
+                changed |= ui
+                    .radio_value(
+                        &mut self.sendme_blob_dir_mode,
+                        SendmeBlobDirMode::DownloadDir,
+                        "Use same folder as downloads",
+                    )
+                    .changed();
+                changed |= ui
+                    .radio_value(
+                        &mut self.sendme_blob_dir_mode,
+                        SendmeBlobDirMode::Custom,
+                        "Use custom folder",
+                    )
+                    .changed();
+
+                if self.sendme_blob_dir_mode == SendmeBlobDirMode::Custom {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let custom_text = self
+                            .sendme_blob_custom_dir
+                            .as_ref()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "Choose a folder".to_string());
+                        ui.label(
+                            RichText::new(truncate_middle(&custom_text, 40))
+                                .color(TEXT_MUTED)
+                                .size(10.5),
+                        );
+                        if accent_button_sized(
+                            ui,
+                            "📂",
+                            self.engine_color(),
+                            Vec2::new(32.0, 22.0),
+                        )
+                        .clicked()
+                        {
+                            self.launch_picker(PickerRequest::SendmeBlobFolder);
+                        }
+                        if self.sendme_blob_custom_dir.is_some()
+                            && accent_button_sized(
+                                ui,
+                                "✕",
+                                Color32::from_rgb(130, 85, 85),
+                                Vec2::new(24.0, 22.0),
+                            )
+                            .clicked()
+                        {
+                            self.sendme_blob_custom_dir = None;
+                            self.sendme_blob_dir_mode = SendmeBlobDirMode::SystemTemp;
+                            changed = true;
+                        }
+                    });
+                }
+
+                if changed {
+                    self.persist_user_settings();
+                }
+            });
+            ui.label(
+                RichText::new(
+                    "Used for Sendme and EazySendme temporary blob/cache data on both send and receive.",
+                )
+                .color(TEXT_MUTED)
+                .size(10.0),
+            );
+        });
+    }
+
     fn show_send(&mut self, ui: &mut egui::Ui) {
         section_header(ui, "📤", "Send");
         ui.add_space(4.0);
@@ -3278,6 +3475,13 @@ impl DataBeamApp {
         }
 
         // ── File list ──
+        self.show_sendme_blob_dir_setup(ui, send_locked);
+        if self.selected_tool == SelectedTool::Sendme
+            || self.selected_tool == SelectedTool::EazySendme
+        {
+            ui.add_space(6.0);
+        }
+
         card_frame(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
@@ -3639,7 +3843,10 @@ impl DataBeamApp {
                     };
 
                     if let Some(tick) = ticket_to_check {
-                        let disk_size = crate::backend::get_sendme_blob_directory_size(&tick);
+                        let disk_size = crate::backend::get_sendme_blob_directory_size(
+                            &tick,
+                            self.effective_sendme_blob_dir().as_deref(),
+                        );
                         if disk_size > 0 {
                             (
                                 true,
@@ -3731,6 +3938,15 @@ impl DataBeamApp {
                 });
             });
         });
+        self.show_sendme_blob_dir_setup(
+            ui,
+            self.transfer_state == TransferState::Running,
+        );
+        if self.selected_tool == SelectedTool::Sendme
+            || self.selected_tool == SelectedTool::EazySendme
+        {
+            ui.add_space(6.0);
+        }
         if self.selected_tool == SelectedTool::Croc {
             let text = self
                 .croc_received_text
