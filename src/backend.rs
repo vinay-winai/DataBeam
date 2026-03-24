@@ -13,7 +13,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use flate2::read::GzDecoder;
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use sendme_native::{
     check_and_export_local_in as native_check_and_export_local_in,
     cleanup_sendme_receive_artifacts_for_ticket_in as native_cleanup_sendme_receive_artifacts_for_ticket_in,
@@ -601,6 +600,39 @@ fn sender_blob_base_dir(base_dir: Option<&Path>) -> Option<PathBuf> {
     base_dir.map(|dir| dir.join("databeam_sender_stuff"))
 }
 
+fn derive_payload_root_name(paths: &[PathBuf]) -> Result<String, String> {
+    if paths.is_empty() {
+        return Err("No paths provided".to_string());
+    }
+
+    let mut largest_item = &paths[0];
+    let mut largest_size = 0u64;
+
+    for p in paths {
+        let size = if p.is_dir() {
+            get_dir_size(p)
+        } else {
+            fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+        };
+        if size > largest_size {
+            largest_size = size;
+            largest_item = p;
+        }
+    }
+
+    let base_name = largest_item
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("files");
+
+    let mut name_slug: String = base_name.chars().take(20).collect();
+    if paths.len() > 1 {
+        name_slug.push_str("_and_more");
+    }
+    name_slug.push_str("_databeam");
+    Ok(name_slug)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct NativeSenderRequestStarted {
     endpoint_id: String,
@@ -888,64 +920,6 @@ fn read_lines_cr_aware(
     }
 }
 
-#[allow(dead_code)]
-fn run_sendme_with_pty(
-    binary: &str,
-    args: &[String],
-    runtime_dir: &Path,
-    current_dir: Option<&Path>,
-    tx: &mpsc::Sender<TransferMsg>,
-    cancel: Arc<AtomicBool>,
-    pid_handle: Arc<std::sync::Mutex<Option<u32>>>,
-    parser: fn(&str, &mpsc::Sender<TransferMsg>, &Arc<AtomicBool>),
-) -> Result<(bool, String), String> {
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: 40,
-            cols: 120,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| format!("Failed to create PTY: {e}"))?;
-
-    let mut cmd = CommandBuilder::new(binary);
-    cmd.env("RUST_LOG", "info");
-    cmd.env("IROH_DATA_DIR", runtime_dir.to_string_lossy().to_string());
-    for arg in args {
-        cmd.arg(arg);
-    }
-    if let Some(dir) = current_dir {
-        cmd.cwd(dir.to_string_lossy().to_string());
-    }
-
-    let mut child = pair
-        .slave
-        .spawn_command(cmd)
-        .map_err(|e| format!("Failed to start sendme in PTY: {e}"))?;
-
-    if let Ok(mut guard) = pid_handle.lock() {
-        *guard = child.process_id();
-    }
-
-    let reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|e| format!("Failed to attach PTY reader: {e}"))?;
-    let tx_reader = tx.clone();
-    let cancel_reader = cancel.clone();
-    let reader_thread = thread::spawn(move || {
-        read_lines_cr_aware(reader, tx_reader, parser, cancel_reader);
-    });
-
-    let status = child
-        .wait()
-        .map_err(|e| format!("Process wait failed: {e}"))?;
-    let _ = reader_thread.join();
-
-    Ok((status.success(), format!("{status:?}")))
-}
-
 // ── Croc Send ──────────────────────────────────────────────────────
 
 pub fn croc_send(
@@ -969,22 +943,15 @@ pub fn croc_send(
         if let Some(code) = &opts.custom_code {
             cmd.env("CROC_SECRET", code);
         }
-        let mut _staging_holder: Option<PathBuf> = None;
         if opts.text_mode {
             cmd.arg("--text");
             if let Some(text) = &opts.text_value {
                 cmd.arg(text);
             }
         } else {
-            let send_path = match create_staging_dir(&opts.paths, None) {
-                Ok(path) => path,
-                Err(e) => {
-                    let _ = tx.send(TransferMsg::Error(format!("Failed to stage files: {}", e)));
-                    return;
-                }
-            };
-            cmd.arg(&send_path);
-            // No _staging_holder needed as we use deterministic directories in Temp
+            for path in &opts.paths {
+                cmd.arg(path);
+            }
         }
 
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -1157,14 +1124,15 @@ pub fn sendme_send(
 
     let _worker = thread::spawn(move || {
         let sender_blob_dir = sender_blob_base_dir(opts.blob_dir.as_deref());
-        let (send_path, _staging_dir_path) =
-            match create_staging_dir(&opts.paths, sender_blob_dir.as_deref()) {
-            Ok(path) => (path, None::<PathBuf>), // We keep path, but we don't have a TempDir object anymore as it's deterministic
+        let payload_root_name = match derive_payload_root_name(&opts.paths) {
+            Ok(name) => name,
             Err(e) => {
-                let _ = tx.send(TransferMsg::Error(format!("Failed to stage files: {}", e)));
+                let _ = tx.send(TransferMsg::Error(format!("Failed to prepare payload: {}", e)));
                 return;
             }
         };
+
+        let paths = opts.paths.clone();
 
         let _ = tx.send(TransferMsg::Started);
 
@@ -1185,7 +1153,8 @@ pub fn sendme_send(
         let (evt_tx, evt_rx) = mpsc::channel::<NativeSendmeEvent>();
         let app_handle: NativeSendmeAppHandle = Some(Arc::new(NativeSendmeEmitter::new(evt_tx)));
         let share = runtime.block_on(native_sendme_start_share(
-            send_path.clone(),
+            paths,
+            payload_root_name,
             NativeSendOptions {
                 relay_mode: NativeRelayModeOption::Default,
                 ticket_type: NativeAddrInfoOptions::RelayAndAddresses,
@@ -1483,7 +1452,6 @@ pub fn sendme_send(
         }
 
         let _ = fs::remove_dir_all(&share.blobs_data_dir);
-        let _ = fs::remove_dir_all(&send_path); // Clean up the deterministic staging folder too
         if let Some(blob_base) = sender_blob_dir.as_ref() {
             cleanup_sendme_send_dirs(blob_base);
             cleanup_sendme_temp_artifacts(blob_base);
@@ -1495,78 +1463,6 @@ pub fn sendme_send(
     (rx, ProcessHandle { cancel, child_pid })
 }
 /// Create a deterministic staging directory with all items copied/linked into it for sendme
-fn create_staging_dir(paths: &[PathBuf], base_dir: Option<&Path>) -> Result<PathBuf, String> {
-    if paths.is_empty() {
-        return Err("No paths provided".to_string());
-    }
-
-    // 1. Find the largest item to serve as the name base
-    let mut largest_item = &paths[0];
-    let mut largest_size = 0u64;
-
-    for p in paths {
-        let size = if p.is_dir() {
-            get_dir_size(p)
-        } else {
-            fs::metadata(p).map(|m| m.len()).unwrap_or(0)
-        };
-        if size > largest_size {
-            largest_size = size;
-            largest_item = p;
-        }
-    }
-
-    // 2. Construct deterministic name
-    let base_name = largest_item
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("files");
-    
-    // Cap name to 20 chars
-    let mut name_slug: String = base_name.chars().take(20).collect();
-    if paths.len() > 1 {
-        name_slug.push_str("_and_more");
-    }
-    name_slug.push_str("_databeam");
-
-    // 3. Create the staging directory in Temp (not auto-deleted by TempDir object, but manual)
-    let temp_base = base_dir
-        .map(Path::to_path_buf)
-        .unwrap_or_else(std::env::temp_dir);
-    fs::create_dir_all(&temp_base).map_err(|e| format!("Could not create staging base dir: {}", e))?;
-    let staging_path = temp_base.join(&name_slug);
-    
-    // Clear any previous STALE staging attempt for this specific payload
-    // Note: We don't remove it if we want to skip linking, but linking is cheap,
-    // so clearing ensures we don't have old files from a modified payload.
-    let _ = fs::remove_dir_all(&staging_path);
-    fs::create_dir_all(&staging_path).map_err(|e| format!("Could not create staging dir: {}", e))?;
-
-    for src in paths {
-        // Prevent recursion
-        if staging_path.starts_with(src) {
-             continue;
-        }
-
-        let name = src
-            .file_name()
-            .ok_or_else(|| format!("Invalid path: {}", src.display()))?;
-        let dest = staging_path.join(name);
-
-        if src.is_dir() {
-            copy_dir_recursive(src, &dest)
-                .map_err(|e| format!("Failed to copy {}: {}", src.display(), e))?;
-        } else {
-            // Try hard link first, fallback to copy
-            if fs::hard_link(src, &dest).is_err() {
-                fs::copy(src, &dest).map_err(|e| format!("Failed to copy {}: {}", src.display(), e))?;
-            }
-        }
-    }
-
-    Ok(staging_path)
-}
-
 fn get_dir_size(path: &Path) -> u64 {
     let mut total = 0;
     if let Ok(entries) = fs::read_dir(path) {
@@ -1580,26 +1476,6 @@ fn get_dir_size(path: &Path) -> u64 {
         }
     }
     total
-}
-
-fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
-        } else if fs::hard_link(&src_path, &dst_path).is_err() {
-            fs::copy(&src_path, &dst_path)?;
-        }
-    }
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn cleanup_runtime_dir(path: &Path) {
-    let _ = fs::remove_dir_all(path);
 }
 
 fn cleanup_sendme_send_dirs(base_dir: &Path) {
@@ -1643,29 +1519,6 @@ fn cleanup_sendme_temp_artifacts(temp_base: &Path) {
         }
     }
     let _ = fs::remove_dir(temp_base);
-}
-
-#[allow(dead_code)]
-fn cleanup_sendme_receive_artifacts(base_dir: &Path) {
-    let Ok(entries) = fs::read_dir(base_dir) else {
-        return;
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if !name.starts_with(".sendme") {
-            continue;
-        }
-
-        if path.is_dir() {
-            let _ = fs::remove_dir_all(path);
-        } else {
-            let _ = fs::remove_file(path);
-        }
-    }
 }
 
 // ── Sendme Receive ─────────────────────────────────────────────────
@@ -1998,118 +1851,6 @@ fn extract_croc_code(trimmed: &str) -> Option<String> {
     None
 }
 
-#[allow(dead_code)]
-fn parse_sendme_common(line: &str, tx: &mpsc::Sender<TransferMsg>) -> Option<(String, String)> {
-    // Strip ANSI escape sequences (from pty/script wrapper)
-    let cleaned = strip_ansi(line);
-    let trimmed = cleaned.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    // Ignore crossterm panic messages and internal noise
-    let lower = trimmed.to_lowercase();
-    if lower.contains("reader source not set")
-        || lower.contains("crossterm")
-        || lower.contains("rust_backtrace")
-        || lower.contains("panicked at")
-        || lower.contains("press c to copy")
-        || lower.contains("abort trap")
-    {
-        return None; // Don't show these as output or errors
-    }
-
-    // Detect ticket/code — sendme prints "sendme receive blob<ticket>"
-    if trimmed.contains("sendme receive ") {
-        if let Some(ticket_part) = trimmed.split("sendme receive ").last() {
-            let ticket = ticket_part.trim().to_string();
-            if !ticket.is_empty() {
-                let _ = tx.send(TransferMsg::Code(ticket));
-            }
-        }
-    } else if (trimmed.starts_with("blob") || trimmed.starts_with("Blob")) && trimmed.len() > 40 {
-        // Raw blob ticket on its own line
-        let _ = tx.send(TransferMsg::Code(trimmed.to_string()));
-    }
-
-    let _ = tx.send(TransferMsg::Output(trimmed.to_string()));
-    Some((trimmed.to_string(), lower))
-}
-
-#[allow(dead_code)]
-fn parse_sendme_send_output(line: &str, tx: &mpsc::Sender<TransferMsg>, _cancel: &Arc<AtomicBool>) {
-    let Some((trimmed, lower)) = parse_sendme_common(line, tx) else {
-        return;
-    };
-    if sendme_waiting_banner(&lower) {
-        let _ = tx.send(TransferMsg::WaitingForReceiver);
-    }
-
-    if sendme_sender_activity_line(&trimmed, &lower) {
-        let _ = tx.send(TransferMsg::SenderTransferActivity);
-    }
-
-    // Sender one-shot completion should be signaled by explicit send-finished lines.
-    if lower.contains("finished sending")
-        || lower.contains("transfer complete")
-        || lower.contains("peer disconnected")
-        || lower.contains("client disconnected")
-    {
-        let _ = tx.send(TransferMsg::Progress(1.0));
-        let _ = tx.send(TransferMsg::PeerDisconnected);
-    }
-}
-
-#[allow(dead_code)]
-fn parse_sendme_receive_output(line: &str, tx: &mpsc::Sender<TransferMsg>, _cancel: &Arc<AtomicBool>) {
-    let cleaned = strip_ansi(line);
-    let trimmed = cleaned.trim();
-    if trimmed.is_empty() {
-        return;
-    }
-
-    let Some((_trimmed, lower)) = parse_sendme_common(trimmed, tx) else {
-        return;
-    };
-
-    if lower.starts_with("error:") {
-        let _ = tx.send(TransferMsg::Error(trimmed.to_string()));
-        return;
-    }
-    // Some sendme builds keep the process alive briefly after this final summary line.
-    // Emit completion immediately so UI can transition out of downloading state.
-    if lower.contains("downloaded") && lower.contains("files") {
-        let _ = tx.send(TransferMsg::Progress(1.0));
-        let _ = tx.send(TransferMsg::Completed);
-    }
-}
-
-#[allow(dead_code)]
-fn sendme_waiting_banner(lower: &str) -> bool {
-    lower.contains("waiting for incoming transfer")
-        || lower.contains("waiting for incoming")
-        || lower.contains("waiting for receiver")
-}
-
-#[allow(dead_code)]
-fn sendme_sender_activity_line(trimmed: &str, lower: &str) -> bool {
-    if (lower.contains("[3/4]") || lower.contains("[4/4]"))
-        && (lower.contains("uploading") || lower.contains("downloading"))
-    {
-        return true;
-    }
-    if lower.contains("uploading ...") || lower.contains("downloading ...") {
-        return true;
-    }
-    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
-    for pair in tokens.windows(2) {
-        if pair[0] == "r" && pair[1].contains('/') {
-            return true;
-        }
-    }
-    false
-}
-
 /// Strip ANSI escape sequences from a string
 fn strip_ansi(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
@@ -2169,13 +1910,8 @@ impl ProcessHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        cleanup_sendme_send_dirs, parse_sendme_receive_output, parse_sendme_send_output,
-        TransferMsg,
-    };
+    use super::cleanup_sendme_send_dirs;
     use std::fs;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::{mpsc, Arc};
 
     #[test]
     fn cleanup_removes_only_sendme_send_dirs() {
@@ -2198,169 +1934,5 @@ mod tests {
         assert!(!sendme_b.exists());
         assert!(keep_dir.exists());
         assert!(keep_file.exists());
-    }
-
-    #[test]
-    fn sendme_send_parser_marks_finished_sending_as_disconnected() {
-        let (tx, rx) = mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
-        parse_sendme_send_output("finished sending to client", &tx, &cancel);
-
-        let mut saw_disconnect = false;
-        for _ in 0..4 {
-            match rx.try_recv() {
-                Ok(TransferMsg::PeerDisconnected) => {
-                    saw_disconnect = true;
-                    break;
-                }
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
-
-        assert!(
-            saw_disconnect,
-            "expected parser to emit PeerDisconnected for finished sending"
-        );
-    }
-
-    #[test]
-    fn sendme_send_parser_marks_client_disconnected_as_disconnected() {
-        let (tx, rx) = mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
-        parse_sendme_send_output("client disconnected", &tx, &cancel);
-
-        let mut saw_disconnect = false;
-        for _ in 0..4 {
-            match rx.try_recv() {
-                Ok(TransferMsg::PeerDisconnected) => {
-                    saw_disconnect = true;
-                    break;
-                }
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
-
-        assert!(
-            saw_disconnect,
-            "expected PeerDisconnected for client disconnected line"
-        );
-    }
-
-    #[test]
-    fn sendme_send_parser_emits_waiting_for_receiver_signal() {
-        let (tx, rx) = mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
-        parse_sendme_send_output("waiting for incoming transfer", &tx, &cancel);
-
-        let mut saw_waiting = false;
-        for _ in 0..6 {
-            match rx.try_recv() {
-                Ok(TransferMsg::WaitingForReceiver) => {
-                    saw_waiting = true;
-                    break;
-                }
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
-
-        assert!(
-            saw_waiting,
-            "expected parser to emit WaitingForReceiver for waiting banner"
-        );
-    }
-
-    #[test]
-    fn sendme_send_parser_emits_sender_transfer_activity() {
-        let (tx, rx) = mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
-        parse_sendme_send_output(
-            "[3/4] Uploading ... [00:03] [###>---] 300.00 MiB/600.00 MiB 10.00 MiB/s",
-            &tx,
-            &cancel,
-        );
-
-        let mut saw_activity = false;
-        for _ in 0..6 {
-            match rx.try_recv() {
-                Ok(TransferMsg::SenderTransferActivity) => {
-                    saw_activity = true;
-                    break;
-                }
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
-
-        assert!(
-            saw_activity,
-            "expected parser to emit SenderTransferActivity for upload progress line"
-        );
-    }
-
-    #[test]
-    fn sendme_receive_parser_emits_high_frequency_noise_lines() {
-        let (tx, rx) = mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
-        parse_sendme_receive_output(
-            "n 99549f9de3 r 31724666896/0 i 474 # f9ffee9093 [] 8 B/8 B",
-            &tx,
-            &cancel,
-        );
-
-        match rx.try_recv() {
-            Ok(TransferMsg::Output(_)) => {}
-            other => panic!("expected output message, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn sendme_receive_parser_marks_downloaded_files_as_completed() {
-        let (tx, rx) = mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
-        parse_sendme_receive_output("downloaded 7 files, 595.45 MiB. took 5 seconds", &tx, &cancel);
-
-        let mut saw_completed = false;
-        for _ in 0..6 {
-            match rx.try_recv() {
-                Ok(TransferMsg::Completed) => {
-                    saw_completed = true;
-                    break;
-                }
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
-
-        assert!(
-            saw_completed,
-            "expected receive parser to emit Completed for downloaded files line"
-        );
-    }
-
-    #[test]
-    fn sendme_receive_parser_emits_error_message_for_error_prefix_line() {
-        let (tx, rx) = mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
-        parse_sendme_receive_output("error: ticket not found", &tx, &cancel);
-
-        let mut saw_error = false;
-        for _ in 0..6 {
-            match rx.try_recv() {
-                Ok(TransferMsg::Error(msg)) => {
-                    saw_error = msg.to_lowercase().starts_with("error:");
-                    break;
-                }
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
-
-        assert!(
-            saw_error,
-            "expected receive parser to emit Error for error: line"
-        );
     }
 }

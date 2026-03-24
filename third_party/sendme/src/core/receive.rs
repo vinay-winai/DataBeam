@@ -699,27 +699,6 @@ pub async fn check_and_export_local_in(
 
     Ok(true)
 }
-/// Checks if a specific ticket exists as a local blob directory in temp_dir.
-pub fn local_ticket_exists_on_disk(ticket_str: &str) -> bool {
-    local_ticket_exists_on_disk_in(ticket_str, None)
-}
-
-pub fn local_ticket_exists_on_disk_in(ticket_str: &str, blob_dir: Option<PathBuf>) -> bool {
-    let Ok(ticket) = BlobTicket::from_str(ticket_str) else {
-        return false;
-    };
-    let expected_dir = format!(".sendme-recv-{}", ticket.hash().to_hex());
-    let mut candidates = Vec::new();
-    if let Some(base) = blob_dir {
-        candidates.push(base.join(&expected_dir));
-    }
-    let temp_candidate = std::env::temp_dir().join(expected_dir);
-    if !candidates.contains(&temp_candidate) {
-        candidates.push(temp_candidate);
-    }
-    candidates.into_iter().any(|path| path.exists())
-}
-
 /// Recursively calculates the size of a directory.
 fn calculate_dir_size(path: &std::path::Path) -> u64 {
     let mut total = 0;

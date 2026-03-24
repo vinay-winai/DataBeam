@@ -103,7 +103,8 @@ fn emit_event_with_payload<T: Serialize>(app_handle: &AppHandle, event_name: &st
     }
 }
 pub async fn start_share(
-    path: PathBuf,
+    paths: Vec<PathBuf>,
+    payload_root: String,
     options: SendOptions,
     app_handle: AppHandle,
 ) -> anyhow::Result<SendResult> {
@@ -139,17 +140,18 @@ pub async fn start_share(
             temp_base.display(),
         );
     }
-    let cwd = std::env::current_dir()?;
-    if cwd.join(&path) == cwd {
-        anyhow::bail!("can not share from the current directory");
-    }
-
-    let path2 = path.clone();
     let blobs_data_dir2 = blobs_data_dir.clone();
     let (progress_tx, progress_rx) = mpsc::channel(32);
     let app_handle_clone = app_handle.clone();
-    let entry_type = if path.is_file() { "file" } else { "directory" };
+    anyhow::ensure!(!paths.is_empty(), "no valid paths to share");
+    let entry_type = if paths.len() == 1 && paths[0].is_file() {
+        "file"
+    } else {
+        "directory"
+    };
     let entry_type_for_progress = entry_type.to_string();
+    let paths2 = paths.clone();
+    let payload_root2 = payload_root.clone();
 
     let setup = async move {
         let t0 = Instant::now();
@@ -171,7 +173,7 @@ pub async fn start_share(
             )),
         );
 
-        let import_result = import(path2, blobs.store()).await?;
+        let import_result = import(paths2, payload_root2, blobs.store()).await?;
         let dt = t0.elapsed();
 
         let (ref _temp_tag, size, ref _collection) = import_result;
@@ -239,43 +241,15 @@ pub async fn start_share(
     })
 }
 
-async fn import(path: PathBuf, db: &Store) -> anyhow::Result<(TempTag, u64, Collection)> {
-    let parallelism = num_cpus::get();
-    let path = path.canonicalize()?;
-    anyhow::ensure!(path.exists(), "path {} does not exist", path.display());
-    let root = path.parent().context("context get parent")?;
-    let files = WalkDir::new(path.clone()).into_iter();
-    let data_sources: Vec<(String, PathBuf)> = files
-        .filter_map(|entry| {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::warn!("skipping inaccessible entry: {}", e);
-                    return None;
-                }
-            };
-            if !entry.file_type().is_file() {
-                return None;
-            }
-            let path = entry.into_path();
-            let relative = match path.strip_prefix(root) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!("skipping {}: {}", path.display(), e);
-                    return None;
-                }
-            };
-            match canonicalized_path_to_string(relative, true) {
-                Ok(name) => Some((name, path)),
-                Err(e) => {
-                    tracing::warn!("skipping {}: {}", path.display(), e);
-                    None
-                }
-            }
-        })
-        .collect();
-
+async fn import(
+    paths: Vec<PathBuf>,
+    payload_root: String,
+    db: &Store,
+) -> anyhow::Result<(TempTag, u64, Collection)> {
+    let data_sources = build_virtual_data_sources(paths, &payload_root)?;
     anyhow::ensure!(!data_sources.is_empty(), "no valid files to share");
+
+    let parallelism = num_cpus::get();
 
     let mut names_and_tags = n0_future::stream::iter(data_sources)
         .map(|(name, path)| {
@@ -327,6 +301,63 @@ async fn import(path: PathBuf, db: &Store) -> anyhow::Result<(TempTag, u64, Coll
     let temp_tag = collection.clone().store(db).await?;
     drop(tags);
     Ok((temp_tag, size, collection))
+}
+
+fn build_virtual_data_sources(
+    paths: Vec<PathBuf>,
+    payload_root: &str,
+) -> anyhow::Result<Vec<(String, PathBuf)>> {
+    let mut data_sources = Vec::new();
+
+    for source in paths {
+        let canonical = source.canonicalize()?;
+        anyhow::ensure!(
+            canonical.exists(),
+            "path {} does not exist",
+            canonical.display()
+        );
+
+        let source_name = canonical
+            .file_name()
+            .context("shared path has no file name")?;
+        let source_name = canonicalized_path_to_string(Path::new(source_name), true)?;
+
+        if canonical.is_file() {
+            data_sources.push((format!("{payload_root}/{source_name}"), canonical));
+            continue;
+        }
+
+        for entry in WalkDir::new(&canonical).into_iter() {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!("skipping inaccessible entry: {}", e);
+                    continue;
+                }
+            };
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.into_path();
+            let relative = match path.strip_prefix(&canonical) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("skipping {}: {}", path.display(), e);
+                    continue;
+                }
+            };
+            let relative = match canonicalized_path_to_string(relative, true) {
+                Ok(name) => name,
+                Err(e) => {
+                    tracing::warn!("skipping {}: {}", path.display(), e);
+                    continue;
+                }
+            };
+            data_sources.push((format!("{payload_root}/{source_name}/{relative}"), path));
+        }
+    }
+
+    Ok(data_sources)
 }
 
 pub fn canonicalized_path_to_string(
