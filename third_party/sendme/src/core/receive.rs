@@ -529,11 +529,27 @@ pub async fn check_and_export_local(
 }
 
 pub fn cleanup_sendme_receive_artifacts_for_ticket(ticket_str: &str) {
+    cleanup_sendme_receive_artifacts_for_ticket_in(ticket_str, None)
+}
+
+pub fn cleanup_sendme_receive_artifacts_for_ticket_in(
+    ticket_str: &str,
+    blob_dir: Option<PathBuf>,
+) {
     if let Ok(ticket) = BlobTicket::from_str(ticket_str) {
         let dir_name = format!(".sendme-recv-{}", ticket.hash().to_hex());
+        let mut candidates = Vec::new();
+        if let Some(base) = blob_dir {
+            candidates.push(base.join(&dir_name));
+        }
         let temp_candidate = std::env::temp_dir().join(&dir_name);
-        if temp_candidate.exists() {
-            let _ = std::fs::remove_dir_all(temp_candidate);
+        if !candidates.contains(&temp_candidate) {
+            candidates.push(temp_candidate);
+        }
+        for candidate in candidates {
+            if candidate.exists() {
+                let _ = std::fs::remove_dir_all(candidate);
+            }
         }
     }
 }
@@ -668,21 +684,21 @@ pub async fn check_and_export_local_in(
     // Clean up the temporary blob store after successful local export
     if let Ok(ticket) = BlobTicket::from_str(ticket_str) {
         let expected_dir = format!(".sendme-recv-{}", ticket.hash().to_hex());
-        let iroh_data_dir = std::env::temp_dir().join(expected_dir);
-        let _ = tokio::fs::remove_dir_all(&iroh_data_dir).await;
+        let mut cleanup_targets = Vec::new();
+        cleanup_targets.push(std::env::temp_dir().join(&expected_dir));
+        if let Some(base) = blob_dir {
+            let custom_target = base.join(&expected_dir);
+            if !cleanup_targets.contains(&custom_target) {
+                cleanup_targets.push(custom_target);
+            }
+        }
+        for iroh_data_dir in cleanup_targets {
+            let _ = tokio::fs::remove_dir_all(&iroh_data_dir).await;
+        }
     }
 
     Ok(true)
 }
-/// Checks if a specific ticket exists as a local blob directory in temp_dir.
-pub fn local_ticket_exists_on_disk(ticket_str: &str) -> bool {
-    let Ok(ticket) = BlobTicket::from_str(ticket_str) else {
-        return false;
-    };
-    let expected_dir = format!(".sendme-recv-{}", ticket.hash().to_hex());
-    std::env::temp_dir().join(expected_dir).exists()
-}
-
 /// Recursively calculates the size of a directory.
 fn calculate_dir_size(path: &std::path::Path) -> u64 {
     let mut total = 0;
@@ -703,15 +719,28 @@ fn calculate_dir_size(path: &std::path::Path) -> u64 {
 
 /// Returns the total size in bytes of the local blob directory for the given ticket.
 pub fn local_ticket_size_on_disk(ticket_str: &str) -> u64 {
+    local_ticket_size_on_disk_in(ticket_str, None)
+}
+
+pub fn local_ticket_size_on_disk_in(ticket_str: &str, blob_dir: Option<PathBuf>) -> u64 {
     let Ok(ticket) = BlobTicket::from_str(ticket_str) else {
         return 0;
     };
     let expected_dir = format!(".sendme-recv-{}", ticket.hash().to_hex());
-    let path = std::env::temp_dir().join(expected_dir);
-    if !path.exists() {
-        return 0;
+    let mut candidates = Vec::new();
+    if let Some(base) = blob_dir {
+        candidates.push(base.join(&expected_dir));
     }
-    calculate_dir_size(&path)
+    let temp_candidate = std::env::temp_dir().join(expected_dir);
+    if !candidates.contains(&temp_candidate) {
+        candidates.push(temp_candidate);
+    }
+    candidates
+        .into_iter()
+        .filter(|path| path.exists())
+        .map(|path| calculate_dir_size(&path))
+        .max()
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
