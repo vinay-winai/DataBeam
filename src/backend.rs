@@ -163,8 +163,8 @@ fn native_sendme_version() -> Option<&'static str> {
 
 fn detect_native_sendme() -> ToolStatus {
     let version = native_sendme_version()
-        .map(|version| format!("sendme {version} (native)"))
-        .or_else(|| Some("sendme (native)".to_string()));
+        .map(|version| format!("iroh 1.0.0 (sendme {version})"))
+        .or_else(|| Some("iroh 1.0.0 (native)".to_string()));
 
     ToolStatus {
         tool: Tool::Sendme,
@@ -201,11 +201,20 @@ fn github_repo(tool: &Tool) -> &'static str {
     }
 }
 
+pub const HARDCODED_CROC_VERSION: &str = "v11.0.1";
+
 fn fetch_latest_release(tool: &Tool) -> Result<GitHubRelease, String> {
-    let url = format!(
-        "https://api.github.com/repos/{}/releases/latest",
-        github_repo(tool)
-    );
+    let url = match tool {
+        Tool::Croc => format!(
+            "https://api.github.com/repos/{}/releases/tags/{}",
+            github_repo(tool),
+            HARDCODED_CROC_VERSION
+        ),
+        _ => format!(
+            "https://api.github.com/repos/{}/releases/latest",
+            github_repo(tool)
+        ),
+    };
     let json = download_bytes(&url)?;
     serde_json::from_slice::<GitHubRelease>(&json)
         .map_err(|e| format!("Failed to parse GitHub release JSON: {e}"))
@@ -386,6 +395,37 @@ fn extract_binary_from_zip(
 
 fn install_managed_binary(tool: &Tool) -> Option<PathBuf> {
     let output_path = managed_binary_path(tool);
+
+    // If cached Croc binary exists, verify its version matches HARDCODED_CROC_VERSION.
+    // If it does not match (e.g. legacy v10.4.1 binary from older DataBeam installs),
+    // force delete the cached file to enforce clean re-installation of the target version.
+    if tool == &Tool::Croc && output_path.exists() {
+        let is_target_ver = new_hidden_command(&output_path)
+            .arg("--version")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .ok()
+            .map(|o| {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let clean_ver = HARDCODED_CROC_VERSION.trim_start_matches('v');
+                stdout.contains(HARDCODED_CROC_VERSION)
+                    || stderr.contains(HARDCODED_CROC_VERSION)
+                    || stdout.contains(clean_ver)
+                    || stderr.contains(clean_ver)
+            })
+            .unwrap_or(false);
+
+        if !is_target_ver {
+            eprintln!(
+                "Outdated croc binary detected in cache. Purging cached file to install hardcoded version {}",
+                HARDCODED_CROC_VERSION
+            );
+            let _ = fs::remove_file(&output_path);
+        }
+    }
+
     if output_path.exists()
         && fs::metadata(&output_path)
             .map(|m| m.len() > 0)
