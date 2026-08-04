@@ -1,7 +1,10 @@
+# News
+v2.6 relesed
+
 # Troubleshooting DataBeam
 
 ## EazySendme/ Sendme specific Transfer Issues
-- Transfers will likely fail in networks that actively block p2p traffic like most free vpns. Croc may work in this case as they maintain public relay servers.
+- Switch to croc instead.
 
 ## Croc / EazySendme Transfer Issues
 - If transfer does not start and logs show room not found or room unavailable/room full/peer left, sender should retry with a different custom code. Avoid using simple codes like 1234567 or aaaaaaa.
@@ -13,6 +16,3 @@
 
 ## Suggestions
 - Use Standalone Sendme mode for sensitive data transfers.
-- the temporary sendme blobs are stored at C:\Users\ < Username > \AppData\Local\Temp and 
-  names start with **.sendme-** .
-  
