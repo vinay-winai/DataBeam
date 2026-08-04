@@ -38,6 +38,8 @@ pub struct SendOptions {
     pub magic_ipv6_addr: Option<std::net::SocketAddrV6>,
     /// If set, iroh blob stores are created under this directory instead of std::env::temp_dir().
     pub blob_dir: Option<PathBuf>,
+    /// Number of parallel jobs to use while importing files.
+    pub jobs: Option<usize>,
 }
 
 #[derive(Debug, Default)]
@@ -133,7 +135,7 @@ pub fn get_or_create_secret() -> anyhow::Result<iroh::SecretKey> {
     }
     */
 
-    let key = iroh::SecretKey::generate(&mut rand::rng());
+    let key = iroh::SecretKey::generate();
     /*
     let _ = std::fs::create_dir_all(&data_dir);
     let _ = std::fs::write(&secret_path, hex::encode(key.to_bytes()));

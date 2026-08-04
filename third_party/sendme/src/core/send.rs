@@ -3,7 +3,7 @@ use crate::core::types::{
 };
 use anyhow::Context;
 use data_encoding::HEXLOWER;
-use iroh::{discovery::pkarr::PkarrPublisher, Endpoint, RelayMode};
+use iroh::{address_lookup::pkarr::PkarrPublisher, endpoint::presets, Endpoint, RelayMode};
 use iroh_blobs::{
     api::{
         blobs::{AddPathOptions, ImportMode},
@@ -112,19 +112,19 @@ pub async fn start_share(
 
     let relay_mode: RelayMode = options.relay_mode.clone().into();
 
-    let mut builder = Endpoint::builder()
+    let mut builder = Endpoint::builder(presets::N0)
         .alpns(vec![iroh_blobs::protocol::ALPN.to_vec()])
         .secret_key(secret_key)
         .relay_mode(relay_mode.clone());
 
     if options.ticket_type == AddrInfoOptions::Id {
-        builder = builder.discovery(PkarrPublisher::n0_dns());
+        builder = builder.address_lookup(PkarrPublisher::n0_dns());
     }
     if let Some(addr) = options.magic_ipv4_addr {
-        builder = builder.bind_addr_v4(addr);
+        builder = builder.bind_addr(addr)?;
     }
     if let Some(addr) = options.magic_ipv6_addr {
-        builder = builder.bind_addr_v6(addr);
+        builder = builder.bind_addr(addr)?;
     }
 
     let suffix = rand::rng().random::<[u8; 16]>();
@@ -173,7 +173,7 @@ pub async fn start_share(
             )),
         );
 
-        let import_result = import(paths2, payload_root2, blobs.store()).await?;
+        let import_result = import(paths2, payload_root2, blobs.store(), options.jobs).await?;
         let dt = t0.elapsed();
 
         let (ref _temp_tag, size, ref _collection) = import_result;
@@ -245,11 +245,12 @@ async fn import(
     paths: Vec<PathBuf>,
     payload_root: String,
     db: &Store,
+    jobs: Option<usize>,
 ) -> anyhow::Result<(TempTag, u64, Collection)> {
     let data_sources = build_virtual_data_sources(paths, &payload_root)?;
     anyhow::ensure!(!data_sources.is_empty(), "no valid files to share");
 
-    let parallelism = num_cpus::get();
+    let parallelism = jobs.unwrap_or_else(num_cpus::get);
 
     let mut names_and_tags = n0_future::stream::iter(data_sources)
         .map(|(name, path)| {

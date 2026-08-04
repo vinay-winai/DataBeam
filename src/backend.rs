@@ -1161,6 +1161,7 @@ pub fn sendme_send(
                 magic_ipv4_addr: None,
                 magic_ipv6_addr: None,
                 blob_dir: sender_blob_dir.clone(),
+                jobs: None,
             },
             app_handle,
         ));
