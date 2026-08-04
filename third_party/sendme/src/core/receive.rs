@@ -1,5 +1,5 @@
 use crate::core::types::{get_or_create_secret, AppHandle, ReceiveOptions, ReceiveResult};
-use iroh::{discovery::dns::DnsDiscovery, Endpoint};
+use iroh::{address_lookup::dns::DnsAddressLookup, endpoint::presets, Endpoint};
 use iroh_blobs::{
     api::{
         blobs::{ExportMode, ExportOptions, ExportProgressItem},
@@ -69,19 +69,19 @@ pub async fn download(
 
     let secret_key = get_or_create_secret()?;
 
-    let mut builder = Endpoint::builder()
+    let mut builder = Endpoint::builder(presets::N0)
         .alpns(vec![])
         .secret_key(secret_key)
         .relay_mode(options.relay_mode.clone().into());
 
     if ticket.addr().relay_urls().count() == 0 && ticket.addr().ip_addrs().count() == 0 {
-        builder = builder.discovery(DnsDiscovery::n0_dns());
+        builder = builder.address_lookup(DnsAddressLookup::n0_dns());
     }
     if let Some(addr) = options.magic_ipv4_addr {
-        builder = builder.bind_addr_v4(addr);
+        builder = builder.bind_addr(addr)?;
     }
     if let Some(addr) = options.magic_ipv6_addr {
-        builder = builder.bind_addr_v6(addr);
+        builder = builder.bind_addr(addr)?;
     }
 
     let endpoint = builder.bind().await?;
@@ -115,6 +115,7 @@ pub async fn download(
     let _iroh_data_dir = blob_base.join(&dir_name);
     let db = FsStore::load(&_iroh_data_dir).await?;
     let db2 = db.clone();
+    let endpoint_close = endpoint.clone();
 
     let fut = async move {
         let hash_and_format = ticket.hash_and_format();
@@ -331,8 +332,12 @@ pub async fn download(
 
     let (total_files, payload_size, _stats, output_dir) = select! {
         x = fut => match x {
-            Ok(x) => x,
+            Ok(x) => {
+                let _ = endpoint_close.close().await;
+                x
+            }
             Err(e) => {
+                let _ = endpoint_close.close().await;
                 tracing::error!("Download operation failed: {}", e);
                 // make sure we shutdown the db before exiting
                 db2.shutdown().await?;
@@ -341,6 +346,7 @@ pub async fn download(
             }
         },
         _ = tokio::signal::ctrl_c() => {
+            let _ = endpoint_close.close().await;
             tracing::warn!("Operation cancelled by user");
             db2.shutdown().await?;
             // WE DO NOT DELETE the cache here, so it can be resumed later!
