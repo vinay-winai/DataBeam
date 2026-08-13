@@ -250,7 +250,7 @@ async fn import(
     let data_sources = build_virtual_data_sources(paths, &payload_root)?;
     anyhow::ensure!(!data_sources.is_empty(), "no valid files to share");
 
-    let parallelism = jobs.unwrap_or_else(num_cpus::get);
+    let parallelism = jobs.unwrap_or_else(num_cpus::get).max(1);
 
     let mut names_and_tags = n0_future::stream::iter(data_sources)
         .map(|(name, path)| {

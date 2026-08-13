@@ -163,8 +163,8 @@ fn native_sendme_version() -> Option<&'static str> {
 
 fn detect_native_sendme() -> ToolStatus {
     let version = native_sendme_version()
-        .map(|version| format!("sendme {version} (native)"))
-        .or_else(|| Some("sendme (native)".to_string()));
+        .map(|version| format!("iroh 1.0.0 (sendme {version})"))
+        .or_else(|| Some("iroh 1.0.0 (native)".to_string()));
 
     ToolStatus {
         tool: Tool::Sendme,
@@ -201,11 +201,20 @@ fn github_repo(tool: &Tool) -> &'static str {
     }
 }
 
+pub const HARDCODED_CROC_VERSION: &str = "v11.0.1";
+
 fn fetch_latest_release(tool: &Tool) -> Result<GitHubRelease, String> {
-    let url = format!(
-        "https://api.github.com/repos/{}/releases/latest",
-        github_repo(tool)
-    );
+    let url = match tool {
+        Tool::Croc => format!(
+            "https://api.github.com/repos/{}/releases/tags/{}",
+            github_repo(tool),
+            HARDCODED_CROC_VERSION
+        ),
+        _ => format!(
+            "https://api.github.com/repos/{}/releases/latest",
+            github_repo(tool)
+        ),
+    };
     let json = download_bytes(&url)?;
     serde_json::from_slice::<GitHubRelease>(&json)
         .map_err(|e| format!("Failed to parse GitHub release JSON: {e}"))
@@ -384,8 +393,55 @@ fn extract_binary_from_zip(
     ))
 }
 
+fn is_matching_croc_version(version_output: &str, target_version: &str) -> bool {
+    let target_norm = target_version.trim().trim_start_matches('v');
+    for token in version_output.split_whitespace() {
+        let cleaned = token
+            .trim_matches(|c: char| !c.is_alphanumeric() && c != '.' && c != '-')
+            .trim_start_matches('v');
+        if cleaned == target_norm {
+            return true;
+        }
+    }
+    false
+}
+
 fn install_managed_binary(tool: &Tool) -> Option<PathBuf> {
     let output_path = managed_binary_path(tool);
+
+    // If cached Croc binary exists, verify its version matches HARDCODED_CROC_VERSION.
+    // If it does not match (e.g. legacy v10.4.1 binary from older DataBeam installs),
+    // force delete the cached file to enforce clean re-installation of the target version.
+    if tool == &Tool::Croc && output_path.exists() {
+        let is_target_ver = new_hidden_command(&output_path)
+            .arg("--version")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .ok()
+            .map(|o| {
+                if !o.status.success() {
+                    return false;
+                }
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                is_matching_croc_version(&stdout, HARDCODED_CROC_VERSION)
+                    || is_matching_croc_version(&stderr, HARDCODED_CROC_VERSION)
+            })
+            .unwrap_or(false);
+
+        if !is_target_ver {
+            eprintln!(
+                "Outdated or invalid croc binary detected in cache. Purging cached file to install hardcoded version {}",
+                HARDCODED_CROC_VERSION
+            );
+            if let Err(e) = fs::remove_file(&output_path) {
+                eprintln!("Failed to remove invalid cached binary {:?}: {}", output_path, e);
+                return None;
+            }
+        }
+    }
+
     if output_path.exists()
         && fs::metadata(&output_path)
             .map(|m| m.len() > 0)
@@ -1935,5 +1991,17 @@ mod tests {
         assert!(!sendme_b.exists());
         assert!(keep_dir.exists());
         assert!(keep_file.exists());
+    }
+
+    #[test]
+    fn test_is_matching_croc_version() {
+        use super::is_matching_croc_version;
+
+        assert!(is_matching_croc_version("croc version v11.0.1", "v11.0.1"));
+        assert!(is_matching_croc_version("croc version 11.0.1", "v11.0.1"));
+        assert!(is_matching_croc_version("croc v11.0.1, build 123", "11.0.1"));
+        assert!(!is_matching_croc_version("croc version v11.0.10", "v11.0.1"));
+        assert!(!is_matching_croc_version("croc version v11.0.1-beta", "v11.0.1"));
+        assert!(!is_matching_croc_version("croc version v10.4.1", "v11.0.1"));
     }
 }
