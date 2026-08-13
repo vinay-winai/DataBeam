@@ -393,6 +393,19 @@ fn extract_binary_from_zip(
     ))
 }
 
+fn is_matching_croc_version(version_output: &str, target_version: &str) -> bool {
+    let target_norm = target_version.trim().trim_start_matches('v');
+    for token in version_output.split_whitespace() {
+        let cleaned = token
+            .trim_matches(|c: char| !c.is_alphanumeric() && c != '.' && c != '-')
+            .trim_start_matches('v');
+        if cleaned == target_norm {
+            return true;
+        }
+    }
+    false
+}
+
 fn install_managed_binary(tool: &Tool) -> Option<PathBuf> {
     let output_path = managed_binary_path(tool);
 
@@ -407,22 +420,25 @@ fn install_managed_binary(tool: &Tool) -> Option<PathBuf> {
             .output()
             .ok()
             .map(|o| {
+                if !o.status.success() {
+                    return false;
+                }
                 let stdout = String::from_utf8_lossy(&o.stdout);
                 let stderr = String::from_utf8_lossy(&o.stderr);
-                let clean_ver = HARDCODED_CROC_VERSION.trim_start_matches('v');
-                stdout.contains(HARDCODED_CROC_VERSION)
-                    || stderr.contains(HARDCODED_CROC_VERSION)
-                    || stdout.contains(clean_ver)
-                    || stderr.contains(clean_ver)
+                is_matching_croc_version(&stdout, HARDCODED_CROC_VERSION)
+                    || is_matching_croc_version(&stderr, HARDCODED_CROC_VERSION)
             })
             .unwrap_or(false);
 
         if !is_target_ver {
             eprintln!(
-                "Outdated croc binary detected in cache. Purging cached file to install hardcoded version {}",
+                "Outdated or invalid croc binary detected in cache. Purging cached file to install hardcoded version {}",
                 HARDCODED_CROC_VERSION
             );
-            let _ = fs::remove_file(&output_path);
+            if let Err(e) = fs::remove_file(&output_path) {
+                eprintln!("Failed to remove invalid cached binary {:?}: {}", output_path, e);
+                return None;
+            }
         }
     }
 
@@ -1975,5 +1991,17 @@ mod tests {
         assert!(!sendme_b.exists());
         assert!(keep_dir.exists());
         assert!(keep_file.exists());
+    }
+
+    #[test]
+    fn test_is_matching_croc_version() {
+        use super::is_matching_croc_version;
+
+        assert!(is_matching_croc_version("croc version v11.0.1", "v11.0.1"));
+        assert!(is_matching_croc_version("croc version 11.0.1", "v11.0.1"));
+        assert!(is_matching_croc_version("croc v11.0.1, build 123", "11.0.1"));
+        assert!(!is_matching_croc_version("croc version v11.0.10", "v11.0.1"));
+        assert!(!is_matching_croc_version("croc version v11.0.1-beta", "v11.0.1"));
+        assert!(!is_matching_croc_version("croc version v10.4.1", "v11.0.1"));
     }
 }
