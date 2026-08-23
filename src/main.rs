@@ -179,6 +179,16 @@ struct DataBeamApp {
     transfer_speed_samples: Vec<f64>,
     latest_cli_progress_line: Option<String>,
     croc_file_progress: Option<(u64, u64)>,
+    /// Live croc progressbar state: current bar's file name.
+    croc_bar_file: Option<String>,
+    /// Done bytes of the current file per its latest progressbar frame.
+    croc_bar_done: u64,
+    /// Total bytes of the current file per its latest progressbar frame.
+    croc_bar_file_total: u64,
+    /// Byte total of all files whose bars have completed (folded on file switch).
+    croc_completed_bytes: u64,
+    /// Time of the last parsed progressbar frame, for finalize-phase detection.
+    croc_last_frame_at: Option<f64>,
     croc_received_text: Option<String>,
     croc_expect_text_payload: bool,
     transfer_phase: TransferPhase,
@@ -279,6 +289,11 @@ impl Default for DataBeamApp {
             transfer_speed_samples: Vec::new(),
             latest_cli_progress_line: None,
             croc_file_progress: None,
+            croc_bar_file: None,
+            croc_bar_done: 0,
+            croc_bar_file_total: 0,
+            croc_completed_bytes: 0,
+            croc_last_frame_at: None,
             croc_received_text: None,
             croc_expect_text_payload: false,
             transfer_phase: TransferPhase::Preparing,
@@ -595,6 +610,218 @@ impl DataBeamApp {
         }
     }
 
+    /// Folds a parsed croc progressbar frame into byte-accurate overall progress.
+    /// When croc switches to the next file's bar, the finished file's size is
+    /// accumulated so progress never resets between files.
+    fn apply_croc_bar_frame(&mut self, frame: CrocBarFrame) {
+        // A new bar starts with a blank 0% render, so a done-bytes drop means
+        // another file with the same name began (croc's bar description is the
+        // bare filename, which repeats across folders).
+        let new_bar_started = match &self.croc_bar_file {
+            Some(prev) => *prev != frame.file_name || frame.done_bytes < self.croc_bar_done,
+            None => false,
+        };
+        if new_bar_started {
+            self.croc_completed_bytes = self
+                .croc_completed_bytes
+                .saturating_add(self.croc_bar_file_total.max(self.croc_bar_done));
+        }
+        self.croc_bar_file = Some(frame.file_name);
+        self.croc_bar_file_total = frame.total_bytes;
+        self.croc_bar_done = frame.done_bytes;
+        self.croc_last_frame_at = Some(self.animation_time);
+
+        if let (Some(done_files), Some(total_files)) = (frame.file_index, frame.file_count) {
+            if total_files > 0 {
+                self.croc_file_progress = Some((done_files.min(total_files), total_files));
+            }
+        }
+
+        // Single-file transfers announce their size only via the bar itself.
+        if self.transfer_total_bytes.is_none() {
+            self.transfer_total_bytes = Some(frame.total_bytes);
+        }
+
+        if self.transfer_phase != TransferPhase::Transferring {
+            self.transfer_phase = TransferPhase::Transferring;
+            self.preparing_progress = 1.0;
+            if self.transfer_payload_start_time.is_none() {
+                self.transfer_payload_start_time = Some(self.animation_time);
+            }
+        }
+
+        let overall_done = self
+            .croc_completed_bytes
+            .saturating_add(frame.done_bytes)
+            .min(self.transfer_total_bytes.unwrap_or(u64::MAX));
+        if overall_done >= self.transfer_done_bytes.unwrap_or(0) {
+            self.transfer_done_bytes = Some(overall_done);
+        }
+
+        let total = self.transfer_total_bytes.unwrap_or(0);
+        if total > 0 {
+            self.transfer_progress =
+                (self.transfer_done_bytes.unwrap_or(0) as f32 / total as f32).clamp(0.0, 1.0);
+        } else if let Some((done_files, total_files)) = self.croc_file_progress {
+            if total_files > 0 {
+                let within = frame.done_bytes as f32 / frame.total_bytes.max(1) as f32;
+                self.transfer_progress = (((done_files.saturating_sub(1)) as f32 + within)
+                    / total_files as f32)
+                    .clamp(0.0, 1.0);
+            }
+        } else {
+            self.transfer_progress = self
+                .transfer_progress
+                .max((frame.done_bytes as f32 / frame.total_bytes.max(1) as f32).clamp(0.0, 1.0));
+        }
+
+        match frame.speed_bps {
+            Some(speed) if speed > 0.0 => {
+                self.transfer_speed_bps = Some(speed);
+                self.last_done_speed_sample =
+                    Some((self.animation_time, self.transfer_done_bytes.unwrap_or(0)));
+            }
+            _ => self.update_derived_speed_from_done_bytes(),
+        }
+    }
+
+    fn build_croc_panel_data(
+        &self,
+        accent: Color32,
+        effective_progress: f32,
+        done: u64,
+        total: u64,
+    ) -> CrocPanelData {
+        let _ = accent;
+        // croc emits no bars for unchanged/skipped files and goes quiet while
+        // hashing + writing; after a few seconds of frame silence we are in
+        // the finalize phase, not stalled mid-transfer.
+        let finalizing = self
+            .croc_last_frame_at
+            .is_some_and(|t| self.animation_time - t > 4.0);
+        let verb = if self.view == AppView::Send {
+            "Sending"
+        } else {
+            "Receiving"
+        };
+        let current_file = self.croc_bar_file.clone().unwrap_or_default();
+        let title = if finalizing {
+            "Finalizing\u{2026} (verifying files)".to_string()
+        } else if current_file.is_empty() {
+            format!("{verb}\u{2026}")
+        } else {
+            format!("{verb} {current_file}")
+        };
+
+        let transferred_label = if total > 0 {
+            format!(
+                "{} / {}",
+                format_file_size(done),
+                format_file_size(total)
+            )
+        } else {
+            format_file_size(done)
+        };
+
+        let detail_left = match self.croc_file_progress {
+            Some((done_files, total_files)) if total_files > 0 => {
+                Some(format!("{done_files}/{total_files} {current_file}"))
+            }
+            _ if !current_file.is_empty() => Some(current_file),
+            _ => None,
+        };
+
+        let (rate_value, eta_value) = self.panel_rate_eta(done, total, finalizing);
+
+        CrocPanelData {
+            title,
+            transferred_label,
+            progress: effective_progress,
+            percent_label: format!("{:.1}%", effective_progress * 100.0),
+            detail_left,
+            rate_value,
+            eta_value,
+        }
+    }
+
+    /// Live rate + overall ETA shared by the croc and sendme panels.
+    fn panel_rate_eta(&self, done: u64, total: u64, finalizing: bool) -> (String, String) {
+        if finalizing {
+            return ("--".to_string(), "--".to_string());
+        }
+        let rate_value = match self.transfer_speed_bps {
+            Some(speed) if speed > 0.0 => {
+                format!("{}/s", format_file_size(speed.round() as u64))
+            }
+            _ => "--".to_string(),
+        };
+        let eta_value = if total > done {
+            match self.transfer_speed_bps {
+                Some(speed) if speed > 0.0 => {
+                    format_eta_compact((total - done) as f64 / speed)
+                }
+                _ => "--".to_string(),
+            }
+        } else if total > 0 {
+            "0s".to_string()
+        } else {
+            "--".to_string()
+        };
+        (rate_value, eta_value)
+    }
+
+    /// Panel data for native sendme transfers: done/total and speed come from
+    /// exact native events, so no finalize heuristics are needed.
+    fn build_sendme_panel_data(
+        &self,
+        accent: Color32,
+        effective_progress: f32,
+        done: u64,
+        total: u64,
+    ) -> CrocPanelData {
+        let _ = accent;
+        let verb = if self.view == AppView::Send {
+            "Sending"
+        } else {
+            "Receiving"
+        };
+        let title = format!("{verb}\u{2026}");
+        let transferred_label = if total > 0 {
+            format!("{} / {}", format_file_size(done), format_file_size(total))
+        } else {
+            format_file_size(done)
+        };
+        let detail_left = self
+            .sendme_total_items
+            .map(|total_files| format!("{total_files} files"));
+        let (rate_value, eta_value) = self.panel_rate_eta(done, total, false);
+        CrocPanelData {
+            title,
+            transferred_label,
+            progress: effective_progress,
+            percent_label: format!("{:.1}%", effective_progress * 100.0),
+            detail_left,
+            rate_value,
+            eta_value,
+        }
+    }
+
+    /// End-to-end average speed over the actual payload transfer window
+    /// (excluding prep and waiting-for-receiver time), like getcroc's Rate.
+    fn average_transfer_speed_bps(&self) -> Option<f64> {
+        let start = self.transfer_payload_start_time.or(self.transfer_start_time)?;
+        let end = self.transfer_end_time?;
+        let secs = end - start;
+        if secs <= 0.0 {
+            return None;
+        }
+        let done = self.transfer_done_bytes.unwrap_or(0) as f64;
+        if done <= 0.0 {
+            return None;
+        }
+        Some(done / secs)
+    }
+
     fn switch_tool(&mut self, tool: SelectedTool) {
         if self.selected_tool == tool {
             return;
@@ -743,6 +970,11 @@ impl DataBeamApp {
         self.transfer_speed_samples.clear();
         self.latest_cli_progress_line = None;
         self.croc_file_progress = None;
+        self.croc_bar_file = None;
+        self.croc_bar_done = 0;
+        self.croc_bar_file_total = 0;
+        self.croc_completed_bytes = 0;
+        self.croc_last_frame_at = None;
         self.croc_received_text = None;
         self.croc_expect_text_payload = false;
         self.transfer_phase = TransferPhase::Preparing;
@@ -982,6 +1214,12 @@ impl DataBeamApp {
         if eazy_receive_pre_ticket {
             return;
         }
+        if self.selected_tool == SelectedTool::Croc {
+            if let Some(frame) = parse_croc_bar_frame(line) {
+                self.apply_croc_bar_frame(frame);
+                return;
+            }
+        }
         let eazy_sendme_active = self.selected_tool == SelectedTool::EazySendme
             && match self.view {
                 AppView::Send => true,
@@ -1167,21 +1405,25 @@ impl DataBeamApp {
         if let Some((done_files, total_files)) = croc_file_counter {
             if total_files > 0 {
                 self.croc_file_progress = Some((done_files, total_files));
-                let mut overall = done_files as f32 / total_files as f32;
-                if let Some((cur_done, cur_total)) = parse_payload_progress(line) {
-                    if cur_total > 0 {
-                        let cur_ratio = (cur_done as f32 / cur_total as f32).clamp(0.0, 1.0);
-                        let complete_before = done_files.saturating_sub(1) as f32;
-                        overall =
-                            ((complete_before + cur_ratio) / total_files as f32).clamp(0.0, 1.0);
+                // Byte-accurate bar tracking (croc_bar_file) supersedes the
+                // file-counter model once progressbar frames have been seen.
+                if self.croc_bar_file.is_none() {
+                    let mut overall = done_files as f32 / total_files as f32;
+                    if let Some((cur_done, cur_total)) = parse_payload_progress(line) {
+                        if cur_total > 0 {
+                            let cur_ratio = (cur_done as f32 / cur_total as f32).clamp(0.0, 1.0);
+                            let complete_before = done_files.saturating_sub(1) as f32;
+                            overall =
+                                ((complete_before + cur_ratio) / total_files as f32).clamp(0.0, 1.0);
+                        }
                     }
-                }
-                // In Croc file-counter mode, overall progress should follow file counter directly.
-                self.transfer_progress = overall;
-                if let Some(total_bytes) = self.transfer_total_bytes {
-                    if total_bytes > 0 {
-                        let derived_done = (overall as f64 * total_bytes as f64) as u64;
-                        self.transfer_done_bytes = Some(derived_done.min(total_bytes));
+                    // In Croc file-counter mode, overall progress should follow file counter directly.
+                    self.transfer_progress = overall;
+                    if let Some(total_bytes) = self.transfer_total_bytes {
+                        if total_bytes > 0 {
+                            let derived_done = (overall as f64 * total_bytes as f64) as u64;
+                            self.transfer_done_bytes = Some(derived_done.min(total_bytes));
+                        }
                     }
                 }
             }
@@ -1445,6 +1687,20 @@ impl DataBeamApp {
                                     }
                                 }
                                 if !skip_log_line
+                                    && !(self.selected_tool == SelectedTool::Croc
+                                        && (parse_croc_bar_frame(&line).is_some()
+                                            || (lower.starts_with("hashing ")
+                                                && line.contains('%')
+                                                && line.contains('|')))
+                                    )
+                                    && !(matches!(
+                                        self.selected_tool,
+                                        SelectedTool::Sendme | SelectedTool::EazySendme
+                                    ) && (is_sendme_sender_request_line(&line)
+                                        || lower.contains("downloading ...")
+                                        || lower.contains("uploading ...")
+                                        || lower.contains("writing... ")
+                                        || (line.starts_with("n ") && line.contains(" r "))))
                                     && (self.selected_tool == SelectedTool::Sendme
                                         || self.selected_tool == SelectedTool::EazySendme
                                         || self.transfer_log.last() != Some(&line))
@@ -4103,6 +4359,7 @@ impl DataBeamApp {
                     if self.selected_tool == SelectedTool::Croc
                         && self.croc_file_progress.is_some()
                         && total > 0
+                        && self.transfer_done_bytes.is_none()
                     {
                         done = ((effective_progress as f64) * total as f64) as u64;
                     }
@@ -4155,13 +4412,36 @@ impl DataBeamApp {
                     ui.add_space(4.0);
 
                     if !sendme_serve_mode {
-                        if self.transfer_phase == TransferPhase::Transferring {
+                        let panel_active = self.transfer_phase == TransferPhase::Transferring
+                            && matches!(
+                                self.selected_tool,
+                                SelectedTool::Croc | SelectedTool::Sendme | SelectedTool::EazySendme
+                            );
+                        if panel_active {
+                            let panel = if self.selected_tool == SelectedTool::Croc {
+                                self.build_croc_panel_data(
+                                    accent,
+                                    effective_progress,
+                                    done,
+                                    total,
+                                )
+                            } else {
+                                self.build_sendme_panel_data(
+                                    accent,
+                                    effective_progress,
+                                    done,
+                                    total,
+                                )
+                            };
+                            croc_progress_panel(ui, &panel, accent);
+                        } else if self.transfer_phase == TransferPhase::Transferring {
                             animated_progress_bar(ui, effective_progress, accent);
                         } else {
                             pulsing_progress_bar(ui, self.animation_time, accent);
                         }
                         let pct_text = format!("{:>5.1}%", effective_progress * 100.0);
-                        ui.horizontal_wrapped(|ui| match self.transfer_phase {
+                        if !panel_active {
+                            ui.horizontal_wrapped(|ui| match self.transfer_phase {
                             TransferPhase::Preparing
                             | TransferPhase::EazySharingTicket
                             | TransferPhase::EazyWaitingForPeer => {
@@ -4282,6 +4562,7 @@ impl DataBeamApp {
                                 }
                             }
                         });
+                        }
                     } else {
                         let active = self.sendme_active_transfers;
                         let transfer_word = if active == 1 { "transfer" } else { "transfers" };
@@ -4313,7 +4594,9 @@ impl DataBeamApp {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("✅").size(14.0));
                         ui.label(RichText::new("Complete").color(SUCCESS).strong().size(13.0));
-                        if let Some(start) = self.transfer_start_time {
+                        if let Some(start) = self.transfer_payload_start_time
+                            .or(self.transfer_start_time)
+                        {
                             let end = self.transfer_end_time.unwrap_or(self.animation_time);
                             let e = (end - start).max(0.0);
                             ui.label(
@@ -4363,11 +4646,17 @@ impl DataBeamApp {
                                 .monospace(),
                             );
                         }
-                        if let Some(speed) = self.transfer_speed_bps {
+                        // Show the whole-transfer average (bytes / elapsed) like
+                        // getcroc's Rate; the last live sample is a wire burst and
+                        // wildly overstates real throughput.
+                        let speed = self
+                            .average_transfer_speed_bps()
+                            .or(self.transfer_speed_bps);
+                        if let Some(speed) = speed {
                             let speed_label = if self.view == AppView::Send {
-                                "Upload speed"
+                                "Avg upload speed"
                             } else {
-                                "Download speed"
+                                "Avg download speed"
                             };
                             ui.label(
                                 RichText::new(format!(
@@ -4535,9 +4824,36 @@ fn parse_total_size_hint(line: &str) -> Option<u64> {
     let lower = line.to_lowercase();
     if let Some(idx) = lower.find("in total,") {
         let tail = line.get(idx + "in total,".len()..)?.trim();
-        return parse_size_prefix(tail);
+        return parse_croc_header_size(tail);
     }
     None
+}
+
+/// Sizes in croc's session-summary lines ("Sending 4 files (60.1 MB)") come
+/// from a base-1024 humanizer, unlike the progressbar frames (base-1000).
+fn parse_croc_header_size(text: &str) -> Option<u64> {
+    let mut parts = text.split_whitespace();
+    let num = parts.next()?.trim_matches(|c: char| c == ',' || c == '.');
+    let unit = parts.next()?.trim_matches(|c: char| c == ',' || c == '.');
+    let value = num.parse::<f64>().ok()?;
+    if value < 0.0 {
+        return None;
+    }
+    let lower = unit.to_lowercase();
+    let mult = if lower.ends_with("ib") {
+        unit_multiplier(unit)
+    } else {
+        match lower.as_str() {
+            "b" => 1.0,
+            "kb" => 1024.0,
+            "mb" => 1024.0 * 1024.0,
+            "gb" => 1024f64.powi(3),
+            "tb" => 1024f64.powi(4),
+            "pb" => 1024f64.powi(5),
+            _ => return None,
+        }
+    };
+    Some((value * mult) as u64)
 }
 
 fn parse_stage_progress(line: &str) -> Option<f32> {
@@ -4592,7 +4908,253 @@ fn parse_croc_total_size_hint(line: &str) -> Option<u64> {
         return None;
     }
     let inside = line.get(open + 1..close)?.trim();
-    parse_size_prefix(inside)
+    parse_croc_header_size(inside)
+}
+
+// ── Croc progressbar frame parsing (schollz/progressbar v3 output) ───
+//
+// Croc renders one progressbar per file on stderr using \r-delimited redraws.
+// With stderr piped (no TTY, colors disabled) a frame looks like:
+//
+//   \r<filename>  56% |███████             | (56.2 MB/600.7 MB, 4.46 MB/s) [1m3s:2m3s]
+//
+// The final 100% render omits the [elapsed:eta] bracket. Sizes use SI units
+// (base-1000 kB/MB/GB). This parser extracts exact byte counts, speed and ETA.
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CrocBarFrame {
+    pub file_name: String,
+    pub done_bytes: u64,
+    pub total_bytes: u64,
+    pub speed_bps: Option<f64>,
+    pub eta_secs: Option<f64>,
+    /// Per-file completion counter (" 1/4") appended to the final frame line.
+    pub file_index: Option<u64>,
+    pub file_count: Option<u64>,
+}
+
+/// Multiplier for croc's humanized units. Decimal units (kB/MB/...) are
+/// base-1000 as used by progressbar's `humanizeBytes`; binary units stay at 1024.
+fn croc_unit_multiplier(unit: &str) -> Option<f64> {
+    fn prefix_power(u: &str) -> Option<i32> {
+        match u {
+            "k" => Some(1),
+            "m" => Some(2),
+            "g" => Some(3),
+            "t" => Some(4),
+            "p" => Some(5),
+            "e" => Some(6),
+            _ => None,
+        }
+    }
+    let lower = unit.trim().to_lowercase();
+    if lower == "b" {
+        return Some(1.0);
+    }
+    if let Some(stripped) = lower.strip_suffix("ib") {
+        return Some(1024f64.powi(prefix_power(stripped)?));
+    }
+    Some(1000f64.powi(prefix_power(lower.strip_suffix('b')?)?))
+}
+
+/// Parses Go `time.Duration.String()` output like "45s", "2m3s", "1h4m5s".
+fn parse_go_duration(text: &str) -> Option<f64> {
+    let chars: Vec<char> = text.trim().chars().collect();
+    if chars.is_empty() || !chars[0].is_ascii_digit() {
+        return None;
+    }
+    let mut total = 0.0f64;
+    let mut i = 0usize;
+    while i < chars.len() {
+        let num_start = i;
+        while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+            i += 1;
+        }
+        if num_start == i {
+            return None;
+        }
+        let value: f64 = chars[num_start..i].iter().collect::<String>().parse().ok()?;
+        let unit_start = i;
+        while i < chars.len() && !chars[i].is_ascii_digit() && chars[i] != '.' {
+            i += 1;
+        }
+        let unit: String = chars[unit_start..i].iter().collect();
+        let mul = match unit.as_str() {
+            "h" => 3600.0,
+            "m" => 60.0,
+            "s" => 1.0,
+            "ms" => 0.001,
+            "us" | "µs" => 0.000001,
+            "ns" => 0.000000001,
+            _ => return None,
+        };
+        total += value * mul;
+    }
+    Some(total)
+}
+
+/// Parses "(done/total[, speed])" stats where sizes are either "A/B UNIT"
+/// (shared suffix, e.g. "56.2/600.7 MB") or "A UNIT_A/B UNIT_B"
+/// (different suffixes, e.g. "210 MB/5 GB").
+fn parse_croc_size_pair(part: &str) -> Option<(u64, u64)> {
+    let tokens: Vec<&str> = part.split_whitespace().collect();
+    let (done, total) = match tokens.len() {
+        2 => {
+            let mult = croc_unit_multiplier(tokens[1])?;
+            let (a, b) = tokens[0].split_once('/')?;
+            (
+                a.trim().parse::<f64>().ok()? * mult,
+                b.trim().parse::<f64>().ok()? * mult,
+            )
+        }
+        3 => {
+            let (unit_a, total_num) = tokens[1].split_once('/')?;
+            let mult_a = croc_unit_multiplier(unit_a)?;
+            let mult_b = croc_unit_multiplier(tokens[2])?;
+            (
+                tokens[0].parse::<f64>().ok()? * mult_a,
+                total_num.parse::<f64>().ok()? * mult_b,
+            )
+        }
+        _ => return None,
+    };
+    if done < 0.0 || total <= 0.0 {
+        return None;
+    }
+    Some((done as u64, total as u64))
+}
+
+fn parse_croc_speed_part(part: &str) -> Option<f64> {
+    let speed = part.trim();
+    let value_part = speed.strip_suffix("/s")?;
+    let mut tokens = value_part.split_whitespace();
+    let num: f64 = tokens.next()?.parse().ok()?;
+    let unit = tokens.next()?;
+    if tokens.next().is_some() {
+        return None;
+    }
+    let mult = croc_unit_multiplier(unit)?;
+    if num < 0.0 {
+        return None;
+    }
+    Some(num * mult)
+}
+
+/// Finds the `%` token of a bar frame and validates the `|...|` bar after it.
+/// Returns the byte index of `%` and the start index of its digit run.
+fn find_croc_percent_token(s: &str) -> Option<(usize, usize)> {
+    for (idx, ch) in s.char_indices() {
+        if ch != '%' {
+            continue;
+        }
+        let before = &s[..idx];
+        let digits: String = before
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if digits.is_empty() || digits.len() > 3 {
+            continue;
+        }
+        let after = s[idx + 1..].trim_start();
+        let Some(inner) = after.strip_prefix('|') else {
+            continue;
+        };
+        let Some(close) = inner.find('|') else {
+            continue;
+        };
+        // Bar content is saucer/padding glyphs only; reject prose like "|note|".
+        if !inner[..close].is_empty()
+            && !inner[..close]
+                .chars()
+                .any(|c| c.is_ascii_alphanumeric() && c != '=')
+        {
+            return Some((idx, idx - digits.len()));
+        }
+    }
+    None
+}
+
+/// Parses one redraw of croc's per-file progressbar into structured data.
+pub fn parse_croc_bar_frame(line: &str) -> Option<CrocBarFrame> {
+    let s = line.trim();
+    let (pct_idx, digits_start) = find_croc_percent_token(s)?;
+    let percent: u32 = s[digits_start..pct_idx].parse().ok()?;
+    if percent > 100 {
+        return None;
+    }
+
+    let after_bar = s[pct_idx + 1..].trim_start();
+    let inner = after_bar.strip_prefix('|')?;
+    let close = inner.find('|')?;
+    let rest = inner[close + 1..].trim_start();
+
+    let stats = rest.strip_prefix('(')?;
+    let stats_close = stats.rfind(')')?;
+    let body = &stats[..stats_close];
+    let tail = stats[stats_close + 1..].trim();
+
+    let mut parts = body.split(',');
+    let size_part = parts.next()?.trim();
+    let speed_bps = parts.next().and_then(parse_croc_speed_part);
+    if parts.next().is_some() {
+        return None;
+    }
+
+    let (done_bytes, total_bytes) = parse_croc_size_pair(size_part)?;
+
+    // Optional "[elapsed:eta]" tail; absent on the finished 100% render, where
+    // croc instead appends the per-file completion counter (" 1/4").
+    let mut rest = tail;
+    let mut eta_secs = None;
+    if rest.starts_with('[') {
+        if let Some(close) = rest.find(']') {
+            eta_secs = rest[1..close]
+                .split_once(':')
+                .and_then(|(_, remaining)| parse_go_duration(remaining));
+            rest = rest[close + 1..].trim();
+        }
+    }
+    let counter = rest.split_whitespace().next().unwrap_or("");
+    let (file_index, file_count) = match counter.split_once('/') {
+        Some((a, b))
+            if !a.is_empty()
+                && !b.is_empty()
+                && a.chars().all(|c| c.is_ascii_digit())
+                && b.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            match (a.parse::<u64>(), b.parse::<u64>()) {
+                (Ok(i), Ok(n)) => (Some(i), Some(n)),
+                _ => (None, None),
+            }
+        }
+        _ => (None, None),
+    };
+
+    Some(CrocBarFrame {
+        file_name: s[..digits_start].trim().to_string(),
+        done_bytes,
+        total_bytes,
+        speed_bps,
+        eta_secs,
+        file_index,
+        file_count,
+    })
+}
+
+/// Formats seconds like croc's UI: "45s", "2m 3s", "1h 4m".
+pub fn format_eta_compact(secs: f64) -> String {
+    if !secs.is_finite() || secs <= 0.0 {
+        return "--".to_string();
+    }
+    let secs = secs.round() as u64;
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    }
 }
 
 fn parse_sendme_imported_size_hint(line: &str) -> Option<u64> {
@@ -4851,12 +5413,23 @@ fn parse_size_prefix(text: &str) -> Option<u64> {
 }
 
 fn unit_multiplier(unit: &str) -> f64 {
-    match unit.to_lowercase().as_str() {
+    let lower = unit.to_lowercase();
+    // Binary units are base-1024; decimal units (used by croc's CLI and
+    // progressbar) are base-1000.
+    match lower.as_str() {
         "b" => 1.0,
-        "kb" | "kib" => 1024.0,
-        "mb" | "mib" => 1024.0 * 1024.0,
-        "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
-        "tb" | "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        "kib" => 1024.0,
+        "mib" => 1024.0 * 1024.0,
+        "gib" => 1024.0 * 1024.0 * 1024.0,
+        "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        "pib" => 1024f64.powi(5),
+        "eib" => 1024f64.powi(6),
+        "kb" => 1000.0,
+        "mb" => 1000.0 * 1000.0,
+        "gb" => 1000.0 * 1000.0 * 1000.0,
+        "tb" => 1000f64.powi(4),
+        "pb" => 1000f64.powi(5),
+        "eb" => 1000f64.powi(6),
         _ => 1.0,
     }
 }
@@ -5208,12 +5781,14 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod parse_tests {
     use super::{
-        extract_croc_received_text, extract_croc_received_text_from_logs, normalize_sendme_ticket,
-        parse_croc_file_counter_progress, parse_croc_total_size_hint, parse_payload_progress,
+        extract_croc_received_text, extract_croc_received_text_from_logs, format_eta_compact,
+        normalize_sendme_ticket, parse_croc_bar_frame, parse_croc_file_counter_progress,
+        parse_croc_total_size_hint, parse_go_duration, parse_payload_progress,
         parse_sendme_imported_size_hint, parse_sendme_item_index, parse_sendme_total_files_hint,
         parse_stage_progress, AppView, DataBeamApp, SelectedTool, TransferMsg, TransferPhase,
         TransferState,
     };
+    use eframe::egui::Color32;
     use std::sync::mpsc;
 
     #[test]
@@ -5243,7 +5818,7 @@ mod parse_tests {
         let line = "Downloading ... [##>-----] 57.0 MB/6.3 GB 10.08 MiB/s";
         let (done, total) = parse_payload_progress(line).expect("payload progress");
         assert!(done > 50 * 1024 * 1024);
-        assert!(total > 6 * 1024 * 1024 * 1024);
+        assert!(total > 6_000_000_000);
         assert!(total > done);
     }
 
@@ -5271,15 +5846,245 @@ mod parse_tests {
 
     #[test]
     fn croc_total_size_hint_parses() {
+        // croc's session header uses base-1024 units: 6.4 GB -> 6.4 * 1024^3
         let line = "Sending 57865 files (6.4 GB)";
         let total = parse_croc_total_size_hint(line).expect("croc total");
-        assert!(total > 6 * 1024 * 1024 * 1024);
+        assert!(total > 6_800_000_000u64, "unexpected total: {total}");
+        assert!(total < 6_900_000_000u64, "unexpected total: {total}");
+    }
+
+    #[test]
+    fn croc_total_size_hint_uses_binary_units() {
+        // Real capture: payload of 62,974,560 bytes printed as "60.1 MB".
+        let line = "Receiving 4 files (60.1 MB)";
+        let total = parse_croc_total_size_hint(line).expect("croc total");
+        assert_eq!(total, 63_019_417);
     }
 
     #[test]
     fn croc_total_size_hint_ignores_per_file_lines() {
         let line = "sending databeam_QWIXer/readme.txt (6.0 KB)";
         assert!(parse_croc_total_size_hint(line).is_none());
+    }
+
+    #[test]
+    fn croc_bar_frame_parses_mid_transfer() {
+        let line =
+            "\rscan641.pdf  56% |███████             | (56.2/600.7 MB, 4.46 MB/s) [1m3s:2m3s]";
+        let frame = parse_croc_bar_frame(line).expect("frame");
+        assert_eq!(frame.file_name, "scan641.pdf");
+        assert_eq!(frame.done_bytes, 56_200_000);
+        assert_eq!(frame.total_bytes, 600_700_000);
+        assert_eq!(frame.speed_bps, Some(4_460_000.0));
+        assert_eq!(frame.eta_secs, Some(123.0));
+    }
+
+    #[test]
+    fn croc_bar_frame_parses_single_digit_percent() {
+        let line = "\rtiny.bin   9% |█                   | (16/16 kB, 1.5 MB/s) [0s:0s]";
+        let frame = parse_croc_bar_frame(line).expect("frame");
+        assert_eq!(frame.file_name, "tiny.bin");
+        assert_eq!(frame.done_bytes, 16_000);
+        assert_eq!(frame.total_bytes, 16_000);
+        assert_eq!(frame.speed_bps, Some(1_500_000.0));
+        assert_eq!(frame.eta_secs, Some(0.0));
+    }
+
+    #[test]
+    fn croc_bar_frame_final_frame_has_no_brackets() {
+        let line = "\rf.bin 100% |████████████████████| (1500/1500 B, 1.0 MB/s)";
+        let frame = parse_croc_bar_frame(line).expect("frame");
+        assert_eq!(frame.done_bytes, 1500);
+        assert_eq!(frame.total_bytes, 1500);
+        assert_eq!(frame.speed_bps, Some(1_000_000.0));
+        assert_eq!(frame.eta_secs, None);
+    }
+
+    #[test]
+    fn croc_bar_frame_parses_mixed_suffixes() {
+        let line =
+            "\rbig.iso  42% |████████            | (210 MB/5 GB, 12.5 MB/s) [4m10s:5m50s]";
+        let frame = parse_croc_bar_frame(line).expect("frame");
+        assert_eq!(frame.done_bytes, 210_000_000);
+        assert_eq!(frame.total_bytes, 5_000_000_000);
+        assert_eq!(frame.speed_bps, Some(12_500_000.0));
+        assert_eq!(frame.eta_secs, Some(350.0));
+    }
+
+    #[test]
+    fn croc_bar_frame_without_speed_is_ok() {
+        let line = "\rf.bin  10% |██                  | (60.07/600.7 MB)";
+        let frame = parse_croc_bar_frame(line).expect("frame");
+        assert_eq!(frame.done_bytes, 60_070_000);
+        assert_eq!(frame.total_bytes, 600_700_000);
+        assert_eq!(frame.speed_bps, None);
+        assert_eq!(frame.eta_secs, None);
+    }
+
+    #[test]
+    fn croc_bar_frame_rejects_non_frames() {
+        assert!(parse_croc_bar_frame("").is_none());
+        assert!(parse_croc_bar_frame("[1/4] Getting sizes... [00:00:00]").is_none());
+        assert!(parse_croc_bar_frame("Sending 2 files (6.4 GB)").is_none());
+        assert!(
+            parse_croc_bar_frame("n abc r 123/0 i 474 # hash [] 6.7 KiB/6.7 KiB").is_none(),
+            "sendme lines must not match"
+        );
+        assert!(parse_croc_bar_frame("50% off sale |buy now| today").is_none());
+    }
+
+    #[test]
+    fn go_duration_parses_variants() {
+        assert_eq!(parse_go_duration("45s"), Some(45.0));
+        assert_eq!(parse_go_duration("2m3s"), Some(123.0));
+        assert_eq!(parse_go_duration("1h4m5s"), Some(3845.0));
+        assert_eq!(parse_go_duration("1m30.5s"), Some(90.5));
+        assert_eq!(parse_go_duration("0s"), Some(0.0));
+        assert_eq!(parse_go_duration(""), None);
+        assert_eq!(parse_go_duration("00:00:00"), None);
+        assert_eq!(parse_go_duration("abc"), None);
+    }
+
+    #[test]
+    fn eta_formatting_compacts() {
+        assert_eq!(format_eta_compact(45.0), "45s");
+        assert_eq!(format_eta_compact(123.0), "2m 3s");
+        assert_eq!(format_eta_compact(3723.0), "1h 2m");
+        assert_eq!(format_eta_compact(0.0), "--");
+        assert_eq!(format_eta_compact(-1.0), "--");
+    }
+
+    #[test]
+    fn sendme_panel_shows_eta_and_files() {
+        let mut app = DataBeamApp::default();
+        app.selected_tool = SelectedTool::Sendme;
+        app.view = AppView::Receive;
+        app.transfer_speed_bps = Some(100_000.0);
+        app.sendme_total_items = Some(5);
+        let panel = app.build_sendme_panel_data(Color32::BLUE, 0.5, 500_000, 1_500_000);
+        assert_eq!(panel.title, "Receiving\u{2026}");
+        assert_eq!(panel.detail_left.as_deref(), Some("5 files"));
+        assert_eq!(panel.rate_value, "97.7 KB/s");
+        assert_eq!(panel.eta_value, "10s");
+    }
+
+    #[test]
+    fn average_speed_uses_payload_window() {
+        let mut app = DataBeamApp::default();
+        app.transfer_payload_start_time = Some(10.0);
+        app.transfer_end_time = Some(130.0);
+        app.transfer_done_bytes = Some(600_700_000);
+        let avg = app.average_transfer_speed_bps().expect("avg speed");
+        assert!((avg - 600_700_000.0 / 120.0).abs() < 1.0);
+
+        // Falls back to the session start when no payload timestamp exists.
+        let mut app = DataBeamApp::default();
+        app.transfer_start_time = Some(0.0);
+        app.transfer_end_time = Some(10.0);
+        app.transfer_done_bytes = Some(1000);
+        assert!((app.average_transfer_speed_bps().unwrap() - 100.0).abs() < 1e-6);
+
+        assert!(DataBeamApp::default().average_transfer_speed_bps().is_none());
+    }
+
+    #[test]
+    fn croc_frames_accumulate_across_files() {
+        let mut app = DataBeamApp::default();
+        app.selected_tool = SelectedTool::Croc;
+        app.view = AppView::Receive;
+        app.transfer_state = TransferState::Running;
+        app.transfer_phase = TransferPhase::Transferring;
+        // Real total: 2 x 1536 B = 3072 B, printed base-1024 as "3.0 kB".
+        app.update_transfer_metrics_from_log("Receiving 2 files (3.0 kB)");
+        assert_eq!(app.transfer_total_bytes, Some(3072));
+
+        app.animation_time = 1.0;
+        app.update_transfer_metrics_from_log(
+            "\ra.bin  50% |██████████          | (768/1536 B, 1.0 MB/s) [0s:2s]",
+        );
+        assert_eq!(app.croc_completed_bytes, 0);
+        assert_eq!(app.transfer_done_bytes, Some(768));
+        assert!((app.transfer_progress - 0.25).abs() < 1e-4);
+
+        app.animation_time = 2.0;
+        app.update_transfer_metrics_from_log(
+            "\ra.bin 100% |████████████████████| (1536/1536 B, 1.0 MB/s)",
+        );
+
+        app.animation_time = 3.0;
+        app.update_transfer_metrics_from_log(
+            "\rb.bin   5% |█                   | (75/1536 B, 900 kB/s) [0s:2s]",
+        );
+        assert_eq!(app.croc_completed_bytes, 1536);
+        assert_eq!(app.transfer_done_bytes, Some(1611));
+        let expected = 1611.0f32 / 3072.0;
+        assert!((app.transfer_progress - expected).abs() < 1e-4);
+    }
+
+    #[test]
+    fn croc_bar_frame_parses_trailing_file_counter() {
+        let line = "\ra.txt 100% |████████████████████| (30/30 kB, 11 MB/s) 1/4";
+        let frame = parse_croc_bar_frame(line).expect("frame");
+        assert_eq!(frame.file_index, Some(1));
+        assert_eq!(frame.file_count, Some(4));
+        assert_eq!(frame.eta_secs, None);
+        assert_eq!(frame.done_bytes, 30_000);
+        assert_eq!(frame.total_bytes, 30_000);
+    }
+
+    #[test]
+    fn croc_frames_fold_duplicate_filenames() {
+        let mut app = DataBeamApp::default();
+        app.selected_tool = SelectedTool::Croc;
+        app.view = AppView::Receive;
+        app.transfer_state = TransferState::Running;
+        app.transfer_phase = TransferPhase::Transferring;
+        app.transfer_total_bytes = Some(90_000);
+
+        app.animation_time = 1.0;
+        app.update_transfer_metrics_from_log(
+            "\rdup.txt   0% |                    | ( 0 B/15 kB) [0s:0s]",
+        );
+        app.animation_time = 2.0;
+        app.update_transfer_metrics_from_log(
+            "\rdup.txt 100% |████████████████████| (15/15 kB, 5.7 MB/s) 1/2",
+        );
+        assert_eq!(app.croc_completed_bytes, 0);
+        assert_eq!(app.croc_file_progress, Some((1, 2)));
+
+        // Second file with the SAME name: its blank 0% frame must trigger the fold.
+        app.animation_time = 3.0;
+        app.update_transfer_metrics_from_log(
+            "\rdup.txt   0% |                    | ( 0 B/15 kB) [0s:0s]",
+        );
+        assert_eq!(app.croc_completed_bytes, 15_000);
+
+        app.animation_time = 4.0;
+        app.update_transfer_metrics_from_log(
+            "\rdup.txt 100% |████████████████████| (15/15 kB, 5.7 MB/s) 2/2",
+        );
+        assert_eq!(app.croc_completed_bytes, 15_000);
+        assert_eq!(app.transfer_done_bytes, Some(30_000));
+        assert_eq!(app.croc_file_progress, Some((2, 2)));
+    }
+
+    #[test]
+    fn croc_panel_shows_finalizing_after_frame_silence() {
+        let mut app = DataBeamApp::default();
+        app.selected_tool = SelectedTool::Croc;
+        app.view = AppView::Receive;
+        app.croc_bar_file = Some("big.bin".to_string());
+        app.croc_last_frame_at = Some(10.0);
+
+        app.animation_time = 11.0;
+        let panel = app.build_croc_panel_data(Color32::BLUE, 0.5, 50, 100);
+        assert!(!panel.title.contains("Finalizing"));
+
+        app.animation_time = 20.0;
+        let panel = app.build_croc_panel_data(Color32::BLUE, 0.5, 50, 100);
+        assert!(panel.title.contains("Finalizing"));
+        assert_eq!(panel.eta_value, "--");
+        assert_eq!(panel.rate_value, "--");
     }
 
     #[test]
@@ -5312,9 +6117,7 @@ mod parse_tests {
         app.transfer_phase = TransferPhase::WaitingForReceiver;
         app.transfer_total_bytes = Some((6.4_f64 * 1024.0 * 1024.0 * 1024.0) as u64);
 
-        app.update_transfer_metrics_from_log(
-            "file_download.py 100% |====| (83/83 kB, 58 MB/s) 2628/57865",
-        );
+        app.update_transfer_metrics_from_log("file_download.py 2628/57865");
 
         assert_eq!(app.transfer_phase, TransferPhase::WaitingForReceiver);
         assert!(app.transfer_done_bytes.is_none());
@@ -5334,19 +6137,41 @@ mod parse_tests {
         let total = app
             .transfer_total_bytes
             .expect("total bytes from summary line");
-        assert!(total > 6 * 1024 * 1024 * 1024);
+        assert_eq!(total, 6_871_947_673);
 
         app.update_transfer_metrics_from_log("Sending (->192.168.1.60:56052)");
         assert_eq!(app.transfer_phase, TransferPhase::Transferring);
 
-        app.update_transfer_metrics_from_log(
-            "file_download.py 100% |====| (83/83 kB, 58 MB/s) 2628/57865",
-        );
+        // Before any progressbar frame arrives, the file-counter model drives
+        // overall progress.
+        app.update_transfer_metrics_from_log("file_download.py 2628/57865");
 
         let p = app.effective_progress();
         assert!(p > 0.04 && p < 0.05, "unexpected overall progress: {p}");
         let done = app.transfer_done_bytes.expect("derived done bytes");
         assert!(done > 200 * 1024 * 1024, "unexpected done bytes: {done}");
+    }
+
+    #[test]
+    fn croc_frame_progress_supersedes_file_counter_model() {
+        let mut app = DataBeamApp::default();
+        app.selected_tool = SelectedTool::Croc;
+        app.view = AppView::Send;
+        app.transfer_state = TransferState::Running;
+        app.transfer_phase = TransferPhase::Transferring;
+        app.croc_file_progress = Some((2628, 57865));
+        app.transfer_total_bytes = Some(6_400_000_000);
+
+        app.animation_time = 1.0;
+        app.update_transfer_metrics_from_log(
+            "\rfile_download.py  56% |███████             | (3.4/6.1 GB, 44.6 MB/s) [1m3s:1m13s]",
+        );
+
+        assert_eq!(app.croc_bar_done, 3_400_000_000);
+        assert_eq!(app.transfer_speed_bps, Some(44_600_000.0));
+        let p = app.effective_progress();
+        let expected = 3_400_000_000f32 / 6_400_000_000.0;
+        assert!((p - expected).abs() < 1e-4, "unexpected progress: {p}");
     }
 
     #[test]

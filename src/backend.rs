@@ -201,7 +201,7 @@ fn github_repo(tool: &Tool) -> &'static str {
     }
 }
 
-pub const HARDCODED_CROC_VERSION: &str = "v11.0.1";
+pub const HARDCODED_CROC_VERSION: &str = "v11.2.5";
 
 fn fetch_latest_release(tool: &Tool) -> Result<GitHubRelease, String> {
     let url = match tool {
@@ -1621,6 +1621,7 @@ pub fn sendme_receive(
             app_handle,
         ));
 
+        let mut last_progress_log = Instant::now();
         loop {
             if cancel2.load(Ordering::Relaxed) {
                 task.abort();
@@ -1641,17 +1642,22 @@ pub fn sendme_receive(
                         let progress = (done as f32 / total as f32).clamp(0.0, 1.0);
                         let _ = tx.send(TransferMsg::Progress(progress));
                     }
-                    let _ = tx.send(TransferMsg::Output(format!(
-                        "[3/4] Downloading ... {} / {} {}",
-                        format_size_unit(done),
-                        format_size_unit(total.max(done).max(1)),
-                        format_speed_unit(speed_bps)
-                    )));
-                    let _ = tx.send(TransferMsg::Output(format!(
-                        "n native r {}/{} i 0 # recv",
-                        done,
-                        total.max(done).max(1)
-                    )));
+                    // Progress lines are UI metrics; throttle them so the log
+                    // and channel are not flooded by per-chunk events.
+                    if last_progress_log.elapsed() >= Duration::from_millis(200) {
+                        let _ = tx.send(TransferMsg::Output(format!(
+                            "[3/4] Downloading ... {} / {} {}",
+                            format_size_unit(done),
+                            format_size_unit(total.max(done).max(1)),
+                            format_speed_unit(speed_bps)
+                        )));
+                        let _ = tx.send(TransferMsg::Output(format!(
+                            "n native r {}/{} i 0 # recv",
+                            done,
+                            total.max(done).max(1)
+                        )));
+                        last_progress_log = Instant::now();
+                    }
                 }
                 Ok(NativeSendmeEvent::ReceiveCompleted) => {
                     let _ = tx.send(TransferMsg::Progress(1.0));
@@ -1997,11 +2003,11 @@ mod tests {
     fn test_is_matching_croc_version() {
         use super::is_matching_croc_version;
 
-        assert!(is_matching_croc_version("croc version v11.0.1", "v11.0.1"));
-        assert!(is_matching_croc_version("croc version 11.0.1", "v11.0.1"));
-        assert!(is_matching_croc_version("croc v11.0.1, build 123", "11.0.1"));
-        assert!(!is_matching_croc_version("croc version v11.0.10", "v11.0.1"));
-        assert!(!is_matching_croc_version("croc version v11.0.1-beta", "v11.0.1"));
-        assert!(!is_matching_croc_version("croc version v10.4.1", "v11.0.1"));
+        assert!(is_matching_croc_version("croc version v11.2.5", "v11.2.5"));
+        assert!(is_matching_croc_version("croc version 11.2.5", "v11.2.5"));
+        assert!(is_matching_croc_version("croc v11.2.5, build 123", "11.2.5"));
+        assert!(!is_matching_croc_version("croc version v11.2.50", "v11.2.5"));
+        assert!(!is_matching_croc_version("croc version v11.2.5-beta", "v11.2.5"));
+        assert!(!is_matching_croc_version("croc version v10.4.1", "v11.2.5"));
     }
 }

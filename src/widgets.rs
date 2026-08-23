@@ -143,6 +143,123 @@ pub fn pulsing_progress_bar(ui: &mut egui::Ui, time: f64, color: Color32) {
     }
 }
 
+// ── Croc-style Transfer Panel ──────────────────────────────────────
+
+pub struct CrocPanelData {
+    pub title: String,
+    pub transferred_label: String,
+    pub progress: f32,
+    pub percent_label: String,
+    pub detail_left: Option<String>,
+    pub rate_value: String,
+    pub eta_value: String,
+}
+
+/// Accurate transfer panel in the style of getcroc.com: title + byte counter,
+/// thick bar with right-aligned percentage, file detail row, RATE | ETA box.
+pub fn croc_progress_panel(ui: &mut egui::Ui, data: &CrocPanelData, color: Color32) {
+    // Row 1: title left, transferred/total right.
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::Label::new(
+                RichText::new(&data.title)
+                    .size(12.0)
+                    .color(TEXT_PRIMARY)
+                    .strong(),
+            )
+            .truncate(),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                RichText::new(&data.transferred_label)
+                    .size(11.0)
+                    .color(TEXT_MUTED)
+                    .monospace(),
+            );
+        });
+    });
+    ui.add_space(6.0);
+
+    // Thick rounded bar.
+    let desired_size = Vec2::new(ui.available_width(), 10.0);
+    let (rect, _) = ui.allocate_exact_size(desired_size, Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let rounding = CornerRadius::same(5);
+        ui.painter().rect_filled(
+            rect,
+            rounding,
+            Color32::from_rgba_premultiplied(255, 255, 255, 14),
+        );
+        let fill_width = rect.width() * data.progress.clamp(0.0, 1.0);
+        if fill_width > 0.5 {
+            let fill_rect = Rect::from_min_size(rect.min, Vec2::new(fill_width, rect.height()));
+            ui.painter().rect_filled(fill_rect, rounding, color);
+        }
+    }
+    ui.add_space(2.0);
+
+    // Percentage under the right edge of the bar (horizontal keeps the row at
+    // content height; a bare with_layout would consume all remaining space).
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                RichText::new(&data.percent_label)
+                    .size(10.0)
+                    .color(TEXT_SECONDARY)
+                    .monospace(),
+            );
+        });
+    });
+
+    // File detail row: "4/7 path/file.pdf".
+    if let Some(detail) = &data.detail_left {
+        ui.add_space(2.0);
+        ui.add(egui::Label::new(RichText::new(detail).size(10.0).color(TEXT_SECONDARY)).truncate());
+    }
+    ui.add_space(6.0);
+
+    // RATE | ETA box.
+    let width = ui.available_width();
+    let height = 54.0;
+    let (box_rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+    if ui.is_rect_visible(box_rect) {
+        ui.painter().rect_filled(box_rect, INPUT_ROUNDING, BG_INPUT);
+        ui.painter().rect_stroke(
+            box_rect,
+            INPUT_ROUNDING,
+            Stroke::new(1.0, BORDER_SUBTLE),
+            StrokeKind::Inside,
+        );
+        let mid_x = box_rect.left() + box_rect.width() / 2.0;
+        ui.painter().line_segment(
+            [
+                Pos2::new(mid_x, box_rect.top() + 8.0),
+                Pos2::new(mid_x, box_rect.bottom() - 8.0),
+            ],
+            Stroke::new(1.0, BORDER_SUBTLE),
+        );
+
+        let draw_cell = |label: &str, value: &str, cell_left: f32| {
+            ui.painter().text(
+                Pos2::new(cell_left + 10.0, box_rect.top() + 9.0),
+                egui::Align2::LEFT_TOP,
+                label.to_uppercase(),
+                FontId::new(9.0, FontFamily::Proportional),
+                TEXT_MUTED,
+            );
+            ui.painter().text(
+                Pos2::new(cell_left + 10.0, box_rect.center().y + 3.0),
+                egui::Align2::LEFT_CENTER,
+                value,
+                FontId::new(14.0, FontFamily::Monospace),
+                TEXT_PRIMARY,
+            );
+        };
+        draw_cell("rate", &data.rate_value, box_rect.left());
+        draw_cell("eta", &data.eta_value, mid_x + 8.0);
+    }
+}
+
 // ── Section Header ─────────────────────────────────────────────────
 
 pub fn section_header(ui: &mut egui::Ui, icon: &str, text: &str) {
