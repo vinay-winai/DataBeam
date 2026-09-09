@@ -1286,6 +1286,23 @@ impl DataBeamApp {
         self.transfer_state = TransferState::Failed("Transfer cancelled".to_string());
     }
 
+    /// True when a captured croc output line signals relay DNS resolution
+    /// failure (e.g. `lookup 3.getcroc.com: i/o timeout`). The raw failure
+    /// surfaces only as a generic process-exit message, so callers use this
+    /// to show a DNS/VPN hint on the Failed card instead.
+    fn is_relay_dns_failure_line(line: &str) -> bool {
+        let lower = line.to_lowercase();
+        lower.contains("no such host")
+            || lower.contains("could not resolve")
+            || lower.contains("cannot resolve")
+            || lower.contains("temporary failure in name resolution")
+            || lower.contains("server misbehaving")
+            || lower.contains("dns error")
+            || lower.contains("dns lookup failed")
+            || (lower.contains("lookup") && lower.contains("getcroc"))
+            || (lower.contains("lookup") && lower.contains("i/o timeout"))
+    }
+
     fn fail_transfer(&mut self, e: String) {
         if let Some(handle) = &self.transfer_handle {
             handle.request_cancel();
@@ -2718,6 +2735,22 @@ impl DataBeamApp {
                                     // Serve mode: non-fatal per-cycle sender failure, restart cleanly.
                                     restart_sendme_serve = true;
                                     break;
+                                } else if (self.selected_tool == SelectedTool::Croc
+                                    || self.selected_tool == SelectedTool::EazySendme)
+                                    && self
+                                        .transfer_log
+                                        .iter()
+                                        .rev()
+                                        .take(50)
+                                        .any(|l| Self::is_relay_dns_failure_line(l))
+                                {
+                                    // Raw croc failure is only a generic process-exit
+                                    // message; the log holds the real cause, so headline
+                                    // it as a DNS/VPN hint instead.
+                                    self.fail_transfer(
+                                        "Couldn't reach the relay: DNS lookup failed. Check your DNS or VPN connection and retry (details in the log below)."
+                                            .to_string(),
+                                    );
                                 } else {
                                     self.fail_transfer(e);
                                 }
@@ -6553,6 +6586,29 @@ mod parse_tests {
         let line = "[1/4]⠁ Connecting ... [00:00:00]";
         let p = parse_stage_progress(line).expect("stage progress");
         assert!((p - 0.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn relay_dns_failure_line_matches_resolver_errors() {
+        // Exact line shape reported against Quad9 DNS.
+        assert!(DataBeamApp::is_relay_dns_failure_line(
+            "relay connection failed: could not connect to 3.getcroc.com:9009: 3.getcroc.com:9009: comm.NewConnection failed: dial tcp: lookup 3.getcroc.com: i/o timeout"
+        ));
+        assert!(DataBeamApp::is_relay_dns_failure_line(
+            "dial tcp: lookup 1.getcroc.com: no such host"
+        ));
+        assert!(DataBeamApp::is_relay_dns_failure_line(
+            "temporary failure in name resolution"
+        ));
+        assert!(!DataBeamApp::is_relay_dns_failure_line(
+            "peer error: refusing files"
+        ));
+        assert!(!DataBeamApp::is_relay_dns_failure_line(
+            "Sending (->peer)"
+        ));
+        assert!(!DataBeamApp::is_relay_dns_failure_line(
+            "Process exited with code: exit code: 1"
+        ));
     }
 
     #[test]
