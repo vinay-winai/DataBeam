@@ -273,6 +273,9 @@ struct DataBeamApp {
     croc_update_check_rx: Option<mpsc::Receiver<CrocUpdateCheckResult>>,
     croc_update_apply_rx: Option<mpsc::Receiver<CrocUpdateApplyResult>>,
     croc_legacy_migration_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
+    // Background first-run managed-croc install (spawned in `new()` when no
+    // cached copy exists; polled in `poll_managed_install`).
+    managed_install_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
     croc_update_last_check_at: Option<f64>,
     croc_update_startup_check_done: bool,
 
@@ -420,6 +423,7 @@ impl Default for DataBeamApp {
             croc_update_check_rx: None,
             croc_update_apply_rx: None,
             croc_legacy_migration_rx: None,
+            managed_install_rx: None,
             croc_update_last_check_at: None,
             croc_update_startup_check_done: false,
             native_engines_expanded: false,
@@ -480,9 +484,26 @@ impl DataBeamApp {
         app.size_update_tx = Some(size_tx);
         app.size_update_rx = Some(size_rx);
 
-        let (croc_path, sendme_path) = init_bundled_binaries();
+        let (croc_path, sendme_path) = init_bundled_binaries_fast();
         app.bundled_croc = croc_path;
         app.bundled_sendme = sendme_path;
+
+        // Managed croc download must never block first paint (macOS: the
+        // dock icon bounces forever with no window until `new()` returns).
+        // Fetch it on a worker and re-detect when it lands; until then the
+        // system PATH fallback (if any) serves transfers.
+        if app.bundled_croc.is_none() {
+            let (tx, rx) = mpsc::channel();
+            app.managed_install_rx = Some(rx);
+            let wake = cc.egui_ctx.clone();
+            app.transfer_log
+                .push("Downloading croc in the background…".to_string());
+            thread::spawn(move || {
+                let path = install_managed_binary(&Tool::Croc);
+                let _ = tx.send(path);
+                wake.request_repaint();
+            });
+        }
 
         app.tool_statuses =
             detect_all_tools(app.bundled_croc.as_ref(), app.bundled_sendme.as_ref());
@@ -1945,6 +1966,37 @@ impl DataBeamApp {
             let _ = tx.send(path);
             wake.request_repaint();
         });
+    }
+
+    /// Background managed-croc install (spawned in `new()` when no cached
+    /// copy exists): adopt the binary and re-detect so the tool card flips
+    /// without a restart.
+    fn poll_managed_install(&mut self) {
+        let Some(rx) = self.managed_install_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(path) => {
+                if let Some(path) = path {
+                    self.bundled_croc = Some(path);
+                    self.tool_statuses = detect_all_tools(
+                        self.bundled_croc.as_ref(),
+                        self.bundled_sendme.as_ref(),
+                    );
+                    self.transfer_log
+                        .push("Background croc download finished.".to_string());
+                } else {
+                    self.transfer_log.push(
+                        "Background croc download failed; using system croc if available."
+                            .to_string(),
+                    );
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                self.managed_install_rx = Some(rx);
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {}
+        }
     }
 
     fn poll_croc_update(&mut self, ctx: &egui::Context) {
@@ -3672,6 +3724,7 @@ impl eframe::App for DataBeamApp {
         self.poll_size_updates();
         self.poll_transfer();
         // Croc self-update: first check on open, then every 6 hours.
+        self.poll_managed_install();
         self.poll_croc_update(ctx);
         self.maybe_trigger_croc_update_check(ctx);
         if let Some(started_at) = self.eazy_local_check_started_at {

@@ -280,7 +280,7 @@ fn find_release_asset<'a>(tool: &Tool, release: &'a GitHubRelease) -> Option<&'a
 #[cfg(not(target_os = "windows"))]
 fn download_bytes(url: &str) -> Result<Vec<u8>, String> {
     let output = new_hidden_command("curl")
-        .args(["-fsSL", "-A", "databeam", url])
+        .args(["-fsSL", "--connect-timeout", "20", "--max-time", "180", "-A", "databeam", url])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -308,7 +308,7 @@ fn download_bytes(url: &str) -> Result<Vec<u8>, String> {
     let tmp_path_str = tmp_path.to_string_lossy().to_string();
 
     let script = format!(
-        "$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -UseBasicParsing -Headers @{{'User-Agent'='Mozilla/5.0 (Windows NT 10.0; Win64; x64) DataBeam/{}'; 'Accept'='application/vnd.github+json, application/octet-stream'}} -Uri '{}' -OutFile '{}'",
+        "$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -UseBasicParsing -TimeoutSec 180 -Headers @{{'User-Agent'='Mozilla/5.0 (Windows NT 10.0; Win64; x64) DataBeam/{}'; 'Accept'='application/vnd.github+json, application/octet-stream'}} -Uri '{}' -OutFile '{}'",
         env!("CARGO_PKG_VERSION"),
         escape_ps_single_quote(url),
         escape_ps_single_quote(&tmp_path_str)
@@ -398,19 +398,41 @@ fn extract_binary_from_zip(
     ))
 }
 
-fn install_managed_binary(tool: &Tool) -> Option<PathBuf> {
+/// Non-empty cached managed binary, if present. Never touches the network.
+/// On macOS also strips the quarantine xattr best-effort so later
+/// `--version` probes can't stall in Gatekeeper verification.
+fn cached_managed_binary(tool: &Tool) -> Option<PathBuf> {
+    let path = managed_binary_path(tool);
+    if path.exists() && fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false) {
+        #[cfg(target_os = "macos")]
+        strip_quarantine(&path);
+        Some(path)
+    } else {
+        None
+    }
+}
+
+/// macOS tags files downloaded by an app with com.apple.quarantine; the
+/// first exec then stalls in Gatekeeper verification (on the calling
+/// thread). Managed binaries come from official upstream releases, so
+/// clearing the flag best-effort is safe.
+#[cfg(target_os = "macos")]
+fn strip_quarantine(path: &Path) {
+    let _ = std::process::Command::new("xattr")
+        .args(["-d", "com.apple.quarantine"])
+        .arg(path)
+        .output();
+}
+
+pub fn install_managed_binary(tool: &Tool) -> Option<PathBuf> {
     let output_path = managed_binary_path(tool);
 
     // No version pinning: any non-empty cached binary is reused as-is.
     // Freshness is handled by `croc update` (self-updater) after startup,
     // plus the legacy-migration path in `refresh_managed_croc_to_latest`.
 
-    if output_path.exists()
-        && fs::metadata(&output_path)
-            .map(|m| m.len() > 0)
-            .unwrap_or(false)
-    {
-        return Some(output_path);
+    if let Some(cached) = cached_managed_binary(tool) {
+        return Some(cached);
     }
 
     fs::create_dir_all(bundled_bin_dir()).ok()?;
@@ -458,6 +480,10 @@ fn install_managed_binary(tool: &Tool) -> Option<PathBuf> {
         eprintln!("{} extraction failed: {}", tool.name(), e);
         return None;
     }
+
+    set_executable_permissions(&output_path);
+    #[cfg(target_os = "macos")]
+    strip_quarantine(&output_path);
 
     Some(output_path)
 }
@@ -757,16 +783,19 @@ pub fn redetect_croc_status(bundled_croc: Option<&PathBuf>) -> ToolStatus {
     detect_tool_with_bundled(&Tool::Croc, bundled_croc)
 }
 
-/// Initialize managed binaries:
-// 1) Extract embedded binaries when available.
-// 2) Otherwise download platform-specific binaries from official GitHub releases.
-pub fn init_bundled_binaries() -> (Option<PathBuf>, Option<PathBuf>) {
+/// Fast, non-blocking half of startup init: embedded extract + cached reuse
+/// only — never touches the network. When the managed croc is missing, the
+/// caller must run `install_managed_binary` on a background thread and
+/// re-detect afterwards; downloading here would hang first paint (on macOS
+/// the dock icon bounces forever with no window until startup returns).
+pub fn init_bundled_binaries_fast() -> (Option<PathBuf>, Option<PathBuf>) {
     let mut croc_path = extract_bundled_binary(&managed_binary_name(&Tool::Croc), CROC_GZ);
 
     // Prefer managed Croc binaries on every platform for consistent behavior.
-    // If managed download is unavailable, detection later falls back to system PATH.
+    // With no cached copy, detection falls back to system PATH until a
+    // background install lands.
     if croc_path.is_none() {
-        croc_path = install_managed_binary(&Tool::Croc);
+        croc_path = cached_managed_binary(&Tool::Croc);
     }
 
     // Sendme is linked as a native Rust library (third_party/sendme), so no external
@@ -2378,9 +2407,22 @@ mod tests {
     }
 
     #[test]
+    fn managed_croc_path_roundtrip() {
+        use super::{is_managed_croc_binary, managed_binary_path, Tool};
+
+        // Whatever the platform cache dir is, the managed path must
+        // recognize itself and reject foreign locations.
+        let managed = managed_binary_path(&Tool::Croc)
+            .to_string_lossy()
+            .to_string();
+        assert!(is_managed_croc_binary(&managed));
+        assert!(!is_managed_croc_binary("/usr/local/bin/croc"));
+        assert!(!is_managed_croc_binary(""));
+    }
+
+    #[test]
     fn croc_update_check_output_parses() {
         use super::{parse_croc_update_check_output, CrocUpdateCheck};
-
         assert!(matches!(
             parse_croc_update_check_output("croc v11.5.0 is up to date.\n"),
             CrocUpdateCheck::UpToDate { .. }

@@ -10,9 +10,16 @@
 //!
 //! Window semantics mirror proven tray apps on the same stack: hide goes
 //! through the winit-consistent viewport command; restore calls raw Win32
-//! ShowWindow FIRST (needs no event loop — its OS messages wake a hidden
-//! loop) followed by the same viewport commands; any left-click restores,
-//! menu Exit quits.
+//! ShowWindow FIRST on Windows (needs no event loop — its OS messages wake
+//! a hidden loop) followed by the same viewport commands; any left-click
+//! restores, menu Exit quits.
+//!
+//! macOS menu-bar diffs (see [`tray_title_text`] and `init_tray`): the
+//! status item is icon-only with the icon as a template silhouette (native
+//! dark/light rendering, per HIG); title text next to the icon is a
+//! Windows/Linux convention and is omitted there. No LSUIElement — the dock
+//! icon stays, close-to-tray is minimize via the shared viewport path, and
+//! restore is viewport commands only (no Win32 wake exists off-Windows).
 //!
 //! [`TrayState`] owns the icon, menu and items for the app lifetime —
 //! dropping it removes the icon. Creation returns `None` where no tray is
@@ -228,6 +235,21 @@ fn load_tray_icon() -> Option<Icon> {
     Icon::from_rgba(image.into_raw(), width, height).ok()
 }
 
+/// Status-item title text. macOS menu-bar convention is icon-only — text
+/// next to the icon is non-standard there — while Windows/Linux show the
+/// label. Pure (no muda/tray objects) so it is unit-tested on every OS,
+/// unlike the init path which needs the main thread on macOS.
+pub fn tray_title_text() -> Option<&'static str> {
+    #[cfg(target_os = "macos")]
+    {
+        None
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Some("DataBeam")
+    }
+}
+
 /// Create the tray icon + right-click menu (`Show DataBeam` / `Exit`) and
 /// return the owned state plus the raw-event channel. `hwnd` is captured for
 /// direct Win32 wake/restore from the handler thread (None off-Windows).
@@ -258,17 +280,28 @@ pub fn init_tray(
         None
     })?;
 
-    let tray = match TrayIconBuilder::new()
+    let mut builder = TrayIconBuilder::new()
         .with_menu(Box::new(menu.clone()))
         // Explicit: left-click restores via Click events. The library
         // DEFAULT shows the menu on left-click too (verified in source),
         // which fights the restore and confuses the toggle-re-enable path.
+        // (macOS: left-click then delivers Click; right/Ctrl-click pops
+        // the menu — same split as Windows.)
         .with_menu_on_left_click(false)
         .with_tooltip("DataBeam — Secure & Fast Transfer")
-        .with_title("DataBeam")
-        .with_icon(icon)
-        .build()
+        .with_icon(icon);
+    // macOS menu-bar diff: template silhouette (native tint in dark/light
+    // mode) instead of the full-color icon; the 64px asset's alpha channel
+    // becomes the mask. A dedicated monochrome asset can replace it later.
+    #[cfg(target_os = "macos")]
     {
+        builder = builder.with_icon_as_template(true);
+    }
+    // Title text beside the icon is Windows/Linux convention only.
+    if let Some(title) = tray_title_text() {
+        builder = builder.with_title(title);
+    }
+    let tray = match builder.build() {
         Ok(tray) => tray,
         Err(e) => {
             debug_log(&format!("tray init failed: build: {e:?}"));
@@ -461,6 +494,17 @@ mod tests {
             map_menu_id(show_id, quit_id, &MenuEvent { id: "other".into() }),
             None
         );
+    }
+
+    #[test]
+    fn tray_title_diff_matches_platform() {
+        // Pure helper (no Menu/tray objects) so this runs on every OS,
+        // unlike the init tests which need the main thread on macOS.
+        if cfg!(target_os = "macos") {
+            assert_eq!(tray_title_text(), None);
+        } else {
+            assert_eq!(tray_title_text(), Some("DataBeam"));
+        }
     }
 
     #[test]
