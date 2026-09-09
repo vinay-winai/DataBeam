@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod backend;
 mod theme;
+mod tray;
 mod widgets;
 
 use eframe::egui;
@@ -19,6 +20,26 @@ use theme::*;
 use widgets::*;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// Window geometry baselines: builder size and the minimum accepted size.
+// The restore guard reuses the minimums so a shrunken restore can never be
+// mistaken for a legitimate user resize (users cannot go below minimum).
+const WINDOW_DEFAULT_W: f32 = 620.0;
+const WINDOW_DEFAULT_H: f32 = 820.0;
+const WINDOW_MIN_W: f32 = 460.0;
+const WINDOW_MIN_H: f32 = 400.0;
+
+/// Decide whether a tray restore must force the window size.
+/// Returns the size to apply when `current` is below the usable minimum
+/// (a state no legitimate resize can produce); otherwise `None` so healthy
+/// restores — including user-resized windows — are never touched.
+fn restore_size_override(current: [f32; 2], last_good: [f32; 2]) -> Option<[f32; 2]> {
+    if current[0] < WINDOW_MIN_W || current[1] < WINDOW_MIN_H {
+        Some(last_good)
+    } else {
+        None
+    }
+}
 
 // ── Application State ──────────────────────────────────────────────
 
@@ -126,6 +147,12 @@ struct UserSettings {
     croc_custom_code: String,
     #[serde(default)]
     croc_use_custom_code: bool,
+    /// Close hides the window to the system tray instead of quitting.
+    #[serde(default = "default_true")]
+    minimize_to_tray: bool,
+    /// Tray debug log to the temp dir (default off).
+    #[serde(default)]
+    tray_debug_log: bool,
     /// Maps croc code → cache entry containing Sendme ticket and sizes for that session.
     /// Persisted so local-blob retry works even after app restart or reset_transfer.
     #[serde(default)]
@@ -201,6 +228,9 @@ struct DataBeamApp {
     eazy_local_check_started_at: Option<f64>,
     croc_qr_popup_open: bool,
     croc_text_popup_open: bool,
+    settings_popup_open: bool,
+    /// Tray debug log to temp file (default off; see tray::set_debug_enabled).
+    tray_debug_log: bool,
 
     // EazySendme
     eazysendme_custom_code: String,
@@ -243,6 +273,21 @@ struct DataBeamApp {
     cleanup_targets: Vec<PathBuf>,
     cleanup_bytes: u64,
     cleanup_prompt_open: bool,
+
+    // System tray (close hides to tray when enabled).
+    // Icon ownership stays here (dropping removes the icon); quit intent
+    // and menu ids live in tray:: statics (shared with handler thread).
+    minimize_to_tray: bool,
+    tray_state: Option<tray::TrayState>,
+    tray_action_rx: Option<mpsc::Receiver<tray::TrayRawEvent>>,
+    /// Win32 HWND captured at startup, independent of the tray toggle, so a
+    /// later toggle-time init still restores via direct Win32 wake.
+    startup_hwnd: Option<isize>,
+    /// Last-known-good inner size, recorded on healthy visible frames.
+    /// Session-only (never persisted): stale geometry must not outlive it.
+    last_good_inner: [f32; 2],
+    /// One-shot launch repair done (see update()).
+    launch_size_fixed: bool,
 }
 
 impl Drop for DataBeamApp {
@@ -306,6 +351,8 @@ impl Default for DataBeamApp {
             eazy_local_check_started_at: None,
             croc_qr_popup_open: false,
             croc_text_popup_open: false,
+            settings_popup_open: false,
+            tray_debug_log: false,
             toast_msg: None,
             animation_time: 0.0,
             drag_hover: false,
@@ -340,6 +387,12 @@ impl Default for DataBeamApp {
             cleanup_targets: Vec::new(),
             cleanup_bytes: 0,
             cleanup_prompt_open: false,
+            minimize_to_tray: true,
+            tray_state: None,
+            tray_action_rx: None,
+            startup_hwnd: None,
+            last_good_inner: [WINDOW_DEFAULT_W, WINDOW_DEFAULT_H],
+            launch_size_fixed: false,
         }
     }
 }
@@ -394,6 +447,29 @@ impl DataBeamApp {
             detect_all_tools(app.bundled_croc.as_ref(), app.bundled_sendme.as_ref());
         app.load_user_settings();
 
+        // Capture the HWND unconditionally: a later toggle-time init needs
+        // it for the direct Win32 wake even when no tray init runs now.
+        // No tray objects are created while the toggle is off.
+        use raw_window_handle::HasWindowHandle as _;
+        app.startup_hwnd = cc
+            .window_handle()
+            .ok()
+            .and_then(|handle| tray::hwnd_from_raw(handle.as_raw()));
+
+        // System tray is ON by default; init after settings load so the
+        // toggle is honoured. Tray creation may fail (no indicator service
+        // on Linux, headless CI) — then close quits normally. The installed
+        // handlers forward events plus a repaint wakeup (required: a hidden
+        // window gets no update() calls to poll with).
+        if app.minimize_to_tray && !tray::is_active() {
+            if let Some((state, rx)) =
+                tray::init_tray(cc.egui_ctx.clone(), Self::pick_restore_hwnd(app.startup_hwnd, tray::tray_hwnd()))
+            {
+                app.tray_state = Some(state);
+                app.tray_action_rx = Some(rx);
+            }
+        }
+
         // Always start with EazySendme; fall back if tools are unavailable.
         let sendme_available = app
             .tool_statuses
@@ -416,6 +492,14 @@ impl DataBeamApp {
     }
 
     fn settings_file_path() -> Option<PathBuf> {
+        // Overridable for tests (so they never touch real user data) and
+        // portable installs.
+        if let Some(custom) = std::env::var_os("DATABEAM_SETTINGS_FILE") {
+            let custom = PathBuf::from(custom);
+            if !custom.as_os_str().is_empty() {
+                return Some(custom);
+            }
+        }
         let base = dirs::config_dir()
             .or_else(dirs::data_local_dir)
             .or_else(dirs::cache_dir)
@@ -470,6 +554,9 @@ impl DataBeamApp {
         self.eazysendme_auto_retry = true; // Always true on launch
         self.croc_custom_code = settings.croc_custom_code;
         self.croc_use_custom_code = settings.croc_use_custom_code;
+        self.minimize_to_tray = settings.minimize_to_tray;
+        self.tray_debug_log = settings.tray_debug_log;
+        tray::set_debug_enabled(settings.tray_debug_log);
         // Limit map size to 20 entries (keep newest)
         // Accept the full map; 20 entries is tiny for JSON anyway.
         self.eazysendme_code_ticket_map = settings.eazysendme_code_ticket_map;
@@ -500,6 +587,8 @@ impl DataBeamApp {
             eazysendme_auto_retry: self.eazysendme_auto_retry,
             croc_custom_code: self.croc_custom_code.clone(),
             croc_use_custom_code: self.croc_use_custom_code,
+            minimize_to_tray: self.minimize_to_tray,
+            tray_debug_log: self.tray_debug_log,
             eazysendme_code_ticket_map: self.eazysendme_code_ticket_map.clone(),
         };
         if let Ok(json) = serde_json::to_string_pretty(&settings) {
@@ -1054,6 +1143,95 @@ impl DataBeamApp {
         // exist and check_and_export_local will return Ok(false), falling through to Croc.
     }
 
+    /// HWND for tray restore: the startup-captured handle wins because it is
+    /// always taken, while the shared cached one only exists when a prior
+    /// tray init ran. Toggle-time init with no prior init used to pass
+    /// `None`, silently disabling the direct Win32 wake on every restore.
+    fn pick_restore_hwnd(startup: Option<isize>, cached: Option<isize>) -> Option<isize> {
+        startup.or(cached)
+    }
+
+    /// Restore a hidden/minimized main window and focus it: raw Win32 show
+    /// first (needs no event loop — this is what wakes a hidden loop),
+    /// then winit-consistent viewport commands. Finally the size guard:
+    /// if the reported rect is below the usable minimum (shrunken-restore
+    /// race), force the last-known-good size instead.
+    fn show_main_window(&mut self, ctx: &egui::Context) {
+        tray::debug_log("tray action applied: Show");
+        if let Some(hwnd) = tray::tray_hwnd() {
+            tray::sw_show(hwnd);
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        let current = ctx.screen_rect();
+        if let Some(size) =
+            restore_size_override([current.width(), current.height()], self.last_good_inner)
+        {
+            tray::debug_log(&format!(
+                "tray restore size guard: forcing {}x{}",
+                size[0] as u32, size[1] as u32
+            ));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(size[0], size[1])));
+        }
+    }
+
+    /// Hide the main window to the tray (transfers keep running).
+    /// Minimize-only by design: taskbar-minimize is the verified ~0%-CPU
+    /// hidden state on this stack (the OS suppresses redraw delivery for
+    /// iconic windows while the event loop keeps processing real events, so
+    /// tray clicks keep working). `Visible(false)` is deliberately NOT used:
+    /// measured locally, a merely-hidden window spins the main thread at a
+    /// full core with zero update() calls — root cause inside winit/eframe
+    /// internals, still unnamed. A pending Eazy auto-retry keeps its exact
+    /// wake second.
+    fn hide_to_tray(&mut self, ctx: &egui::Context) {
+        tray::debug_log("window hidden to tray");
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        // A pending Eazy auto-retry keeps its exact wake second.
+        if let Some(retry_time) = self.eazy_next_retry_time {
+            let secs = (retry_time - self.animation_time).clamp(0.0, 3600.0);
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(secs));
+        }
+    }
+
+    /// Apply one tray-menu/click action. Quit is instant (see hard_quit).
+    fn apply_tray_action(&mut self, ctx: &egui::Context, action: tray::TrayAction) {
+        match action {
+            tray::TrayAction::Show => {
+                self.show_main_window(ctx);
+            }
+            tray::TrayAction::Quit => {
+                tray::hard_quit();
+            }
+        }
+    }
+
+    /// Toggle close-to-tray from the settings popup (persisted).
+    fn set_minimize_to_tray(&mut self, ctx: &egui::Context, enabled: bool) {
+        if self.minimize_to_tray == enabled {
+            return;
+        }
+        self.minimize_to_tray = enabled;
+        if enabled && self.tray_state.is_none() {
+            // No frame handle here; prefer the startup-captured HWND so the
+            // direct Win32 wake works even when no prior tray init ran.
+            let hwnd = Self::pick_restore_hwnd(self.startup_hwnd, tray::tray_hwnd());
+            tray::debug_log(&format!(
+                "tray toggle init hwnd: {}",
+                if hwnd.is_some() { "present" } else { "missing" }
+            ));
+            if let Some((state, rx)) = tray::init_tray(ctx.clone(), hwnd) {
+                self.tray_state = Some(state);
+                self.tray_action_rx = Some(rx);
+            }
+        } else if !enabled {
+            // Drop the icon immediately so it never lingers.
+            self.tray_state.take();
+        }
+        self.persist_user_settings();
+    }
+
     fn cancel_transfer(&mut self) {
         if let Some(handle) = &self.transfer_handle {
             handle.request_cancel();
@@ -1105,17 +1283,26 @@ impl DataBeamApp {
             || e.to_lowercase().contains("os error 17") // EEXIST on Unix
             || e.to_lowercase().contains("os error 183"); // ERROR_ALREADY_EXISTS on Windows
 
+        // NOTE: failure-path elapsed is shown on the Failed card for consistency;
+        // the original request was the Elapsed label in the Completed body row
+        // next to Avg speed.
         if is_file_exists_error {
             self.eazy_retry_count = 0;
             if self.selected_tool == SelectedTool::Croc {
                 self.transfer_state = TransferState::Failed("The file/folder you intended to download has the same name as another item at the destination. Rename that item and try a new transfer.".to_string());
             }
+            // NOTE: freeze end-time here too so the failure-path elapsed is
+            // accurate on these early-return paths (same note as above).
+            self.transfer_end_time = Some(self.animation_time);
             return;
         }
 
         if e == "conflict-detected" {
             self.eazy_retry_count = 0;
             self.transfer_state = TransferState::Failed("The file/folder you intended to download has the same name as another item at the destination. Rename that item and try a new transfer.".to_string());
+            // NOTE: same as above — freeze end-time for an accurate
+            // failure-path elapsed on this early-return path.
+            self.transfer_end_time = Some(self.animation_time);
             return;
         }
 
@@ -2725,6 +2912,44 @@ impl DataBeamApp {
         if self.cleanup_prompt_open {
             self.render_cleanup_popup(ctx);
         }
+        if self.settings_popup_open {
+            self.render_settings_popup(ctx);
+        }
+    }
+
+    fn render_settings_popup(&mut self, ctx: &egui::Context) {
+        let mut open = self.settings_popup_open;
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::RIGHT_BOTTOM, [-12.0, -12.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(260.0);
+                // NOTE: checkbox edits a LOCAL copy on purpose. Binding `&mut
+                // self.minimize_to_tray` directly would flip the field before
+                // `set_minimize_to_tray` runs, making its changed-guard always
+                // true and silently skipping init/drop/persist.
+                let mut tray_toggle = self.minimize_to_tray;
+                if ui
+                    .checkbox(&mut tray_toggle, "Live in system tray (close hides to tray)")
+                    .changed()
+                {
+                    let ctx = ui.ctx().clone();
+                    self.set_minimize_to_tray(&ctx, tray_toggle);
+                }
+                let mut debug_toggle = self.tray_debug_log;
+                if ui
+                    .checkbox(&mut debug_toggle, "Tray debug log (temp file)")
+                    .on_hover_text("Writes tray events to databeam-tray-debug.log in the temp dir")
+                    .changed()
+                {
+                    self.tray_debug_log = debug_toggle;
+                    tray::set_debug_enabled(debug_toggle);
+                    self.persist_user_settings();
+                }
+            });
+        self.settings_popup_open = open;
     }
 
     fn render_cleanup_popup(&mut self, ctx: &egui::Context) {
@@ -2845,6 +3070,50 @@ impl DataBeamApp {
 impl eframe::App for DataBeamApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.animation_time = ctx.input(|i| i.time);
+        // One-shot launch repair: a poisoned persisted rect (saved while
+        // tiny/iconic) would otherwise open small every launch. A static
+        // tiny window generates no further updates, so this cannot wait.
+        if !self.launch_size_fixed {
+            self.launch_size_fixed = true;
+            let first = ctx.screen_rect();
+            if let Some(size) = restore_size_override(
+                [first.width(), first.height()],
+                [WINDOW_DEFAULT_W, WINDOW_DEFAULT_H],
+            ) {
+                tray::debug_log(&format!(
+                    "launch size guard: forcing {}x{}",
+                    size[0] as u32, size[1] as u32
+                ));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(
+                    size[0], size[1],
+                )));
+            }
+        }
+        // Track last-known-good window size for the restore-size guard.
+        // Only healthy visible frames qualify (below-minimum rects, e.g. a
+        // shrunken restore, are never recorded).
+        let screen = ctx.screen_rect();
+        if screen.width() >= WINDOW_MIN_W && screen.height() >= WINDOW_MIN_H {
+            self.last_good_inner = [screen.width(), screen.height()];
+        }
+        // ── System tray: close-to-tray + menu actions ──
+        // Raw tray/menu events arrive via installed handlers, which apply
+        // Show/Quit directly; this drain is a backup for when the loop runs.
+        let tray_actions = match self.tray_action_rx.as_ref() {
+            Some(rx) => tray::drain_actions_global(rx),
+            _ => Vec::new(),
+        };
+        for action in tray_actions {
+            self.apply_tray_action(ctx, action);
+        }
+        if ctx.input(|i| i.viewport().close_requested()) {
+            // Tray Exit bypasses this entirely (hard_quit); X always hides
+            // to tray while the toggle is on and the icon exists.
+            if self.minimize_to_tray && tray::is_active() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.hide_to_tray(ctx);
+            }
+        }
         if !self.initialized_once {
             self.view = AppView::Home;
             self.initialized_once = true;
@@ -3072,6 +3341,15 @@ impl eframe::App for DataBeamApp {
                     });
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Settings cog: lives in the always-visible top bar
+                        // (the bottom status bar only renders mid-transfer).
+                        if ui
+                            .add(egui::Button::new(RichText::new("⚙").size(14.0)).frame(false))
+                            .on_hover_text("Settings")
+                            .clicked()
+                        {
+                            self.settings_popup_open = !self.settings_popup_open;
+                        }
                         let (tc, tn) = match self.selected_tool {
                             SelectedTool::Croc => (CROC_COLOR, "🐊 croc"),
                             SelectedTool::Sendme => (SENDME_COLOR, "📡 sendme"),
@@ -4669,12 +4947,47 @@ impl DataBeamApp {
                                 .monospace(),
                             );
                         }
+                        // Elapsed wall time next to the speed, same value as
+                        // the header above (payload start if known, else send
+                        // start, through completion).
+                        if let Some(start) = self
+                            .transfer_payload_start_time
+                            .or(self.transfer_start_time)
+                        {
+                            let end = self.transfer_end_time.unwrap_or(self.animation_time);
+                            let e = (end - start).max(0.0);
+                            ui.label(
+                                RichText::new(format!(
+                                    "Elapsed: {}:{:02}",
+                                    e as u64 / 60,
+                                    e as u64 % 60
+                                ))
+                                .size(10.0)
+                                .color(TEXT_MUTED)
+                                .monospace(),
+                            );
+                        }
                     });
                 }
                 TransferState::Failed(e) => {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new("❌").size(14.0));
                         ui.label(RichText::new(e).color(ERROR).size(12.0));
+                        // NOTE: failure-path elapsed is shown here for consistency;
+                        // the original request was the Elapsed label in the
+                        // Completed body row next to Avg speed.
+                        if let Some(start) = self
+                            .transfer_payload_start_time
+                            .or(self.transfer_start_time)
+                        {
+                            let end = self.transfer_end_time.unwrap_or(self.animation_time);
+                            let e = (end - start).max(0.0);
+                            ui.label(
+                                RichText::new(format!("{}:{:02}", e as u64 / 60, e as u64 % 60))
+                                    .color(TEXT_MUTED)
+                                    .size(11.0),
+                            );
+                        }
                     });
                 }
             }
@@ -5761,10 +6074,10 @@ fn main() -> eframe::Result {
     ))]
     let _single_instance_guard = enforce_single_instance_release();
 
-    let options = eframe::NativeOptions {
+        let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([620.0, 820.0])
-            .with_min_inner_size([460.0, 400.0])
+            .with_inner_size([WINDOW_DEFAULT_W, WINDOW_DEFAULT_H])
+            .with_min_inner_size([WINDOW_MIN_W, WINDOW_MIN_H])
             .with_title("DataBeam — Secure & Fast Transfer")
             .with_icon(databeam_icon())
             .with_drag_and_drop(true),
@@ -6450,5 +6763,99 @@ mod parse_tests {
         app.poll_transfer();
 
         assert!(app.eazy_local_check_started_at.is_none());
+    }
+
+    /// Guards `DATABEAM_SETTINGS_FILE` so a panic cannot leak the override
+    /// into other tests running in the same process.
+    struct SettingsFileGuard;
+    impl SettingsFileGuard {
+        fn set(path: &std::path::Path) -> Self {
+            std::env::set_var("DATABEAM_SETTINGS_FILE", path);
+            SettingsFileGuard
+        }
+    }
+    impl Drop for SettingsFileGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("DATABEAM_SETTINGS_FILE");
+        }
+    }
+
+    #[test]
+    fn pick_restore_hwnd_prefers_startup_capture() {
+        use super::DataBeamApp;
+        // Startup capture always wins: it is taken unconditionally, while the
+        // cached one only exists when a prior tray init ran. Toggle-time init
+        // with no prior init used to pass None (silent dead restores).
+        assert_eq!(DataBeamApp::pick_restore_hwnd(Some(123), Some(456)), Some(123));
+        assert_eq!(DataBeamApp::pick_restore_hwnd(Some(123), None), Some(123));
+        assert_eq!(DataBeamApp::pick_restore_hwnd(None, Some(456)), Some(456));
+        assert_eq!(DataBeamApp::pick_restore_hwnd(None, None), None);
+        // Default has no capture yet (filled in new()).
+        assert_eq!(DataBeamApp::default().startup_hwnd, None);
+    }
+
+    #[test]
+    fn restore_size_override_only_fires_below_minimum() {
+        use super::restore_size_override;
+        // Healthy sizes (default, user-resized, exactly minimum): untouched.
+        assert_eq!(restore_size_override([620.0, 820.0], [800.0, 600.0]), None);
+        assert_eq!(restore_size_override([800.0, 600.0], [800.0, 600.0]), None);
+        assert_eq!(restore_size_override([460.0, 400.0], [620.0, 820.0]), None);
+        // Shrunken restore states: forced to last good.
+        assert_eq!(
+            restore_size_override([160.0, 31.0], [620.0, 820.0]),
+            Some([620.0, 820.0])
+        );
+        assert_eq!(
+            restore_size_override([0.0, 0.0], [800.0, 600.0]),
+            Some([800.0, 600.0])
+        );
+        assert_eq!(
+            restore_size_override([620.0, 399.0], [620.0, 820.0]),
+            Some([620.0, 820.0])
+        );
+    }
+
+    #[test]
+    fn tray_toggle_setter_drives_init_drop_and_persist() {
+        // Redirect settings so this test never touches real user data.
+        // Regression test: the checkbox must go through the setter with the
+        // not-yet-applied value. Binding `&mut app.minimize_to_tray`
+        // directly flips the field first, making the setter's changed-guard
+        // always true — toggle ON then silently never initialized the tray.
+        let dir = std::env::temp_dir().join(format!(
+            "databeam-test-settings-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("test settings dir");
+        let file = dir.join("settings.json");
+        let _guard = SettingsFileGuard::set(&file);
+
+        let mut app = DataBeamApp::default();
+        assert!(app.minimize_to_tray);
+        let ctx = eframe::egui::Context::default();
+
+        // OFF: flips the field and persists (no icon was ever created).
+        // May briefly show a tray icon on machines with a tray; it is
+        // dropped with `app` at test end.
+        app.set_minimize_to_tray(&ctx, false);
+        assert!(!app.minimize_to_tray);
+        assert!(app.tray_state.is_none());
+        let raw = std::fs::read_to_string(&file).expect("settings written");
+        assert!(raw.contains("\"minimize_to_tray\": false"));
+
+        // ON: flips back and ATTEMPTS init (graceful None headless).
+        app.set_minimize_to_tray(&ctx, true);
+        assert!(app.minimize_to_tray);
+
+        // Same value: no-op, still on.
+        app.set_minimize_to_tray(&ctx, true);
+        assert!(app.minimize_to_tray);
+
+        // Persisted file reflects the final value.
+        let raw = std::fs::read_to_string(&file).expect("settings written");
+        assert!(raw.contains("\"minimize_to_tray\": true"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

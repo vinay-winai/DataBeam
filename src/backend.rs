@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{BufReader, Cursor, Read, Write};
@@ -201,7 +201,7 @@ fn github_repo(tool: &Tool) -> &'static str {
     }
 }
 
-pub const HARDCODED_CROC_VERSION: &str = "v11.0.1";
+pub const HARDCODED_CROC_VERSION: &str = "v11.5.0";
 
 fn fetch_latest_release(tool: &Tool) -> Result<GitHubRelease, String> {
     let url = match tool {
@@ -1021,6 +1021,8 @@ pub fn croc_send(
                 if let Ok(mut guard) = pid_handle.lock() {
                     *guard = Some(child.id());
                 }
+                // Tracked for tray instant-quit (see kill_all_tracked_children).
+                track_child_pid(child.id());
 
                 let stderr = child.stderr.take();
                 let stdout = child.stdout.take();
@@ -1042,6 +1044,7 @@ pub fn croc_send(
                 });
 
                 let status = child.wait();
+                untrack_child_pid(child.id());
                 if let Some(h) = stderr_thread {
                     let _ = h.join();
                 }
@@ -1112,6 +1115,8 @@ pub fn croc_receive(
                 if let Ok(mut guard) = pid_handle.lock() {
                     *guard = Some(child.id());
                 }
+                // Tracked for tray instant-quit (see kill_all_tracked_children).
+                track_child_pid(child.id());
 
                 let stderr = child.stderr.take();
                 let stdout = child.stdout.take();
@@ -1133,6 +1138,7 @@ pub fn croc_receive(
                 });
 
                 let status = child.wait();
+                untrack_child_pid(child.id());
                 if let Some(h) = stderr_thread {
                     let _ = h.join();
                 }
@@ -1911,6 +1917,37 @@ fn extract_croc_code(trimmed: &str) -> Option<String> {
         }
     }
 
+    // croc 11.5.0 sender shape: `croc <code> (code copied to clipboard)`.
+    // Older releases log `Code is: <code>` (handled above). The paren
+    // requirement distinguishes the code line from subcommand echoes
+    // (`croc send …`, `croc relay`, …) which never carry `(…)` directly.
+    {
+        let mut text = trimmed;
+        // Tolerate a log-level tag such as `[Croc] ` if a caller passes one.
+        if let Some(tag) = text.get(..6) {
+            if tag.eq_ignore_ascii_case("[croc]") {
+                text = text[6..].trim_start();
+            }
+        }
+        let is_croc_prefix = text
+            .get(..5)
+            .is_some_and(|head| head.eq_ignore_ascii_case("croc "));
+        if is_croc_prefix {
+            let rest = text[5..].trim_start();
+            if let Some(space) = rest.find(char::is_whitespace) {
+                let token = rest[..space].trim_matches('"');
+                let tail = rest[space..].trim_start();
+                if tail.starts_with('(')
+                    && !token.is_empty()
+                    && !token.starts_with('-')
+                    && !token.contains(['/', '\\', ':', '?', '#'])
+                {
+                    return Some(token.to_string());
+                }
+            }
+        }
+    }
+
     None
 }
 
@@ -1954,20 +1991,55 @@ impl ProcessHandle {
         // Actually kill the child process
         if let Ok(guard) = self.child_pid.lock() {
             if let Some(pid) = *guard {
-                #[cfg(unix)]
-                {
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGTERM);
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    let mut cmd = new_hidden_command("taskkill");
-
-                    let _ = cmd.args(["/PID", &pid.to_string(), "/F", "/T"]).output();
-                }
+                kill_pid(pid);
             }
         }
+    }
+}
+
+/// Kill one process id best-effort (shared by cancel and instant-quit).
+fn kill_pid(pid: u32) {
+    #[cfg(unix)]
+    {
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let mut cmd = new_hidden_command("taskkill");
+
+        let _ = cmd.args(["/PID", &pid.to_string(), "/F", "/T"]).output();
+    }
+}
+
+// ── Managed child-process registry ───────────────────────────────
+// Long-lived croc children tracked here so tray instant-quit can kill them
+// without app state (`process::exit` skips `Drop`, which is what normally
+// cancels them). PIDs are removed when the child is reaped.
+static MANAGED_CHILD_PIDS: std::sync::LazyLock<std::sync::Mutex<HashSet<u32>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+pub(crate) fn track_child_pid(pid: u32) {
+    if let Ok(mut set) = MANAGED_CHILD_PIDS.lock() {
+        set.insert(pid);
+    }
+}
+
+pub(crate) fn untrack_child_pid(pid: u32) {
+    if let Ok(mut set) = MANAGED_CHILD_PIDS.lock() {
+        set.remove(&pid);
+    }
+}
+
+/// Best-effort kill of every tracked child (tray instant-quit path).
+pub(crate) fn kill_all_tracked_children() {
+    let pids: Vec<u32> = MANAGED_CHILD_PIDS
+        .lock()
+        .map(|mut set| set.drain().collect())
+        .unwrap_or_default();
+    for pid in pids {
+        kill_pid(pid);
     }
 }
 
@@ -2003,11 +2075,50 @@ mod tests {
     fn test_is_matching_croc_version() {
         use super::is_matching_croc_version;
 
-        assert!(is_matching_croc_version("croc version v11.0.1", "v11.0.1"));
-        assert!(is_matching_croc_version("croc version 11.0.1", "v11.0.1"));
-        assert!(is_matching_croc_version("croc v11.0.1, build 123", "11.0.1"));
-        assert!(!is_matching_croc_version("croc version v11.0.10", "v11.0.1"));
-        assert!(!is_matching_croc_version("croc version v11.0.1-beta", "v11.0.1"));
-        assert!(!is_matching_croc_version("croc version v10.4.1", "v11.0.1"));
+        assert!(is_matching_croc_version("croc version v11.5.0", "v11.5.0"));
+        assert!(is_matching_croc_version("croc version 11.5.0", "v11.5.0"));
+        assert!(is_matching_croc_version("croc v11.5.0, build 123", "11.5.0"));
+        assert!(!is_matching_croc_version("croc version v11.5.00", "v11.5.0"));
+        assert!(!is_matching_croc_version("croc version v11.5.0-beta", "v11.5.0"));
+        assert!(!is_matching_croc_version("croc version v10.4.1", "v11.5.0"));
+    }
+
+    #[test]
+    fn test_extract_croc_code_sender_shapes() {
+        use super::extract_croc_code;
+
+        // croc 11.5.0 generated/custom sender line (Eazy + Croc modes).
+        assert_eq!(
+            extract_croc_code("croc asdfasdf (code copied to clipboard)"),
+            Some("asdfasdf".to_string())
+        );
+        assert_eq!(
+            extract_croc_code("croc coach-wasp-quill (code copied to clipboard)"),
+            Some("coach-wasp-quill".to_string())
+        );
+        // Tolerate a log-level tag prefix.
+        assert_eq!(
+            extract_croc_code("[Croc] croc asdfasdf (code copied to clipboard)"),
+            Some("asdfasdf".to_string())
+        );
+        // Legacy shapes keep working.
+        assert_eq!(
+            extract_croc_code("Code is: ocean-monkey-42"),
+            Some("ocean-monkey-42".to_string())
+        );
+        assert_eq!(
+            extract_croc_code("CROC_SECRET=\"asdfasdf\" croc"),
+            Some("asdfasdf".to_string())
+        );
+        // Must not fire on subcommand echoes, progress, or links.
+        assert_eq!(extract_croc_code("croc send file.txt"), None);
+        assert_eq!(extract_croc_code("croc relay"), None);
+        assert_eq!(extract_croc_code("Sending (->192.168.1.60:56052)"), None);
+        assert_eq!(
+            extract_croc_code("Or open: https://getcroc.com/?code=asdfasdf"),
+            None
+        );
+        assert_eq!(extract_croc_code("Sending 'text' (222 B)"), None);
+        assert_eq!(extract_croc_code(""), None);
     }
 }
