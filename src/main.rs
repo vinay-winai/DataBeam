@@ -1,6 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod backend;
 mod theme;
+// Tray stack is Windows-only for now (macOS menu-bar / Linux indicator
+// support deferred): silence dead code off-Windows. The pure mapping
+// helpers stay unit-tested on every OS.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod tray;
 mod widgets;
 
@@ -518,11 +522,10 @@ impl DataBeamApp {
             .ok()
             .and_then(|handle| tray::hwnd_from_raw(handle.as_raw()));
 
-        // System tray is ON by default; init after settings load so the
-        // toggle is honoured. Tray creation may fail (no indicator service
-        // on Linux, headless CI) — then close quits normally. The installed
-        // handlers forward events plus a repaint wakeup (required: a hidden
-        // window gets no update() calls to poll with).
+        // System tray is Windows-only for now; init after settings load so
+        // the toggle is honoured. Other platforms quit on close (default
+        // eframe behaviour) and never create tray objects.
+        #[cfg(target_os = "windows")]
         if app.minimize_to_tray && !tray::is_active() {
             if let Some((state, rx)) =
                 tray::init_tray(cc.egui_ctx.clone(), Self::pick_restore_hwnd(app.startup_hwnd, tray::tray_hwnd()))
@@ -1210,6 +1213,8 @@ impl DataBeamApp {
     /// always taken, while the shared cached one only exists when a prior
     /// tray init ran. Toggle-time init with no prior init used to pass
     /// `None`, silently disabling the direct Win32 wake on every restore.
+    /// Windows-only tray path (see mod tray).
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     fn pick_restore_hwnd(startup: Option<isize>, cached: Option<isize>) -> Option<isize> {
         startup.or(cached)
     }
@@ -1248,6 +1253,8 @@ impl DataBeamApp {
     /// full core with zero update() calls — root cause inside winit/eframe
     /// internals, still unnamed. A pending Eazy auto-retry keeps its exact
     /// wake second.
+    /// Windows-only tray path (see mod tray).
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     fn hide_to_tray(&mut self, ctx: &egui::Context) {
         tray::debug_log("window hidden to tray");
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
@@ -1271,6 +1278,8 @@ impl DataBeamApp {
     }
 
     /// Toggle close-to-tray from the settings popup (persisted).
+    /// Windows-only tray path (see mod tray).
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     fn set_minimize_to_tray(&mut self, ctx: &egui::Context, enabled: bool) {
         if self.minimize_to_tray == enabled {
             return;
@@ -3402,27 +3411,32 @@ impl DataBeamApp {
             .anchor(egui::Align2::RIGHT_BOTTOM, [-12.0, -12.0])
             .show(ctx, |ui| {
                 ui.set_min_width(260.0);
-                // NOTE: checkbox edits a LOCAL copy on purpose. Binding `&mut
-                // self.minimize_to_tray` directly would flip the field before
-                // `set_minimize_to_tray` runs, making its changed-guard always
-                // true and silently skipping init/drop/persist.
-                let mut tray_toggle = self.minimize_to_tray;
-                if ui
-                    .checkbox(&mut tray_toggle, "Live in system tray (close hides to tray)")
-                    .changed()
+                // Windows-only tray rows (see mod tray): other platforms
+                // quit on close, so no tray toggle is shown there.
+                #[cfg(target_os = "windows")]
                 {
-                    let ctx = ui.ctx().clone();
-                    self.set_minimize_to_tray(&ctx, tray_toggle);
-                }
-                let mut debug_toggle = self.tray_debug_log;
-                if ui
-                    .checkbox(&mut debug_toggle, "Tray debug log (temp file)")
-                    .on_hover_text("Writes tray events to databeam-tray-debug.log in the temp dir")
-                    .changed()
-                {
-                    self.tray_debug_log = debug_toggle;
-                    tray::set_debug_enabled(debug_toggle);
-                    self.persist_user_settings();
+                    // NOTE: checkbox edits a LOCAL copy on purpose. Binding `&mut
+                    // self.minimize_to_tray` directly would flip the field before
+                    // `set_minimize_to_tray` runs, making its changed-guard always
+                    // true and silently skipping init/drop/persist.
+                    let mut tray_toggle = self.minimize_to_tray;
+                    if ui
+                        .checkbox(&mut tray_toggle, "Live in system tray (close hides to tray)")
+                        .changed()
+                    {
+                        let ctx = ui.ctx().clone();
+                        self.set_minimize_to_tray(&ctx, tray_toggle);
+                    }
+                    let mut debug_toggle = self.tray_debug_log;
+                    if ui
+                        .checkbox(&mut debug_toggle, "Tray debug log (temp file)")
+                        .on_hover_text("Writes tray events to databeam-tray-debug.log in the temp dir")
+                        .changed()
+                    {
+                        self.tray_debug_log = debug_toggle;
+                        tray::set_debug_enabled(debug_toggle);
+                        self.persist_user_settings();
+                    }
                 }
                 ui.add_space(4.0);
                 ui.separator();
@@ -3605,8 +3619,10 @@ impl eframe::App for DataBeamApp {
             self.apply_tray_action(ctx, action);
         }
         if ctx.input(|i| i.viewport().close_requested()) {
-            // Tray Exit bypasses this entirely (hard_quit); X always hides
-            // to tray while the toggle is on and the icon exists.
+            // Windows-only tray: X hides to tray while the toggle is on and
+            // the icon exists (Tray Exit bypasses this via hard_quit).
+            // Other platforms quit on close (default eframe behaviour).
+            #[cfg(target_os = "windows")]
             if self.minimize_to_tray && tray::is_active() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.hide_to_tray(ctx);

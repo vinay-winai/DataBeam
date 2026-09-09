@@ -23,8 +23,15 @@
 //!
 //! [`TrayState`] owns the icon, menu and items for the app lifetime —
 //! dropping it removes the icon. Creation returns `None` where no tray is
-//! available (Linux without appindicator, headless CI); callers then fall
-//! back to normal quit-on-close behaviour.
+//! available (headless CI); callers then fall back to normal quit-on-close
+//! behaviour.
+//!
+//! NOTE: the tray stack is currently Windows-only — all call sites in
+//! `main.rs` (init, close-intercept, settings toggle) are
+//! `#[cfg(target_os = "windows")]`-gated and this module carries
+//! `allow(dead_code)` off-Windows. macOS menu-bar / Linux indicator support
+//! is deferred, not removed: the builder diffs and pure mapping helpers are
+//! kept portable and unit-tested on every OS.
 
 use std::sync::{mpsc, Mutex, OnceLock};
 
