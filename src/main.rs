@@ -2027,15 +2027,30 @@ impl DataBeamApp {
                             let prev = croc_version_string(&result.binary);
                             self.start_croc_update_apply(ctx, result.binary, prev);
                         }
-                        Ok(CrocUpdateCheck::UpToDate { .. }) => {
+                        Ok(CrocUpdateCheck::UpToDate { version, .. }) => {
                             self.croc_update_phase = CrocUpdatePhase::Idle;
                             self.refresh_croc_tool_status();
+                            // Speak up: without this the check spins and
+                            // vanishes silently, indistinguishable from a
+                            // no-op (log only — background checks run
+                            // every 6h, so no toast).
+                            if version.is_empty() {
+                                self.transfer_log.push("croc is up to date".to_string());
+                            } else {
+                                self.transfer_log
+                                    .push(format!("croc is up to date ({version})"));
+                            }
                         }
                         Ok(CrocUpdateCheck::NotWritable { .. }) => {
                             // Package-managed croc: never overwrite, just
-                            // refresh the displayed version.
+                            // refresh the displayed version. Same audibility
+                            // reason as UpToDate above.
                             self.croc_update_phase = CrocUpdatePhase::Idle;
                             self.refresh_croc_tool_status();
+                            self.transfer_log.push(
+                                "croc is system-managed; update it with your package manager"
+                                    .to_string(),
+                            );
                         }
                         Ok(CrocUpdateCheck::Unsupported { .. }) => {
                             // Legacy binary without `update`: migrate via a
@@ -6681,8 +6696,31 @@ mod parse_tests {
     }
 
     #[test]
-    fn payload_progress_parses_mib_ratio() {
-        let line = "Downloading ... 8.98 MiB/19.02 MiB 35.34 MiB/s";
+    fn up_to_date_check_leaves_confirmation_log() {
+        use super::{CrocUpdateCheck, CrocUpdateCheckResult, CrocUpdatePhase};
+
+        // Regression: UpToDate used to go Idle silently, so a finished
+        // check was indistinguishable from a no-op.
+        let mut app = DataBeamApp::default();
+        let (tx, rx) = mpsc::channel();
+        app.croc_update_check_rx = Some(rx);
+        app.croc_update_phase = CrocUpdatePhase::Checking;
+        tx.send(CrocUpdateCheckResult {
+            check: Ok(CrocUpdateCheck::UpToDate {
+                version: "v11.5.2".to_string(),
+                raw: "croc v11.5.2 is up to date.".to_string(),
+            }),
+            binary: "croc".to_string(),
+        })
+        .expect("send check result");
+        app.poll_croc_update(&eframe::egui::Context::default());
+        assert_eq!(app.croc_update_phase, CrocUpdatePhase::Idle);
+        assert!(app.transfer_log.iter().any(|l| l.contains("up to date")
+            && l.contains("v11.5.2")));
+    }
+
+    #[test]
+    fn payload_progress_parses_mib_ratio() {        let line = "Downloading ... 8.98 MiB/19.02 MiB 35.34 MiB/s";
         let (done, total) = parse_payload_progress(line).expect("payload progress");
         assert!(done > 0);
         assert!(total > done);
