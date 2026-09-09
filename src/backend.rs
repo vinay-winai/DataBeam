@@ -186,6 +186,13 @@ fn managed_binary_path(tool: &Tool) -> PathBuf {
     bundled_bin_dir().join(managed_binary_name(tool))
 }
 
+/// True when `path` is our own managed croc binary (not a system install).
+/// Legacy migration must only ever replace the managed copy — re-downloading
+/// every 6h because a *system* croc predates `update` would be pure waste.
+pub fn is_managed_croc_binary(path: &str) -> bool {
+    managed_binary_path(&Tool::Croc).to_string_lossy() == path
+}
+
 fn set_executable_permissions(_path: &Path) {
     #[cfg(unix)]
     {
@@ -201,20 +208,18 @@ fn github_repo(tool: &Tool) -> &'static str {
     }
 }
 
-pub const HARDCODED_CROC_VERSION: &str = "v11.5.0";
-
 fn fetch_latest_release(tool: &Tool) -> Result<GitHubRelease, String> {
-    let url = match tool {
-        Tool::Croc => format!(
-            "https://api.github.com/repos/{}/releases/tags/{}",
-            github_repo(tool),
-            HARDCODED_CROC_VERSION
-        ),
-        _ => format!(
-            "https://api.github.com/repos/{}/releases/latest",
-            github_repo(tool)
-        ),
-    };
+    // No version pinning: always resolve the latest stable release.
+    // Croc freshness after bootstrap is maintained by its own self-updater
+    // (`croc update`), not by this download path.
+    //
+    // NOTE for future croc versions: if the release asset naming changes
+    // (`croc_<ver>_<OS>-<arch>.tar.gz/zip`), bootstrap breaks here —
+    // `croc_asset_markers` + `find_release_asset` are the knobs.
+    let url = format!(
+        "https://api.github.com/repos/{}/releases/latest",
+        github_repo(tool)
+    );
     let json = download_bytes(&url)?;
     serde_json::from_slice::<GitHubRelease>(&json)
         .map_err(|e| format!("Failed to parse GitHub release JSON: {e}"))
@@ -393,54 +398,12 @@ fn extract_binary_from_zip(
     ))
 }
 
-fn is_matching_croc_version(version_output: &str, target_version: &str) -> bool {
-    let target_norm = target_version.trim().trim_start_matches('v');
-    for token in version_output.split_whitespace() {
-        let cleaned = token
-            .trim_matches(|c: char| !c.is_alphanumeric() && c != '.' && c != '-')
-            .trim_start_matches('v');
-        if cleaned == target_norm {
-            return true;
-        }
-    }
-    false
-}
-
 fn install_managed_binary(tool: &Tool) -> Option<PathBuf> {
     let output_path = managed_binary_path(tool);
 
-    // If cached Croc binary exists, verify its version matches HARDCODED_CROC_VERSION.
-    // If it does not match (e.g. legacy v10.4.1 binary from older DataBeam installs),
-    // force delete the cached file to enforce clean re-installation of the target version.
-    if tool == &Tool::Croc && output_path.exists() {
-        let is_target_ver = new_hidden_command(&output_path)
-            .arg("--version")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .ok()
-            .map(|o| {
-                if !o.status.success() {
-                    return false;
-                }
-                let stdout = String::from_utf8_lossy(&o.stdout);
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                is_matching_croc_version(&stdout, HARDCODED_CROC_VERSION)
-                    || is_matching_croc_version(&stderr, HARDCODED_CROC_VERSION)
-            })
-            .unwrap_or(false);
-
-        if !is_target_ver {
-            eprintln!(
-                "Outdated or invalid croc binary detected in cache. Purging cached file to install hardcoded version {}",
-                HARDCODED_CROC_VERSION
-            );
-            if let Err(e) = fs::remove_file(&output_path) {
-                eprintln!("Failed to remove invalid cached binary {:?}: {}", output_path, e);
-                return None;
-            }
-        }
-    }
+    // No version pinning: any non-empty cached binary is reused as-is.
+    // Freshness is handled by `croc update` (self-updater) after startup,
+    // plus the legacy-migration path in `refresh_managed_croc_to_latest`.
 
     if output_path.exists()
         && fs::metadata(&output_path)
@@ -499,9 +462,304 @@ fn install_managed_binary(tool: &Tool) -> Option<PathBuf> {
     Some(output_path)
 }
 
+// ── Croc Self-Update (`croc update`) ─────────────────────────────────
+// Managed croc is no longer version-pinned. Freshness is maintained via
+// the croc binary's own self-updater:
+//
+//   1. `croc update --check`  → detect whether an update is available.
+//   2. `croc update --yes`    → apply it non-interactively.
+//
+// Legacy cached binaries that predate the `update` subcommand cannot
+// self-update; for those we fall back to re-downloading the latest managed
+// release once (see `refresh_managed_croc_to_latest`), after which the
+// self-updater takes over.
+
+/// Result of `croc update --check`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CrocUpdateCheck {
+    UpToDate {
+        version: String,
+        raw: String,
+    },
+    Available {
+        current: String,
+        latest: String,
+        raw: String,
+    },
+    /// Binary is package-managed / non-writable: croc prints upgrade guidance
+    /// instead of self-updating. Never attempt to overwrite it.
+    NotWritable {
+        raw: String,
+    },
+    /// Binary predates the `update` subcommand (or otherwise doesn't support
+    /// it). Caller should migrate via managed re-download instead.
+    Unsupported {
+        raw: String,
+    },
+    Unknown {
+        raw: String,
+    },
+}
+
+/// Outcome of `croc update --yes` (or interactive `croc update` + `y`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrocUpdateApplyOutcome {
+    pub updated: bool,
+    pub already_up_to_date: bool,
+    pub not_writable: bool,
+    /// croc refused to self-update for environment reasons (verified live:
+    /// Windows always refuses with "cannot safely replace the running
+    /// executable in place"; Unix refuses unless the binary carries the
+    /// official-installer registration). Caller should fall back to a
+    /// managed re-download (managed copy only) instead of retrying.
+    pub needs_redownload: bool,
+    pub new_version: Option<String>,
+    pub raw: String,
+}
+
+/// Extract `(current, latest)` from an availability line.
+/// Expected: "croc v11.5.0 is available (current: v11.2.5)."
+/// Operates on the lowercased line throughout so non-ASCII input can never
+/// misalign byte indices (version tokens are ASCII by construction).
+fn extract_croc_versions_from_available_line(lower: &str) -> Option<(String, String)> {
+    let avail_idx = lower.find("is available")?;
+    let current_idx = lower.find("(current:")?;
+    let before = lower[..avail_idx].trim();
+    let latest = before
+        .split_whitespace()
+        .last()?
+        .trim()
+        .trim_matches(['.', ',', ';', ')', '('])
+        .to_string();
+    let after = &lower[current_idx + "(current:".len()..];
+    let current = after
+        .split_whitespace()
+        .next()?
+        .trim()
+        .trim_matches(['.', ',', ';', ')', '(', ':'])
+        .to_string();
+    if latest.is_empty() || current.is_empty() {
+        return None;
+    }
+    Some((current, latest))
+}
+
+fn contains_package_manager_guidance(lower: &str) -> bool {
+    lower.contains("upgrade with")
+        || lower.contains("package-manager")
+        || lower.contains("package manager")
+        || lower.contains("will not be overwritten")
+        || lower.contains("not be overwritten")
+        || lower.contains("use your package manager")
+        || lower.contains("install a stable croc release")
+        || lower.contains("cannot update development build")
+}
+
+fn looks_like_legacy_receive_prompt(output: &str) -> bool {
+    let lower = output.to_lowercase();
+    lower.contains("enter receive code") || lower.contains("could not read receive code")
+}
+
+/// True when croc declined to self-update for environment reasons rather
+/// than failing. Verified against 11.5.x source (`registeredWritableTarget`)
+/// and live on Windows: unconditional refusal there, registration/writability
+/// probes elsewhere. None of these are fixed by retrying or piping `y`.
+fn is_self_update_refusal(lower: &str) -> bool {
+    lower.contains("cannot safely replace the running executable")
+        || lower.contains("not registered as an official standalone install")
+        || lower.contains("registration does not match the running executable")
+        || lower.contains("not a replaceable regular file")
+        || lower.contains("not writable without privilege escalation")
+        || lower.contains("directory is not writable without privilege escalation")
+}
+
+/// Pure parser for `croc update --check` output. Unit-tested below.
+pub fn parse_croc_update_check_output(output: &str) -> CrocUpdateCheck {
+    let raw = output.to_string();
+    let lower = output.to_lowercase();
+    if looks_like_legacy_receive_prompt(output)
+        || lower.contains("unknown command")
+        || (lower.contains("incorrect usage") && lower.contains("update"))
+    {
+        return CrocUpdateCheck::Unsupported { raw };
+    }
+    if lower.contains("is up to date") {
+        let version = lower
+            .split_whitespace()
+            .find(|t| {
+                let c = t.trim_matches(|c: char| !c.is_alphanumeric() && c != '.' && c != 'v');
+                (c.starts_with('v') || c.chars().next().is_some_and(|ch| ch.is_ascii_digit()))
+                    && c.contains('.')
+            })
+            .unwrap_or("")
+            .trim()
+            .trim_matches(['.', ',', ';', ')', '('])
+            .to_string();
+        return CrocUpdateCheck::UpToDate { version, raw };
+    }
+    if lower.contains("is available") {
+        if contains_package_manager_guidance(&lower) {
+            return CrocUpdateCheck::NotWritable { raw };
+        }
+        if let Some((current, latest)) = extract_croc_versions_from_available_line(&lower) {
+            return CrocUpdateCheck::Available {
+                current,
+                latest,
+                raw,
+            };
+        }
+        return CrocUpdateCheck::Unknown { raw };
+    }
+    if contains_package_manager_guidance(&lower) {
+        return CrocUpdateCheck::NotWritable { raw };
+    }
+    CrocUpdateCheck::Unknown { raw }
+}
+
+/// Pure parser for `croc update` apply output. Unit-tested below.
+pub fn parse_croc_update_apply_output(output: &str) -> CrocUpdateApplyOutcome {
+    let lower = output.to_lowercase();
+    if looks_like_legacy_receive_prompt(output) {
+        return CrocUpdateApplyOutcome {
+            updated: false,
+            already_up_to_date: false,
+            not_writable: false,
+            needs_redownload: false,
+            new_version: None,
+            raw: output.to_string(),
+        };
+    }
+    let already_up_to_date = lower.contains("is up to date");
+    let not_writable = contains_package_manager_guidance(&lower);
+    let needs_redownload = !already_up_to_date && is_self_update_refusal(&lower);
+    let mut updated = lower.contains("updated croc from");
+    let mut new_version: Option<String> = None;
+    // "Updated croc from v11.2.5 to v11.5.0."
+    if let Some(idx) = lower.find("updated croc from") {
+        let tail = &lower[idx + "updated croc from".len()..];
+        let parts: Vec<&str> = tail.split_whitespace().collect();
+        if parts.len() >= 3 {
+            let to = parts[2].trim().trim_matches(['.', ',', ';', ')', '(']).to_string();
+            if !to.is_empty() {
+                new_version = Some(to);
+            }
+        }
+    }
+    if already_up_to_date || not_writable || needs_redownload {
+        updated = false;
+    }
+    CrocUpdateApplyOutcome {
+        updated,
+        already_up_to_date,
+        not_writable,
+        needs_redownload,
+        new_version,
+        raw: output.to_string(),
+    }
+}
+
+fn run_croc_command(binary: &str, args: &[&str], stdin_input: Option<&[u8]>) -> Result<String, String> {
+    use std::io::Write;
+
+    let mut cmd = new_hidden_command(binary);
+    cmd.args(args);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if stdin_input.is_some() {
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
+    // Run from temp dir so croc never touches the app working directory.
+    cmd.current_dir(std::env::temp_dir());
+
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to start croc: {e}"))?;
+    if let Some(input) = stdin_input {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(input);
+            // stdin is closed on drop so the child sees EOF.
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("Failed to wait for croc: {e}"))?;
+    let mut combined = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if !stderr.is_empty() {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str(&stderr);
+    }
+    Ok(combined)
+}
+
+/// Run `croc update --check` and parse the result.
+pub fn croc_update_check(binary: &str) -> Result<CrocUpdateCheck, String> {
+    let output = run_croc_command(binary, &["update", "--check"], None)?;
+    Ok(parse_croc_update_check_output(&output))
+}
+
+/// Run the update itself. Prefers non-interactive `--yes`; falls back to
+/// piping `y` into `croc update` exactly as a user answering the
+/// `Update croc from vX to vY? (y/N)` prompt would. Runs at most two croc
+/// invocations: a decline/cancel surfaces as `updated == false`, which the
+/// caller treats as a no-op.
+pub fn croc_update_apply(binary: &str) -> Result<CrocUpdateApplyOutcome, String> {
+    // Fast path: `--yes` skips the prompt when self-update is safe.
+    let output = run_croc_command(binary, &["update", "--yes"], None)?;
+    let mut outcome = parse_croc_update_apply_output(&output);
+    if outcome.updated || outcome.already_up_to_date || outcome.not_writable {
+        return Ok(outcome);
+    }
+    // If --yes was rejected (very old/new flag variants) or the prompt is
+    // still pending, answer `y` explicitly.
+    if output.to_lowercase().contains("update croc from")
+        || output.to_lowercase().contains("(y/n)")
+        || output.to_lowercase().contains("requires an interactive terminal")
+        || (!outcome.updated && output.trim().is_empty())
+    {
+        let fallback = run_croc_command(binary, &["update"], Some(b"y\n"))?;
+        outcome = parse_croc_update_apply_output(&fallback);
+    }
+    Ok(outcome)
+}
+
+/// Best-effort `croc --version` string (without managed/system suffix).
+pub fn croc_version_string(binary: &str) -> Option<String> {
+    let output = new_hidden_command(binary)
+        .arg("--version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let ver = if stdout.is_empty() { stderr } else { stdout };
+    if ver.is_empty() {
+        None
+    } else {
+        Some(ver)
+    }
+}
+
+/// Re-download the latest managed croc release, replacing the cached binary.
+/// Used once to migrate legacy binaries that predate `croc update`.
+pub fn refresh_managed_croc_to_latest() -> Option<PathBuf> {
+    let output_path = managed_binary_path(&Tool::Croc);
+    let _ = fs::remove_file(&output_path);
+    install_managed_binary(&Tool::Croc)
+}
+
+/// Re-run version detection for croc after an update so the home page
+/// `tool_card` shows the new version immediately.
+pub fn redetect_croc_status(bundled_croc: Option<&PathBuf>) -> ToolStatus {
+    detect_tool_with_bundled(&Tool::Croc, bundled_croc)
+}
+
 /// Initialize managed binaries:
-/// 1) Extract embedded binaries when available.
-/// 2) Otherwise download platform-specific binaries from official GitHub releases.
+// 1) Extract embedded binaries when available.
+// 2) Otherwise download platform-specific binaries from official GitHub releases.
 pub fn init_bundled_binaries() -> (Option<PathBuf>, Option<PathBuf>) {
     let mut croc_path = extract_bundled_binary(&managed_binary_name(&Tool::Croc), CROC_GZ);
 
@@ -1951,6 +2209,54 @@ fn extract_croc_code(trimmed: &str) -> Option<String> {
     None
 }
 
+/// Which data path a croc transfer uses, read off croc 11.5.0's
+/// `Sending (...)` / `Receiving (...)` direction line
+/// (`transferDirection()` in upstream `terminal_display.go`):
+/// - `Sending (->peer)` / `Receiving (<-peer)` (arrow first): relayed path.
+/// - `Sending (local->peer)` / `Receiving (local<-peer)` (two addresses):
+///   direct peer link (LAN or Tailcat-direct — the format deliberately does
+///   not split those, so neither do we).
+/// Anything else (file announcements like `Sending 'f' (1 MB)`, progress,
+/// errors) yields `None`: unknown shapes stay silent, never guessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrocRoute {
+    Relay,
+    Direct,
+}
+
+impl CrocRoute {
+    pub fn label(self) -> &'static str {
+        match self {
+            CrocRoute::Relay => "via public relay",
+            CrocRoute::Direct => "direct peer link",
+        }
+    }
+}
+
+pub fn parse_croc_direction(line: &str) -> Option<CrocRoute> {
+    let lower = line.to_lowercase();
+    let rest = lower
+        .strip_prefix("sending (")
+        .or_else(|| lower.strip_prefix("receiving ("))?;
+    let rest = rest.trim_start();
+    // Arrow first means the relay shape (`->peer` / `<-peer`).
+    if rest.starts_with("->") || rest.starts_with("<-") {
+        return Some(CrocRoute::Relay);
+    }
+    // File announcements (`Sending 'payload.bin' (1.0 MB)`) share the
+    // prefix but always quote the name; direction lines never quote.
+    if rest.contains('\'') {
+        return None;
+    }
+    // Otherwise a `local->peer` / `local<-peer` pair means a direct link,
+    // with a non-empty local endpoint before the arrow.
+    let arrow = rest.find("->").or_else(|| rest.find("<-"))?;
+    if rest[..arrow].trim().is_empty() {
+        return None;
+    }
+    Some(CrocRoute::Direct)
+}
+
 /// Strip ANSI escape sequences from a string
 fn strip_ansi(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
@@ -2072,15 +2378,72 @@ mod tests {
     }
 
     #[test]
-    fn test_is_matching_croc_version() {
-        use super::is_matching_croc_version;
+    fn croc_update_check_output_parses() {
+        use super::{parse_croc_update_check_output, CrocUpdateCheck};
 
-        assert!(is_matching_croc_version("croc version v11.5.0", "v11.5.0"));
-        assert!(is_matching_croc_version("croc version 11.5.0", "v11.5.0"));
-        assert!(is_matching_croc_version("croc v11.5.0, build 123", "11.5.0"));
-        assert!(!is_matching_croc_version("croc version v11.5.00", "v11.5.0"));
-        assert!(!is_matching_croc_version("croc version v11.5.0-beta", "v11.5.0"));
-        assert!(!is_matching_croc_version("croc version v10.4.1", "v11.5.0"));
+        assert!(matches!(
+            parse_croc_update_check_output("croc v11.5.0 is up to date.\n"),
+            CrocUpdateCheck::UpToDate { .. }
+        ));
+        match parse_croc_update_check_output("croc v11.5.0 is available (current: v11.2.5).\n") {
+            CrocUpdateCheck::Available { current, latest, .. } => {
+                assert_eq!(current, "v11.2.5");
+                assert_eq!(latest, "v11.5.0");
+            }
+            other => panic!("expected Available, got {other:?}"),
+        }
+        // Legacy binary without the update subcommand surfaces a receive-code
+        // prompt instead of update output.
+        assert!(matches!(
+            parse_croc_update_check_output("Enter receive code: could not read receive code: EOF"),
+            CrocUpdateCheck::Unsupported { .. }
+        ));
+        // Package-managed installs print guidance instead of self-updating.
+        assert!(matches!(
+            parse_croc_update_check_output(
+                "croc v11.5.0 is available (current: v11.2.5).\nUpgrade with Scoop: scoop update croc"
+            ),
+            CrocUpdateCheck::NotWritable { .. }
+        ));
+        // Unrecognized output stays Unknown (retried later, never acted on).
+        assert!(matches!(
+            parse_croc_update_check_output("something unexpected"),
+            CrocUpdateCheck::Unknown { .. }
+        ));
+    }
+
+    #[test]
+    fn croc_update_apply_output_parses() {
+        use super::parse_croc_update_apply_output;
+
+        let ok = parse_croc_update_apply_output(
+            "croc v11.5.0 is available (current: v11.2.5).\nUpdated croc from v11.2.5 to v11.5.0.\n",
+        );
+        assert!(ok.updated);
+        assert_eq!(ok.new_version.as_deref(), Some("v11.5.0"));
+
+        let cancelled =
+            parse_croc_update_apply_output("croc v11.5.0 is available (current: v11.2.5).\nUpdate cancelled.\n");
+        assert!(!cancelled.updated);
+
+        let up_to_date = parse_croc_update_apply_output("croc v11.5.0 is up to date.\n");
+        assert!(!up_to_date.updated);
+        assert!(up_to_date.already_up_to_date);
+
+        // Live Windows refusal: self-update can never apply in place.
+        let refused = parse_croc_update_apply_output(
+            "croc v11.5.1 is available (current: v11.5.0).\nThis platform cannot safely replace the running executable in place.\n",
+        );
+        assert!(!refused.updated);
+        assert!(!refused.already_up_to_date);
+        assert!(refused.needs_redownload);
+
+        // Unix refusal without official-installer registration.
+        let unregistered = parse_croc_update_apply_output(
+            "This installation is not registered as an official standalone install.\n",
+        );
+        assert!(!unregistered.updated);
+        assert!(unregistered.needs_redownload);
     }
 
     #[test]
@@ -2120,5 +2483,46 @@ mod tests {
         );
         assert_eq!(extract_croc_code("Sending 'text' (222 B)"), None);
         assert_eq!(extract_croc_code(""), None);
+    }
+
+    #[test]
+    fn test_parse_croc_direction_shapes() {
+        use super::{parse_croc_direction, CrocRoute};
+
+        // Relay shape: arrow first (upstream `!peerToPeer || local == ""`).
+        assert_eq!(
+            parse_croc_direction("Sending (->203.0.113.7)"),
+            Some(CrocRoute::Relay)
+        );
+        assert_eq!(
+            parse_croc_direction("Receiving (<-203.0.113.7)"),
+            Some(CrocRoute::Relay)
+        );
+        // Direct shape: local->peer pair (LAN or Tailcat-direct — the
+        // format does not split those, so neither do we).
+        assert_eq!(
+            parse_croc_direction("Sending (10.0.0.2->169.254.83.107%Tailscale)"),
+            Some(CrocRoute::Direct)
+        );
+        assert_eq!(
+            parse_croc_direction("Receiving (10.0.0.2<-169.254.83.107)"),
+            Some(CrocRoute::Direct)
+        );
+        // Case-insensitive, like the rest of the log parsing.
+        assert_eq!(
+            parse_croc_direction("SENDING (10.0.0.2->169.254.83.107)"),
+            Some(CrocRoute::Direct)
+        );
+        // File announcements share the prefix but quote the name.
+        assert_eq!(parse_croc_direction("Sending 'payload.bin' (1.0 MB)"), None);
+        assert_eq!(parse_croc_direction("Sending 'text' (222 B)"), None);
+        // Inventory lines, progress, errors, and blanks stay silent.
+        assert_eq!(parse_croc_direction("Sending 0 files (1.0 MB)"), None);
+        assert_eq!(
+            parse_croc_direction("Sending (->192.168.1.60:56052)"),
+            Some(CrocRoute::Relay)
+        );
+        assert_eq!(parse_croc_direction("relay connection failed: nope"), None);
+        assert_eq!(parse_croc_direction(""), None);
     }
 }

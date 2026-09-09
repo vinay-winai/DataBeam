@@ -75,6 +75,28 @@ enum TransferPhase {
     EazyWaitingForPeer,
 }
 
+/// Croc self-update (`croc update --check` → `croc update`) state machine.
+/// Check and apply each run on a background thread; results come back over
+/// channels polled once per frame. At most one phase is ever in flight, and
+/// update work never overlaps a running transfer in either direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CrocUpdatePhase {
+    Idle,
+    Checking,
+    Updating,
+}
+
+struct CrocUpdateCheckResult {
+    check: Result<CrocUpdateCheck, String>,
+    binary: String,
+}
+
+struct CrocUpdateApplyResult {
+    outcome: Result<CrocUpdateApplyOutcome, String>,
+    binary: String,
+    previous_version: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PickerRequest {
     SendFolder,
@@ -218,6 +240,10 @@ struct DataBeamApp {
     croc_last_frame_at: Option<f64>,
     croc_received_text: Option<String>,
     croc_expect_text_payload: bool,
+    /// Data path seen on this transfer (`Sending (...)` direction line),
+    /// cleared per transfer. Croc mode only — never set from the EazySendme
+    /// ticket leg (that leg's path says nothing about the sendme data leg).
+    croc_route: Option<CrocRoute>,
     transfer_phase: TransferPhase,
     preparing_progress: f32,
     transfer_payload_start_time: Option<f64>,
@@ -241,6 +267,14 @@ struct DataBeamApp {
 
     // Croc receive
     croc_receive_recent_codes: Vec<String>,
+
+    // Croc self-update (`croc update --check` → `croc update`, 6h cadence)
+    croc_update_phase: CrocUpdatePhase,
+    croc_update_check_rx: Option<mpsc::Receiver<CrocUpdateCheckResult>>,
+    croc_update_apply_rx: Option<mpsc::Receiver<CrocUpdateApplyResult>>,
+    croc_legacy_migration_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
+    croc_update_last_check_at: Option<f64>,
+    croc_update_startup_check_done: bool,
 
     // UI
     toast_msg: Option<(String, f64, Color32)>,
@@ -341,6 +375,7 @@ impl Default for DataBeamApp {
             croc_last_frame_at: None,
             croc_received_text: None,
             croc_expect_text_payload: false,
+            croc_route: None,
             transfer_phase: TransferPhase::Preparing,
             preparing_progress: 0.0,
             transfer_payload_start_time: None,
@@ -381,6 +416,12 @@ impl Default for DataBeamApp {
             eazysendme_croc_handle: None,
             eazysendme_croc_rx: None,
             croc_receive_recent_codes: Vec::new(),
+            croc_update_phase: CrocUpdatePhase::Idle,
+            croc_update_check_rx: None,
+            croc_update_apply_rx: None,
+            croc_legacy_migration_rx: None,
+            croc_update_last_check_at: None,
+            croc_update_startup_check_done: false,
             native_engines_expanded: false,
             eazysendme_code_ticket_map: HashMap::new(),
             cleanup_scan_rx: None,
@@ -1066,6 +1107,7 @@ impl DataBeamApp {
         self.croc_last_frame_at = None;
         self.croc_received_text = None;
         self.croc_expect_text_payload = false;
+        self.croc_route = None;
         self.transfer_phase = TransferPhase::Preparing;
         self.preparing_progress = 0.0;
         self.transfer_payload_start_time = None;
@@ -1436,7 +1478,7 @@ impl DataBeamApp {
         }
         if self.selected_tool == SelectedTool::Croc
             && self.transfer_phase != TransferPhase::Transferring
-            && (lower.contains("sending (->") || lower.contains("receiving (<-"))
+            && parse_croc_direction(line).is_some()
         {
             self.transfer_phase = TransferPhase::Transferring;
             self.preparing_progress = 1.0;
@@ -1787,6 +1829,303 @@ impl DataBeamApp {
         false
     }
 
+    /// Seconds between automatic croc update checks (after the on-open check).
+    const CROC_UPDATE_INTERVAL_SECS: f64 = 6.0 * 3600.0;
+
+    /// One-line self-update status for the home page (`None` when idle).
+    fn croc_update_status_line(&self) -> Option<String> {
+        match self.croc_update_phase {
+            CrocUpdatePhase::Checking => Some("croc: checking for updates…".to_string()),
+            CrocUpdatePhase::Updating => Some("croc: updating…".to_string()),
+            CrocUpdatePhase::Idle => None,
+        }
+    }
+
+    /// Refresh the cached croc `ToolStatus` so the home page engine card
+    /// shows the new version immediately after an update/migration.
+    fn refresh_croc_tool_status(&mut self) {
+        let fresh = redetect_croc_status(self.bundled_croc.as_ref());
+        if let Some(slot) = self.tool_statuses.iter_mut().find(|s| s.tool == Tool::Croc) {
+            *slot = fresh;
+        } else {
+            self.tool_statuses.push(fresh);
+        }
+    }
+
+    fn record_croc_update_check_time(&mut self) {
+        self.croc_update_last_check_at = Some(self.animation_time);
+    }
+
+    /// Kick off `croc update --check` in a background thread. No-op while a
+    /// transfer runs or another update phase is in flight. Wakes the UI when
+    /// done: a fresh idle app schedules no frames, so without an explicit
+    /// wakeup the result would sit in the channel uncollected indefinitely.
+    fn start_croc_update_check(&mut self, ctx: &egui::Context) {
+        if self.croc_update_phase != CrocUpdatePhase::Idle {
+            return;
+        }
+        if self.transfer_state == TransferState::Running {
+            return;
+        }
+        let Some(binary) = self.get_tool_binary(&Tool::Croc) else {
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        self.croc_update_check_rx = Some(rx);
+        self.croc_update_phase = CrocUpdatePhase::Checking;
+        let wake = ctx.clone();
+        thread::spawn(move || {
+            let check = croc_update_check(&binary);
+            let _ = tx.send(CrocUpdateCheckResult { check, binary });
+            wake.request_repaint();
+        });
+    }
+
+    fn start_croc_update_apply(
+        &mut self,
+        ctx: &egui::Context,
+        binary: String,
+        previous_version: Option<String>,
+    ) {
+        let (tx, rx) = mpsc::channel();
+        self.croc_update_apply_rx = Some(rx);
+        self.croc_update_phase = CrocUpdatePhase::Updating;
+        let wake = ctx.clone();
+        thread::spawn(move || {
+            let outcome = croc_update_apply(&binary);
+            let _ = tx.send(CrocUpdateApplyResult {
+                outcome,
+                binary,
+                previous_version,
+            });
+            wake.request_repaint();
+        });
+    }
+
+    /// One-time migration for cached binaries that predate `croc update`:
+    /// re-download the latest managed release in the background, then
+    /// re-detect so the home page version updates. Managed copy only — a
+    /// legacy *system* croc is left alone (never overwrite foreign files).
+    fn start_croc_legacy_migration(&mut self, ctx: &egui::Context, binary: &str) {
+        if self.croc_update_phase != CrocUpdatePhase::Idle {
+            return;
+        }
+        if self.transfer_state == TransferState::Running {
+            return;
+        }
+        if !is_managed_croc_binary(binary) {
+            self.transfer_log.push(
+                "croc is system-managed and predates self-update; leaving it alone".to_string(),
+            );
+            return;
+        }
+        let (tx, rx) = mpsc::channel::<Option<PathBuf>>();
+        self.croc_update_phase = CrocUpdatePhase::Updating;
+        self.croc_legacy_migration_rx = Some(rx);
+        let wake = ctx.clone();
+        thread::spawn(move || {
+            let path = refresh_managed_croc_to_latest();
+            let _ = tx.send(path);
+            wake.request_repaint();
+        });
+    }
+
+    fn poll_croc_update(&mut self, ctx: &egui::Context) {
+        // ── check results ──
+        if let Some(rx) = self.croc_update_check_rx.take() {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.croc_update_check_rx = None;
+                    self.record_croc_update_check_time();
+                    match result.check {
+                        Ok(CrocUpdateCheck::Available { current, latest, .. }) => {
+                            self.transfer_log.push(format!(
+                                "croc update available ({current} → {latest}), updating…"
+                            ));
+                            self.show_toast(
+                                format!("croc update available ({current} → {latest}), updating…"),
+                                WARNING,
+                            );
+                            let prev = croc_version_string(&result.binary);
+                            self.start_croc_update_apply(ctx, result.binary, prev);
+                        }
+                        Ok(CrocUpdateCheck::UpToDate { .. }) => {
+                            self.croc_update_phase = CrocUpdatePhase::Idle;
+                            self.refresh_croc_tool_status();
+                        }
+                        Ok(CrocUpdateCheck::NotWritable { .. }) => {
+                            // Package-managed croc: never overwrite, just
+                            // refresh the displayed version.
+                            self.croc_update_phase = CrocUpdatePhase::Idle;
+                            self.refresh_croc_tool_status();
+                        }
+                        Ok(CrocUpdateCheck::Unsupported { .. }) => {
+                            // Legacy binary without `update`: migrate via a
+                            // managed re-download to the latest release.
+                            self.croc_update_phase = CrocUpdatePhase::Idle;
+                            let binary = result.binary.clone();
+                            self.start_croc_legacy_migration(ctx, &binary);
+                        }
+                        Ok(CrocUpdateCheck::Unknown { raw }) => {
+                            // Unrecognized output (e.g. croc reworded it):
+                            // stay quiet in UI but leave one log line so the
+                            // drift is visible instead of silent stagnation.
+                            self.croc_update_phase = CrocUpdatePhase::Idle;
+                            let snippet: String = raw.chars().take(120).collect();
+                            self.transfer_log.push(format!(
+                                "croc update check returned unrecognized output: {snippet}"
+                            ));
+                        }
+                        Err(e) => {
+                            self.croc_update_phase = CrocUpdatePhase::Idle;
+                            self.transfer_log.push(format!("croc update check failed: {e}"));
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.croc_update_check_rx = Some(rx);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.croc_update_phase = CrocUpdatePhase::Idle;
+                }
+            }
+        }
+
+        // ── legacy migration results ──
+        if let Some(rx) = self.croc_legacy_migration_rx.take() {
+            match rx.try_recv() {
+                Ok(path) => {
+                    self.croc_legacy_migration_rx = None;
+                    if let Some(path) = path {
+                        self.bundled_croc = Some(path);
+                        self.refresh_croc_tool_status();
+                        let ver = self
+                            .tool_statuses
+                            .iter()
+                            .find(|s| s.tool == Tool::Croc)
+                            .and_then(|s| s.version.clone())
+                            .unwrap_or_default();
+                        self.transfer_log.push(format!("croc migrated to latest ({ver})"));
+                        self.show_toast(format!("croc updated ({ver})"), SUCCESS);
+                    } else {
+                        self.transfer_log.push("croc migration download failed".to_string());
+                    }
+                    self.croc_update_phase = CrocUpdatePhase::Idle;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.croc_legacy_migration_rx = Some(rx);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.croc_update_phase = CrocUpdatePhase::Idle;
+                }
+            }
+        }
+
+        // ── apply results ──
+        if let Some(rx) = self.croc_update_apply_rx.take() {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.croc_update_apply_rx = None;
+                    self.croc_update_phase = CrocUpdatePhase::Idle;
+                    match result.outcome {
+                        Ok(outcome) if outcome.updated => {
+                            self.refresh_croc_tool_status();
+                            let new_ver = outcome.new_version.clone().or_else(|| {
+                                croc_version_string(&result.binary)
+                            });
+                            let msg = match (result.previous_version, new_ver) {
+                                (Some(prev), Some(new)) if prev != new => {
+                                    format!("croc updated ({prev} → {new})")
+                                }
+                                (_, Some(new)) => format!("croc updated ({new})"),
+                                _ => "croc updated".to_string(),
+                            };
+                            self.transfer_log.push(msg.clone());
+                            self.show_toast(msg, SUCCESS);
+                        }
+                        Ok(outcome) if outcome.already_up_to_date => {
+                            self.refresh_croc_tool_status();
+                        }
+                        Ok(outcome) if outcome.not_writable => {
+                            // Not an error: leave the system binary alone.
+                            self.refresh_croc_tool_status();
+                        }
+                        Ok(outcome) if outcome.needs_redownload => {
+                            // Self-update refused by the environment (verified:
+                            // always on Windows, unregistered installs on
+                            // Unix). Managed copy: re-download latest instead;
+                            // foreign binaries are left alone.
+                            if is_managed_croc_binary(&result.binary) {
+                                self.transfer_log.push(
+                                    "croc self-update refused by platform, migrating via re-download…"
+                                        .to_string(),
+                                );
+                                let binary = result.binary.clone();
+                                self.start_croc_legacy_migration(ctx, &binary);
+                            } else {
+                                self.transfer_log.push(
+                                    "croc self-update refused; leaving system binary alone"
+                                        .to_string(),
+                                );
+                                self.refresh_croc_tool_status();
+                            }
+                        }
+                        Ok(_) => {
+                            // Declined/cancelled or no-op: stay silent-ish.
+                            self.refresh_croc_tool_status();
+                        }
+                        Err(e) => {
+                            self.transfer_log.push(format!("croc update failed: {e}"));
+                            self.show_toast(format!("croc update failed: {e}"), WARNING);
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.croc_update_apply_rx = Some(rx);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.croc_update_phase = CrocUpdatePhase::Idle;
+                }
+            }
+        }
+    }
+
+    /// Decide whether a periodic (or startup) check is due. Called every frame;
+    /// cheap no-op most of the time.
+    fn maybe_trigger_croc_update_check(&mut self, ctx: &egui::Context) {
+        if self.croc_update_phase != CrocUpdatePhase::Idle {
+            return;
+        }
+        if self.croc_update_check_rx.is_some()
+            || self.croc_update_apply_rx.is_some()
+            || self.croc_legacy_migration_rx.is_some()
+        {
+            return;
+        }
+        if self.transfer_state == TransferState::Running {
+            return;
+        }
+        if !self
+            .tool_statuses
+            .iter()
+            .any(|s| s.tool == Tool::Croc && s.available)
+        {
+            return;
+        }
+        // First run of the app process: check immediately on open.
+        if !self.croc_update_startup_check_done {
+            self.croc_update_startup_check_done = true;
+            self.start_croc_update_check(ctx);
+            return;
+        }
+        // Afterwards: every 6 hours.
+        if let Some(last) = self.croc_update_last_check_at {
+            if self.animation_time - last >= Self::CROC_UPDATE_INTERVAL_SECS {
+                self.start_croc_update_check(ctx);
+            }
+        }
+    }
+
     fn poll_transfer(&mut self) {
         // Take the receiver out to satisfy borrow checker
         if let Some(rx) = self.transfer_rx.take() {
@@ -1810,6 +2149,21 @@ impl DataBeamApp {
                         match msg {
                             TransferMsg::Output(line) => {
                                 let lower = line.to_lowercase();
+                                // Data-path route from croc's `Sending (...)`
+                                // direction line. First wins; Croc mode only
+                                // (the Eazy ticket leg below must not label
+                                // the sendme data leg).
+                                if self.selected_tool == SelectedTool::Croc
+                                    && self.croc_route.is_none()
+                                {
+                                    if let Some(route) = parse_croc_direction(&line) {
+                                        self.croc_route = Some(route);
+                                        self.transfer_log.push(format!(
+                                            "Route: {}",
+                                            route.label()
+                                        ));
+                                    }
+                                }
                                 if self.selected_tool == SelectedTool::Sendme
                                     && self.view == AppView::Receive
                                     && self.transfer_phase != TransferPhase::Transferring
@@ -1862,8 +2216,7 @@ impl DataBeamApp {
                                     }
                                     if self.selected_tool == SelectedTool::Croc
                                         && self.transfer_phase == TransferPhase::WaitingForReceiver
-                                        && (lower.contains("sending (->")
-                                            || lower.contains("receiving (<-"))
+                                        && parse_croc_direction(&line).is_some()
                                     {
                                         self.transfer_phase = TransferPhase::Transferring;
                                         self.sendme_had_transfer = true;
@@ -2392,6 +2745,7 @@ impl DataBeamApp {
                                     None
                                 };
                                 self.transfer_end_time = None;
+                                self.croc_route = None;
                                 self.transfer_speed_bps = None;
                                 self.transfer_speed_samples.clear();
                                 self.transfer_done_bytes = None;
@@ -2563,6 +2917,26 @@ impl DataBeamApp {
     }
 
     fn start_send(&mut self, is_auto: bool) {
+        // Never overlap a croc self-update: the binary file may be replaced
+        // mid-transfer (fatal on Windows file locks, version skew elsewhere).
+        // Sendme legs never touch the croc binary, so they are exempt.
+        // Updates take seconds; manual attempts get a toast, Eazy auto-retries
+        // re-arm briefly instead of being swallowed.
+        if matches!(
+            self.selected_tool,
+            SelectedTool::Croc | SelectedTool::EazySendme
+        ) && self.croc_update_phase != CrocUpdatePhase::Idle
+        {
+            if is_auto && self.selected_tool == SelectedTool::EazySendme {
+                self.eazy_next_retry_time = Some(self.animation_time + 5.0);
+            } else if !is_auto {
+                self.show_toast(
+                    "croc is updating itself, try again in a moment".to_string(),
+                    WARNING,
+                );
+            }
+            return;
+        }
         if !is_auto {
             self.eazy_retry_count = 0;
             self.eazy_next_retry_time = None;
@@ -2696,6 +3070,23 @@ impl DataBeamApp {
     }
 
     fn start_receive(&mut self, is_auto: bool) {
+        // Same overlap guard as start_send (see above): never run a
+        // croc-backed transfer while the croc binary may be replaced.
+        if matches!(
+            self.selected_tool,
+            SelectedTool::Croc | SelectedTool::EazySendme
+        ) && self.croc_update_phase != CrocUpdatePhase::Idle
+        {
+            if is_auto && self.selected_tool == SelectedTool::EazySendme {
+                self.eazy_next_retry_time = Some(self.animation_time + 5.0);
+            } else if !is_auto {
+                self.show_toast(
+                    "croc is updating itself, try again in a moment".to_string(),
+                    WARNING,
+                );
+            }
+            return;
+        }
         if !is_auto {
             self.eazy_retry_count = 0;
             self.eazy_next_retry_time = None;
@@ -2948,6 +3339,28 @@ impl DataBeamApp {
                     tray::set_debug_enabled(debug_toggle);
                     self.persist_user_settings();
                 }
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
+                // Croc self-update status + manual check (automatic checks
+                // run on open and every 6 hours).
+                if let Some(line) = self.croc_update_status_line() {
+                    ui.label(RichText::new(line).size(11.0).color(TEXT_MUTED).italics());
+                }
+                ui.horizontal(|ui| {
+                    let checking = self.croc_update_phase != CrocUpdatePhase::Idle;
+                    let btn = ui.add_enabled(
+                        !checking,
+                        egui::Button::new("↻ Check croc update now"),
+                    );
+                    if btn.clicked() {
+                        self.croc_update_startup_check_done = true;
+                        self.start_croc_update_check(ctx);
+                        if self.croc_update_phase == CrocUpdatePhase::Idle {
+                            self.show_toast("croc is busy or unavailable".to_string(), WARNING);
+                        }
+                    }
+                });
             });
         self.settings_popup_open = open;
     }
@@ -3225,6 +3638,9 @@ impl eframe::App for DataBeamApp {
         self.handle_dropped_files(ctx);
         self.poll_size_updates();
         self.poll_transfer();
+        // Croc self-update: first check on open, then every 6 hours.
+        self.poll_croc_update(ctx);
+        self.maybe_trigger_croc_update_check(ctx);
         if let Some(started_at) = self.eazy_local_check_started_at {
             let local_check_running = self.selected_tool == SelectedTool::EazySendme
                 && self.view == AppView::Receive
@@ -3591,6 +4007,14 @@ impl DataBeamApp {
                 }
                 ui.add_space(4.0);
             }
+        }
+
+        // Live croc self-update status (first check on open, then every 6h).
+        // The Croc engine card above re-reads `tool_statuses` each frame, so
+        // the version there refreshes automatically after an update.
+        if let Some(line) = self.croc_update_status_line() {
+            ui.add_space(6.0);
+            ui.label(RichText::new(line).size(11.0).color(TEXT_MUTED).italics());
         }
 
         ui.add_space(12.0);
@@ -4686,6 +5110,15 @@ impl DataBeamApp {
                                     .size(11.0),
                             );
                         }
+                        if self.selected_tool == SelectedTool::Croc {
+                            if let Some(route) = self.croc_route {
+                                ui.label(
+                                    RichText::new(route.label())
+                                        .color(TEXT_MUTED)
+                                        .size(11.0),
+                                );
+                            }
+                        }
                     });
                     ui.add_space(4.0);
 
@@ -4966,6 +5399,17 @@ impl DataBeamApp {
                                 .color(TEXT_MUTED)
                                 .monospace(),
                             );
+                        }
+                        // Data path seen on this transfer (Croc mode only).
+                        if self.selected_tool == SelectedTool::Croc {
+                            if let Some(route) = self.croc_route {
+                                ui.label(
+                                    RichText::new(route.label())
+                                        .size(10.0)
+                                        .color(TEXT_MUTED)
+                                        .monospace(),
+                                );
+                            }
                         }
                     });
                 }

@@ -1,0 +1,4 @@
+# Normalize line endings: store LF in repo, check out native endings.
+* text=auto
+# Shell scripts must stay LF or they break on Linux/macOS.
+*.sh text eol=lf
