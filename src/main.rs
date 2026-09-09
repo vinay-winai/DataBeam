@@ -3262,7 +3262,7 @@ impl DataBeamApp {
                         ))
                         .corner_radius(BUTTON_ROUNDING)
                         .stroke(egui::Stroke::new(
-                            1.0,
+                            1.0_f32,
                             Color32::from_rgba_premultiplied(
                                 color.r(),
                                 color.g(),
@@ -3306,7 +3306,7 @@ impl DataBeamApp {
         painter.rect_stroke(
             screen.shrink(3.0),
             egui::epaint::CornerRadius::same(10),
-            egui::Stroke::new(2.0, Color32::from_rgba_premultiplied(255, 140, 0, 110)),
+            egui::Stroke::new(2.0_f32, Color32::from_rgba_premultiplied(255, 140, 0, 110)),
             egui::StrokeKind::Inside,
         );
         let is_croc_text = self.selected_tool == SelectedTool::Croc && self.croc_text_mode;
@@ -3732,15 +3732,15 @@ impl eframe::App for DataBeamApp {
                         let mut style = (*ui.style()).as_ref().clone();
                         style.visuals.widgets.active.bg_fill = accent;
                         style.visuals.widgets.active.fg_stroke =
-                            egui::Stroke::new(1.0, Color32::BLACK);
-                        style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, accent);
+                            egui::Stroke::new(1.0_f32, Color32::BLACK);
+                        style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, accent);
                         style.visuals.selection.bg_fill = Color32::from_rgba_premultiplied(
                             accent.r(),
                             accent.g(),
                             accent.b(),
                             180,
                         );
-                        style.visuals.selection.stroke = egui::Stroke::new(1.0, accent);
+                        style.visuals.selection.stroke = egui::Stroke::new(1.0_f32, accent);
                         ui.set_style(style);
 
                         let transfer_running = self.transfer_state == TransferState::Running;
@@ -4865,7 +4865,7 @@ impl DataBeamApp {
                         ui.painter().circle_filled(center, 3.0, color);
                     } else {
                         ui.painter()
-                            .circle_stroke(center, 3.0, egui::Stroke::new(1.0, color));
+                            .circle_stroke(center, 3.0, egui::Stroke::new(1.0_f32, color));
                     }
                     ui.add_space(2.0);
                     ui.label(RichText::new(msg).color(color).size(10.0));
@@ -7316,6 +7316,9 @@ mod parse_tests {
         );
     }
 
+    // Windows-only: drives the real tray init, whose muda Menu construction
+    // panics on non-main threads on macOS (test harness uses worker threads).
+    #[cfg_attr(not(target_os = "windows"), ignore)]
     #[test]
     fn tray_toggle_setter_drives_init_drop_and_persist() {
         // Redirect settings so this test never touches real user data.

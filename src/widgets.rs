@@ -48,7 +48,7 @@ pub fn card_frame(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::NONE
         .fill(BG_CARD)
         .corner_radius(CARD_ROUNDING)
-        .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+        .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
         .inner_margin(egui::Margin::same(12))
         .show(ui, |ui| {
             add_contents(ui);
@@ -227,7 +227,7 @@ pub fn croc_progress_panel(ui: &mut egui::Ui, data: &CrocPanelData, color: Color
         ui.painter().rect_stroke(
             box_rect,
             INPUT_ROUNDING,
-            Stroke::new(1.0, BORDER_SUBTLE),
+            Stroke::new(1.0_f32, BORDER_SUBTLE),
             StrokeKind::Inside,
         );
         let mid_x = box_rect.left() + box_rect.width() / 2.0;
@@ -236,7 +236,7 @@ pub fn croc_progress_panel(ui: &mut egui::Ui, data: &CrocPanelData, color: Color
                 Pos2::new(mid_x, box_rect.top() + 8.0),
                 Pos2::new(mid_x, box_rect.bottom() - 8.0),
             ],
-            Stroke::new(1.0, BORDER_SUBTLE),
+            Stroke::new(1.0_f32, BORDER_SUBTLE),
         );
 
         let draw_cell = |label: &str, value: &str, cell_left: f32| {
@@ -293,9 +293,9 @@ pub fn tool_card(
         };
 
         let stroke = if selected {
-            Stroke::new(1.5, color)
+            Stroke::new(1.5_f32, color)
         } else {
-            Stroke::new(1.0, BORDER_SUBTLE)
+            Stroke::new(1.0_f32, BORDER_SUBTLE)
         };
 
         ui.painter().rect_filled(rect, CARD_ROUNDING, bg);
@@ -368,7 +368,7 @@ pub fn log_area(ui: &mut egui::Ui, lines: &[String], max_height: f32, stick_bott
     egui::Frame::NONE
         .fill(BG_INPUT)
         .corner_radius(INPUT_ROUNDING)
-        .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+        .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
         .inner_margin(egui::Margin::same(6))
         .show(ui, |ui| {
             egui::ScrollArea::vertical()
@@ -420,7 +420,7 @@ pub fn code_display(ui: &mut egui::Ui, label: &str, code: &str, color: Color32) 
         ))
         .corner_radius(CARD_ROUNDING)
         .stroke(Stroke::new(
-            1.0,
+            1.0_f32,
             Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), 30),
         ))
         .inner_margin(egui::Margin::same(10))

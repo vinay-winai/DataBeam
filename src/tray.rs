@@ -99,7 +99,11 @@ pub fn tray_hwnd() -> Option<isize> {
 /// Restore the window immediately on the calling thread (any thread):
 /// raw Win32 show first (needs no event loop — this is what wakes a hidden
 /// loop), then winit-consistent viewport commands.
-pub fn restore_window_now(ctx: &eframe::egui::Context, hwnd: Option<isize>) {
+pub fn restore_window_now(
+    ctx: &eframe::egui::Context,
+    // Used only for raw Win32 show; other platforms drive the viewport only.
+    #[cfg_attr(not(windows), allow(unused_variables))] hwnd: Option<isize>,
+) {
     #[cfg(windows)]
     if let Some(hwnd) = hwnd {
         sw_show(hwnd);
@@ -482,6 +486,10 @@ mod tests {
     /// channel, same id values). Needs a windowing system; gracefully skips
     /// where no tray exists, e.g. headless CI. May briefly show an icon on
     /// dev machines; dropped at test end.
+    /// Windows-only: muda Menu construction panics on non-main threads on
+    /// macOS (and headless Linux has no tray), while the test harness runs
+    /// tests on worker threads.
+    #[cfg_attr(not(target_os = "windows"), ignore)]
     #[test]
     fn tray_double_init_replaces_forward_entry() {
         use tray_icon::menu::MenuEvent;

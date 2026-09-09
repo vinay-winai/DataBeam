@@ -168,6 +168,7 @@ jobs:
             libwayland-dev \
             libx11-dev \
             libxcursor-dev \
+            libxdo-dev \
             libxi-dev \
             libxkbcommon-dev \
             libxrandr-dev \

@@ -52,7 +52,7 @@ pub fn apply_theme(ctx: &egui::Context) {
 
     // Window
     visuals.window_fill = BG_PANEL;
-    visuals.window_stroke = Stroke::new(1.0, BORDER_SUBTLE);
+    visuals.window_stroke = Stroke::new(1.0_f32, BORDER_SUBTLE);
     visuals.window_shadow = Shadow {
         offset: [0, 4],
         blur: 16,
@@ -66,31 +66,31 @@ pub fn apply_theme(ctx: &egui::Context) {
 
     // Widgets — improved contrast
     visuals.widgets.noninteractive.bg_fill = BG_CARD;
-    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_SECONDARY);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT_SECONDARY);
     visuals.widgets.noninteractive.corner_radius = BUTTON_ROUNDING;
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER_SUBTLE);
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER_SUBTLE);
 
     visuals.widgets.inactive.bg_fill = BG_CARD;
-    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
     visuals.widgets.inactive.corner_radius = BUTTON_ROUNDING;
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER_SUBTLE);
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER_SUBTLE);
 
     visuals.widgets.hovered.bg_fill = BG_CARD_HOVER;
-    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
     visuals.widgets.hovered.corner_radius = BUTTON_ROUNDING;
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT_BLUE);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT_BLUE);
 
     visuals.widgets.active.bg_fill = ACCENT_BLUE;
-    visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
     visuals.widgets.active.corner_radius = BUTTON_ROUNDING;
 
     visuals.widgets.open.bg_fill = BG_CARD_HOVER;
-    visuals.widgets.open.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    visuals.widgets.open.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
     visuals.widgets.open.corner_radius = BUTTON_ROUNDING;
 
     // Selection
     visuals.selection.bg_fill = Color32::from_rgba_premultiplied(214, 66, 36, 60);
-    visuals.selection.stroke = Stroke::new(1.0, ACCENT_BLUE);
+    visuals.selection.stroke = Stroke::new(1.0_f32, ACCENT_BLUE);
 
     // Extreme background
     visuals.extreme_bg_color = BG_INPUT;
