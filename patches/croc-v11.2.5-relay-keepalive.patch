@@ -1,0 +1,101 @@
+--- a/src/croc/croc.go
++++ b/src/croc/croc.go
+@@ -1774,6 +1774,23 @@
+ 	return
+ }
+ 
++// receiveLocalProbeResponse waits for the peer's local-probe reply. Relays
++// may send keepalives while the other peer has not joined the room yet.
++// They are transport frames, not PAKE or encrypted local-endpoint replies.
++func receiveLocalProbeResponse(conn *comm.Comm) ([]byte, error) {
++	for {
++		data, err := conn.Receive()
++		if err != nil {
++			return nil, err
++		}
++		if bytes.Equal(data, []byte{1}) {
++			log.Trace("got ping during local probe")
++			continue
++		}
++		return data, nil
++	}
++}
++
+ // Receive will receive a file
+ func (c *Client) Receive() (err error) {
+ 	defer func() { err = c.redactError(err) }()
+@@ -1906,7 +1923,7 @@
+ 				log.Errorf("dataMessage send error: %v", err)
+ 				return
+ 			}
+-			data, err = c.conn[0].Receive()
++			data, err = receiveLocalProbeResponse(c.conn[0])
+ 			if err != nil {
+ 				return
+ 			}
+@@ -1955,7 +1972,7 @@
+ 			if err = c.conn[0].Send(data); err != nil {
+ 				log.Errorf("ips send error: %v", err)
+ 			}
+-			data, err = c.conn[0].Receive()
++			data, err = receiveLocalProbeResponse(c.conn[0])
+ 			if err != nil {
+ 				return
+ 			}
+--- /dev/null
++++ b/src/croc/local_probe_keepalive_test.go
+@@ -0,0 +1,54 @@
++package croc
++
++import (
++	"bytes"
++	"errors"
++	"io"
++	"net"
++	"testing"
++
++	"github.com/schollz/croc/v11/src/comm"
++)
++
++func TestLocalProbeResponseSkipsRelayKeepalives(t *testing.T) {
++	for _, payload := range [][]byte{
++		[]byte(`{"Kind":"pake2","Version":2}`),
++		{0x80, 0x02, 0x01, 0xff}, // encrypted endpoint response remains opaque
++	} {
++		left, right := net.Pipe()
++		reader, writer := comm.New(left), comm.New(right)
++		done := make(chan error, 1)
++		go func() {
++			defer writer.Close()
++			for _, frame := range [][]byte{{1}, {1}, payload} {
++				if err := writer.Send(frame); err != nil {
++					done <- err
++					return
++				}
++			}
++			done <- nil
++		}()
++		got, err := receiveLocalProbeResponse(reader)
++		reader.Close()
++		if err != nil || !bytes.Equal(got, payload) {
++			t.Fatalf("got %x, %v; want %x", got, err, payload)
++		}
++		if err := <-done; err != nil {
++			t.Fatal(err)
++		}
++	}
++}
++
++func TestLocalProbeResponseReturnsDisconnectAfterKeepalive(t *testing.T) {
++	left, right := net.Pipe()
++	reader, writer := comm.New(left), comm.New(right)
++	defer reader.Close()
++	go func() {
++		defer writer.Close()
++		_ = writer.Send([]byte{1})
++	}()
++	_, err := receiveLocalProbeResponse(reader)
++	if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrClosedPipe) {
++		t.Fatalf("got %v; want a closed connection error", err)
++	}
++}

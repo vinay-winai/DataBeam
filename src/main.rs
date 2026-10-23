@@ -276,10 +276,11 @@ struct DataBeamApp {
     croc_update_phase: CrocUpdatePhase,
     croc_update_check_rx: Option<mpsc::Receiver<CrocUpdateCheckResult>>,
     croc_update_apply_rx: Option<mpsc::Receiver<CrocUpdateApplyResult>>,
-    croc_legacy_migration_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
+    croc_legacy_migration_rx: Option<mpsc::Receiver<Result<PathBuf, String>>>,
     // Background first-run managed-croc install (spawned in `new()` when no
     // cached copy exists; polled in `poll_managed_install`).
     managed_install_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
+    tool_detection_rx: Option<mpsc::Receiver<Vec<ToolStatus>>>,
     croc_update_last_check_at: Option<f64>,
     croc_update_startup_check_done: bool,
 
@@ -319,6 +320,8 @@ struct DataBeamApp {
     // Icon ownership stays here (dropping removes the icon); quit intent
     // and menu ids live in tray:: statics (shared with handler thread).
     minimize_to_tray: bool,
+    window_in_tray: bool,
+    tray_quit_requested: bool,
     tray_state: Option<tray::TrayState>,
     tray_action_rx: Option<mpsc::Receiver<tray::TrayRawEvent>>,
     /// Win32 HWND captured at startup, independent of the tray toggle, so a
@@ -428,6 +431,7 @@ impl Default for DataBeamApp {
             croc_update_apply_rx: None,
             croc_legacy_migration_rx: None,
             managed_install_rx: None,
+            tool_detection_rx: None,
             croc_update_last_check_at: None,
             croc_update_startup_check_done: false,
             native_engines_expanded: false,
@@ -437,6 +441,8 @@ impl Default for DataBeamApp {
             cleanup_bytes: 0,
             cleanup_prompt_open: false,
             minimize_to_tray: true,
+            window_in_tray: false,
+            tray_quit_requested: false,
             tray_state: None,
             tray_action_rx: None,
             startup_hwnd: None,
@@ -492,16 +498,14 @@ impl DataBeamApp {
         app.bundled_croc = croc_path;
         app.bundled_sendme = sendme_path;
 
-        // Managed croc download must never block first paint (macOS: the
-        // dock icon bounces forever with no window until `new()` returns).
-        // Fetch it on a worker and re-detect when it lands; until then the
-        // system PATH fallback (if any) serves transfers.
+        // Retry installation on a worker if initial cache extraction failed.
+        // A version-verified patched system engine can also serve transfers.
         if app.bundled_croc.is_none() {
             let (tx, rx) = mpsc::channel();
             app.managed_install_rx = Some(rx);
             let wake = cc.egui_ctx.clone();
             app.transfer_log
-                .push("Downloading croc in the background…".to_string());
+                .push("Preparing the patched Croc engine…".to_string());
             thread::spawn(move || {
                 let path = install_managed_binary(&Tool::Croc);
                 let _ = tx.send(path);
@@ -509,8 +513,10 @@ impl DataBeamApp {
             });
         }
 
-        app.tool_statuses =
-            detect_all_tools(app.bundled_croc.as_ref(), app.bundled_sendme.as_ref());
+        // No external program may hold up first paint, including --version
+        // or macOS quarantine handling for an already-cached croc.
+        app.tool_statuses = detect_tool_paths(app.bundled_croc.as_ref());
+        app.start_tool_detection(&cc.egui_ctx);
         app.load_user_settings();
 
         // Capture the HWND unconditionally: a later toggle-time init needs
@@ -1225,13 +1231,9 @@ impl DataBeamApp {
     /// if the reported rect is below the usable minimum (shrunken-restore
     /// race), force the last-known-good size instead.
     fn show_main_window(&mut self, ctx: &egui::Context) {
+        self.window_in_tray = false;
         tray::debug_log("tray action applied: Show");
-        if let Some(hwnd) = tray::tray_hwnd() {
-            tray::sw_show(hwnd);
-        }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        tray::restore_window_now(ctx, Self::pick_restore_hwnd(self.startup_hwnd, tray::tray_hwnd()));
         let current = ctx.screen_rect();
         if let Some(size) =
             restore_size_override([current.width(), current.height()], self.last_good_inner)
@@ -1244,35 +1246,35 @@ impl DataBeamApp {
         }
     }
 
-    /// Hide the main window to the tray (transfers keep running).
-    /// Minimize-only by design: taskbar-minimize is the verified ~0%-CPU
-    /// hidden state on this stack (the OS suppresses redraw delivery for
-    /// iconic windows while the event loop keeps processing real events, so
-    /// tray clicks keep working). `Visible(false)` is deliberately NOT used:
-    /// measured locally, a merely-hidden window spins the main thread at a
-    /// full core with zero update() calls — root cause inside winit/eframe
-    /// internals, still unnamed. A pending Eazy auto-retry keeps its exact
-    /// wake second.
-    /// Windows-only tray path (see mod tray).
+    /// Keep the main window iconic to avoid eframe's hidden-window redraw
+    /// spin, while native window styles remove it from taskbar and Alt+Tab.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     fn hide_to_tray(&mut self, ctx: &egui::Context) {
+        self.window_in_tray = true;
         tray::debug_log("window hidden to tray");
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-        // A pending Eazy auto-retry keeps its exact wake second.
+        #[cfg(windows)]
+        if let Some(hwnd) = Self::pick_restore_hwnd(self.startup_hwnd, tray::tray_hwnd()) {
+            tray::sw_hide_to_tray(hwnd);
+        }
         if let Some(retry_time) = self.eazy_next_retry_time {
             let secs = (retry_time - self.animation_time).clamp(0.0, 3600.0);
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(secs));
         }
     }
 
-    /// Apply one tray-menu/click action. Quit is instant (see hard_quit).
+    /// Apply one tray-menu/click action; Exit follows eframe's close path.
     fn apply_tray_action(&mut self, ctx: &egui::Context, action: tray::TrayAction) {
         match action {
             tray::TrayAction::Show => {
                 self.show_main_window(ctx);
             }
             tray::TrayAction::Quit => {
-                tray::hard_quit();
+                self.tray_quit_requested = true;
+                backend::kill_all_tracked_children();
+                self.tray_state.take();
+                self.tray_action_rx = None;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
     }
@@ -1300,6 +1302,7 @@ impl DataBeamApp {
         } else if !enabled {
             // Drop the icon immediately so it never lingers.
             self.tray_state.take();
+            self.tray_action_rx = None;
         }
         self.persist_user_settings();
     }
@@ -1316,10 +1319,6 @@ impl DataBeamApp {
         self.transfer_state = TransferState::Failed("Transfer cancelled".to_string());
     }
 
-    /// True when a captured croc output line signals relay DNS resolution
-    /// failure (e.g. `lookup 3.getcroc.com: i/o timeout`). The raw failure
-    /// surfaces only as a generic process-exit message, so callers use this
-    /// to show a DNS/VPN hint on the Failed card instead.
     fn is_relay_dns_failure_line(line: &str) -> bool {
         let lower = line.to_lowercase();
         lower.contains("no such host")
@@ -1394,6 +1393,18 @@ impl DataBeamApp {
             self.transfer_end_time = Some(self.animation_time);
             return;
         }
+
+        // Classify the terminal error, not old warnings from a recovered attempt.
+        let e = if matches!(self.selected_tool, SelectedTool::Croc | SelectedTool::EazySendme)
+            && Self::is_relay_dns_failure_line(&e)
+        {
+            if !self.transfer_log.iter().any(|line| line == &e) {
+                self.transfer_log.push(e);
+            }
+            "Couldn't reach the relay: DNS lookup failed. Check your DNS or VPN connection and retry (details in the log below).".to_string()
+        } else {
+            e
+        };
 
         if self.selected_tool == SelectedTool::EazySendme
             && self.eazysendme_auto_retry
@@ -1819,7 +1830,9 @@ impl DataBeamApp {
         
     }
 
-    fn update_croc_received_text_from_log(&mut self, line: &str) -> bool {
+    // Only consume incoming Croc output. The display log also contains
+    // app-generated status (such as Route: ...), which is not payload.
+    fn update_croc_received_text_from_output(&mut self, line: &str) -> bool {
         if let Some(text) = extract_croc_received_text(line) {
             if !text.is_empty() && self.croc_received_text.as_deref() != Some(text.as_str()) {
                 self.croc_received_text = Some(text);
@@ -1852,26 +1865,6 @@ impl DataBeamApp {
                     return true;
                 }
             }
-            if self.croc_received_text.is_none() {
-                // Check current line first
-                if let Some(text) = extract_croc_received_text(line) {
-                    self.croc_received_text = Some(text);
-                    if self.selected_tool == SelectedTool::Croc {
-                        self.croc_text_popup_open = true;
-                    }
-                    self.croc_expect_text_payload = false;
-                    return true;
-                }
-                // Then check log
-                if let Some(text) = extract_croc_received_text_from_logs(&self.transfer_log) {
-                    self.croc_received_text = Some(text);
-                    if self.selected_tool == SelectedTool::Croc {
-                        self.croc_text_popup_open = true;
-                    }
-                    self.croc_expect_text_payload = false;
-                    return true;
-                }
-            }
         }
         false
     }
@@ -1888,9 +1881,34 @@ impl DataBeamApp {
         }
     }
 
-    /// Refresh the cached croc `ToolStatus` so the home page engine card
-    /// shows the new version immediately after an update/migration.
+    /// Detect versions on a worker so external probes cannot block first paint.
+    fn start_tool_detection(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = mpsc::channel();
+        self.tool_detection_rx = Some(rx);
+        let croc = self.bundled_croc.clone();
+        let sendme = self.bundled_sendme.clone();
+        let wake = ctx.clone();
+        thread::spawn(move || {
+            let statuses = detect_all_tools(croc.as_ref(), sendme.as_ref());
+            let _ = tx.send(statuses);
+            wake.request_repaint();
+        });
+    }
+
+    fn poll_tool_detection(&mut self) {
+        if let Some(rx) = self.tool_detection_rx.take() {
+            match rx.try_recv() {
+                Ok(statuses) => self.tool_statuses = statuses,
+                Err(mpsc::TryRecvError::Empty) => self.tool_detection_rx = Some(rx),
+                Err(mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
+    }
+
     fn refresh_croc_tool_status(&mut self) {
+        // A startup probe that finishes late must not overwrite the newly
+        // installed version with its pre-update result.
+        self.tool_detection_rx = None;
         let fresh = redetect_croc_status(self.bundled_croc.as_ref());
         if let Some(slot) = self.tool_statuses.iter_mut().find(|s| s.tool == Tool::Croc) {
             *slot = fresh;
@@ -1950,7 +1968,7 @@ impl DataBeamApp {
     }
 
     /// One-time migration for cached binaries that predate `croc update`:
-    /// re-download the latest managed release in the background, then
+    /// restore the bundled patched engine in the background, then
     /// re-detect so the home page version updates. Managed copy only — a
     /// legacy *system* croc is left alone (never overwrite foreign files).
     fn start_croc_legacy_migration(&mut self, ctx: &egui::Context, binary: &str) {
@@ -1966,7 +1984,7 @@ impl DataBeamApp {
             );
             return;
         }
-        let (tx, rx) = mpsc::channel::<Option<PathBuf>>();
+        let (tx, rx) = mpsc::channel::<Result<PathBuf, String>>();
         self.croc_update_phase = CrocUpdatePhase::Updating;
         self.croc_legacy_migration_rx = Some(rx);
         let wake = ctx.clone();
@@ -1980,7 +1998,7 @@ impl DataBeamApp {
     /// Background managed-croc install (spawned in `new()` when no cached
     /// copy exists): adopt the binary and re-detect so the tool card flips
     /// without a restart.
-    fn poll_managed_install(&mut self) {
+    fn poll_managed_install(&mut self, ctx: &egui::Context) {
         let Some(rx) = self.managed_install_rx.take() else {
             return;
         };
@@ -1988,15 +2006,13 @@ impl DataBeamApp {
             Ok(path) => {
                 if let Some(path) = path {
                     self.bundled_croc = Some(path);
-                    self.tool_statuses = detect_all_tools(
-                        self.bundled_croc.as_ref(),
-                        self.bundled_sendme.as_ref(),
-                    );
+                    self.tool_statuses = detect_tool_paths(self.bundled_croc.as_ref());
+                    self.start_tool_detection(ctx);
                     self.transfer_log
-                        .push("Background croc download finished.".to_string());
+                        .push("Patched Croc engine is ready.".to_string());
                 } else {
                     self.transfer_log.push(
-                        "Background croc download failed; using system croc if available."
+                        "Could not prepare the patched Croc engine; checking for a matching system copy."
                             .to_string(),
                     );
                 }
@@ -2016,6 +2032,10 @@ impl DataBeamApp {
                     self.croc_update_check_rx = None;
                     self.record_croc_update_check_time();
                     match result.check {
+                        Ok(CrocUpdateCheck::Pinned { version }) => {
+                            self.croc_update_phase = CrocUpdatePhase::Idle;
+                            self.transfer_log.push(format!("croc {version} is pinned for relay compatibility"));
+                        }
                         Ok(CrocUpdateCheck::Available { current, latest, .. }) => {
                             self.transfer_log.push(format!(
                                 "croc update available ({current} → {latest}), updating…"
@@ -2024,7 +2044,7 @@ impl DataBeamApp {
                                 format!("croc update available ({current} → {latest}), updating…"),
                                 WARNING,
                             );
-                            let prev = croc_version_string(&result.binary);
+                            let prev = Some(current);
                             self.start_croc_update_apply(ctx, result.binary, prev);
                         }
                         Ok(CrocUpdateCheck::UpToDate { version, .. }) => {
@@ -2054,7 +2074,7 @@ impl DataBeamApp {
                         }
                         Ok(CrocUpdateCheck::Unsupported { .. }) => {
                             // Legacy binary without `update`: migrate via a
-                            // managed re-download to the latest release.
+                            // managed re-download to the supported release.
                             self.croc_update_phase = CrocUpdatePhase::Idle;
                             let binary = result.binary.clone();
                             self.start_croc_legacy_migration(ctx, &binary);
@@ -2071,7 +2091,9 @@ impl DataBeamApp {
                         }
                         Err(e) => {
                             self.croc_update_phase = CrocUpdatePhase::Idle;
-                            self.transfer_log.push(format!("croc update check failed: {e}"));
+                            let message = format!("croc update check failed: {e}");
+                            self.transfer_log.push(message.clone());
+                            self.show_toast(message, WARNING);
                         }
                     }
                 }
@@ -2089,7 +2111,7 @@ impl DataBeamApp {
             match rx.try_recv() {
                 Ok(path) => {
                     self.croc_legacy_migration_rx = None;
-                    if let Some(path) = path {
+                    if let Ok(path) = path {
                         self.bundled_croc = Some(path);
                         self.refresh_croc_tool_status();
                         let ver = self
@@ -2098,10 +2120,12 @@ impl DataBeamApp {
                             .find(|s| s.tool == Tool::Croc)
                             .and_then(|s| s.version.clone())
                             .unwrap_or_default();
-                        self.transfer_log.push(format!("croc migrated to latest ({ver})"));
+                        self.transfer_log.push(format!("croc restored to supported release ({ver})"));
                         self.show_toast(format!("croc updated ({ver})"), SUCCESS);
                     } else {
-                        self.transfer_log.push("croc migration download failed".to_string());
+                        let error = path.unwrap_err();
+                        self.transfer_log.push(format!("croc migration download failed: {error}"));
+                        self.show_toast(format!("croc update failed: {error}"), WARNING);
                     }
                     self.croc_update_phase = CrocUpdatePhase::Idle;
                 }
@@ -2140,8 +2164,9 @@ impl DataBeamApp {
                             self.refresh_croc_tool_status();
                         }
                         Ok(outcome) if outcome.not_writable => {
-                            // Not an error: leave the system binary alone.
                             self.refresh_croc_tool_status();
+                            self.transfer_log.push(outcome.raw);
+                            self.show_toast("croc update requires your package manager".to_string(), WARNING);
                         }
                         Ok(outcome) if outcome.needs_redownload => {
                             // Self-update refused by the environment (verified:
@@ -2186,6 +2211,10 @@ impl DataBeamApp {
     /// Decide whether a periodic (or startup) check is due. Called every frame;
     /// cheap no-op most of the time.
     fn maybe_trigger_croc_update_check(&mut self, ctx: &egui::Context) {
+        // macOS remains manual-only until its launch behavior is verified.
+        if cfg!(target_os = "macos") {
+            return;
+        }
         if self.croc_update_phase != CrocUpdatePhase::Idle {
             return;
         }
@@ -2288,7 +2317,7 @@ impl DataBeamApp {
                                     || self.selected_tool == SelectedTool::EazySendme)
                                     && self.view == AppView::Receive
                                 {
-                                    skip_log_line = self.update_croc_received_text_from_log(&line);
+                                    skip_log_line = self.update_croc_received_text_from_output(&line);
                                 }
                                 if self.view == AppView::Send
                                     && self.transfer_state == TransferState::Running
@@ -2811,22 +2840,6 @@ impl DataBeamApp {
                                     // Serve mode: non-fatal per-cycle sender failure, restart cleanly.
                                     restart_sendme_serve = true;
                                     break;
-                                } else if (self.selected_tool == SelectedTool::Croc
-                                    || self.selected_tool == SelectedTool::EazySendme)
-                                    && self
-                                        .transfer_log
-                                        .iter()
-                                        .rev()
-                                        .take(50)
-                                        .any(|l| Self::is_relay_dns_failure_line(l))
-                                {
-                                    // Raw croc failure is only a generic process-exit
-                                    // message; the log holds the real cause, so headline
-                                    // it as a DNS/VPN hint instead.
-                                    self.fail_transfer(
-                                        "Couldn't reach the relay: DNS lookup failed. Check your DNS or VPN connection and retry (details in the log below)."
-                                            .to_string(),
-                                    );
                                 } else {
                                     self.fail_transfer(e);
                                 }
@@ -2897,7 +2910,7 @@ impl DataBeamApp {
                         processed += 1;
                         match msg {
                             TransferMsg::Output(line) => {
-                                let skip = self.update_croc_received_text_from_log(&line);
+                                let skip = self.update_croc_received_text_from_output(&line);
                                 if !skip {
                                     self.transfer_log.push(format!("[Croc] {}", line));
                                     if self.transfer_log.len() > 500 {
@@ -3442,15 +3455,18 @@ impl DataBeamApp {
                         let ctx = ui.ctx().clone();
                         self.set_minimize_to_tray(&ctx, tray_toggle);
                     }
-                    let mut debug_toggle = self.tray_debug_log;
-                    if ui
-                        .checkbox(&mut debug_toggle, "Tray debug log (temp file)")
-                        .on_hover_text("Writes tray events to databeam-tray-debug.log in the temp dir")
-                        .changed()
+                    #[cfg(debug_assertions)]
                     {
-                        self.tray_debug_log = debug_toggle;
-                        tray::set_debug_enabled(debug_toggle);
-                        self.persist_user_settings();
+                        let mut debug_toggle = self.tray_debug_log;
+                        if ui
+                            .checkbox(&mut debug_toggle, "Tray debug log (temp file)")
+                            .on_hover_text("Writes tray events to databeam-tray-debug.log in the temp dir")
+                            .changed()
+                        {
+                            self.tray_debug_log = debug_toggle;
+                            tray::set_debug_enabled(debug_toggle);
+                            self.persist_user_settings();
+                        }
                     }
                 }
                 ui.add_space(4.0);
@@ -3624,8 +3640,7 @@ impl eframe::App for DataBeamApp {
             self.last_good_inner = [screen.width(), screen.height()];
         }
         // ── System tray: close-to-tray + menu actions ──
-        // Raw tray/menu events arrive via installed handlers, which apply
-        // Show/Quit directly; this drain is a backup for when the loop runs.
+        // Handlers wake the native window; apply each queued action here.
         let tray_actions = match self.tray_action_rx.as_ref() {
             Some(rx) => tray::drain_actions_global(rx),
             _ => Vec::new(),
@@ -3633,9 +3648,12 @@ impl eframe::App for DataBeamApp {
         for action in tray_actions {
             self.apply_tray_action(ctx, action);
         }
+        if self.tray_quit_requested {
+            return;
+        }
         if ctx.input(|i| i.viewport().close_requested()) {
             // Windows-only tray: X hides to tray while the toggle is on and
-            // the icon exists (Tray Exit bypasses this via hard_quit).
+            // the icon exists. Tray Exit bypasses this via the quit flag.
             // Other platforms quit on close (default eframe behaviour).
             #[cfg(target_os = "windows")]
             if self.minimize_to_tray && tray::is_active() {
@@ -3754,8 +3772,9 @@ impl eframe::App for DataBeamApp {
         self.handle_dropped_files(ctx);
         self.poll_size_updates();
         self.poll_transfer();
-        // Croc self-update: first check on open, then every 6 hours.
-        self.poll_managed_install();
+        // Automatic checks on Windows/Linux; macOS remains manual-only.
+        self.poll_tool_detection();
+        self.poll_managed_install(ctx);
         self.poll_croc_update(ctx);
         self.maybe_trigger_croc_update_check(ctx);
         if let Some(started_at) = self.eazy_local_check_started_at {
@@ -3784,13 +3803,20 @@ impl eframe::App for DataBeamApp {
                         self.retry_receive(true);
                     }
                 } else {
-                    ctx.request_repaint(); // ensure it repaints for timer updates
+                    let remaining = (retry_time - self.animation_time).max(0.0);
+                    let delay = if self.window_in_tray { remaining } else { remaining.min(0.1) };
+                    ctx.request_repaint_after(std::time::Duration::from_secs_f64(delay));
                 }
             }
         }
 
         if self.transfer_state == TransferState::Running || self.eazy_next_retry_time.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+
+        if self.window_in_tray {
+            // Poll background work above; hidden UI widgets must not animate.
+            return;
         }
 
         // ── Top Bar ─────────────────────────────────────────
@@ -6358,40 +6384,6 @@ fn extract_croc_received_text(line: &str) -> Option<String> {
     None
 }
 
-fn extract_croc_received_text_from_logs(log: &[String]) -> Option<String> {
-    for (idx, line) in log.iter().enumerate().rev() {
-        if let Some(text) = extract_croc_received_text(line) {
-            return Some(text);
-        }
-        let lower = line.to_lowercase();
-        if (lower.contains("receiv") && lower.contains("text")) || lower.contains("received text") {
-            for next in log.iter().skip(idx + 1).take(6) {
-                let candidate = next.trim().trim_matches('"');
-                if candidate.is_empty() || candidate.len() > 2000 {
-                    continue;
-                }
-                let c = candidate.to_lowercase();
-                let looks_like_status = c.contains("connecting")
-                    || c.contains("securing")
-                    || c.contains("receiving")
-                    || c.contains("sending")
-                    || c.contains("code is")
-                    || c.contains("croc_secret")
-                    || c.contains("download")
-                    || c.contains("upload")
-                    || c.contains("mb/s")
-                    || c.contains("kb/s")
-                    || c.contains("error")
-                    || c.contains("failed");
-                if !looks_like_status {
-                    return Some(candidate.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
 fn normalize_sendme_ticket(text: &str) -> Option<String> {
     let trimmed = text.trim().trim_matches('"').trim_matches('\'');
     if trimmed.is_empty() {
@@ -6655,7 +6647,7 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod parse_tests {
     use super::{
-        extract_croc_received_text, extract_croc_received_text_from_logs, format_eta_compact,
+        extract_croc_received_text, format_eta_compact,
         normalize_sendme_ticket, parse_croc_bar_frame, parse_croc_file_counter_progress,
         parse_croc_total_size_hint, parse_go_duration, parse_payload_progress,
         parse_sendme_imported_size_hint, parse_sendme_item_index, parse_sendme_total_files_hint,
@@ -6673,26 +6665,45 @@ mod parse_tests {
     }
 
     #[test]
-    fn relay_dns_failure_line_matches_resolver_errors() {
-        // Exact line shape reported against Quad9 DNS.
-        assert!(DataBeamApp::is_relay_dns_failure_line(
-            "relay connection failed: could not connect to 3.getcroc.com:9009: 3.getcroc.com:9009: comm.NewConnection failed: dial tcp: lookup 3.getcroc.com: i/o timeout"
-        ));
-        assert!(DataBeamApp::is_relay_dns_failure_line(
-            "dial tcp: lookup 1.getcroc.com: no such host"
-        ));
-        assert!(DataBeamApp::is_relay_dns_failure_line(
-            "temporary failure in name resolution"
-        ));
-        assert!(!DataBeamApp::is_relay_dns_failure_line(
-            "peer error: refusing files"
-        ));
-        assert!(!DataBeamApp::is_relay_dns_failure_line(
-            "Sending (->peer)"
-        ));
-        assert!(!DataBeamApp::is_relay_dns_failure_line(
-            "Process exited with code: exit code: 1"
-        ));
+    fn croc_dns_failure_restores_guidance_and_keeps_details() {
+        for error in [
+            "could not connect to 1.getcroc.com:9009: dial tcp: lookup 1.getcroc.com: i/o timeout",
+            "dial tcp: lookup 1.getcroc.com: no such host",
+            "temporary failure in name resolution",
+        ] {
+            let mut app = DataBeamApp::default();
+            app.selected_tool = SelectedTool::Croc;
+            let (tx, rx) = mpsc::channel();
+            app.transfer_rx = Some(rx);
+            tx.send(TransferMsg::Started).unwrap();
+            tx.send(TransferMsg::Error(error.to_string())).unwrap();
+            app.poll_transfer();
+            assert_eq!(app.transfer_state, TransferState::Failed(
+                "Couldn't reach the relay: DNS lookup failed. Check your DNS or VPN connection and retry (details in the log below).".to_string()
+            ));
+            assert!(app.transfer_log.iter().any(|line| line == error));
+        }
+    }
+
+    #[test]
+    fn croc_old_dns_warning_does_not_mask_terminal_error() {
+        for error in [
+            "decompress data: flate: corrupt input before offset 6",
+            "dial tcp 142.132.189.179:9009: i/o timeout",
+            "relay closed",
+        ] {
+            let mut app = DataBeamApp::default();
+            app.selected_tool = SelectedTool::Croc;
+            let (tx, rx) = mpsc::channel();
+            app.transfer_rx = Some(rx);
+            tx.send(TransferMsg::Started).unwrap();
+            tx.send(TransferMsg::Output(
+                "Relay DNS lookup failed; retrying croc once.".to_string()
+            )).unwrap();
+            tx.send(TransferMsg::Error(error.to_string())).unwrap();
+            app.poll_transfer();
+            assert_eq!(app.transfer_state, TransferState::Failed(error.to_string()));
+        }
     }
 
     #[test]
@@ -6717,6 +6728,41 @@ mod parse_tests {
         assert_eq!(app.croc_update_phase, CrocUpdatePhase::Idle);
         assert!(app.transfer_log.iter().any(|l| l.contains("up to date")
             && l.contains("v11.5.2")));
+    }
+
+    #[test]
+    fn croc_random_send_has_share_code_and_completes_from_a_fresh_state() {
+        use crate::backend::TransferMsg;
+        let mut app = DataBeamApp::default();
+        app.selected_tool = SelectedTool::Croc;
+        app.view = AppView::Send;
+        for (custom, code) in [
+            (false, "lip-swab-jab"),
+            (true, "custom-secret"),
+            (false, "july-wake-flint"),
+        ] {
+            app.reset_transfer();
+            app.croc_use_custom_code = custom;
+            if custom {
+                app.transfer_code = Some(code.to_string());
+            }
+            let (tx, rx) = mpsc::channel();
+            app.transfer_rx = Some(rx);
+            tx.send(TransferMsg::Started).unwrap();
+            tx.send(TransferMsg::Code(code.to_string())).unwrap();
+            tx.send(TransferMsg::Output(format!(
+                "croc --relay 142.132.189.179:9009 {code} (code copied to clipboard)"
+            )))
+            .unwrap();
+            app.poll_transfer();
+            // These are the conditions that make Copy Code and Show QR visible.
+            assert_eq!(app.transfer_code.as_deref(), Some(code));
+            assert_eq!(app.transfer_phase, TransferPhase::WaitingForReceiver);
+            tx.send(TransferMsg::Completed).unwrap();
+            app.poll_transfer();
+            assert_eq!(app.transfer_state, TransferState::Completed);
+            assert_eq!(app.transfer_code.as_deref(), Some(code));
+        }
     }
 
     #[test]
@@ -7192,14 +7238,53 @@ mod parse_tests {
     }
 
     #[test]
-    fn croc_text_fallback_from_log_sequence_parses() {
-        let log = vec![
-            "Connecting ...".to_string(),
-            "Receiving 'text'".to_string(),
-            "hello popup".to_string(),
-        ];
-        let text = extract_croc_received_text_from_logs(&log).expect("fallback text");
-        assert_eq!(text, "hello popup");
+    fn croc_text_from_output_sequence_parses() {
+        // A real message may itself look like the app's route annotation.
+        for payload in ["hello popup", "Route: via public relay"] {
+            let mut app = DataBeamApp::default();
+            app.selected_tool = SelectedTool::Croc;
+            app.view = AppView::Receive;
+            assert!(!app.update_croc_received_text_from_output("Connecting ..."));
+            assert!(!app.update_croc_received_text_from_output("Receiving 'text'"));
+            assert!(app.update_croc_received_text_from_output(payload));
+            assert_eq!(app.croc_received_text.as_deref(), Some(payload));
+        }
+    }
+
+    #[test]
+    fn croc_received_text_ignores_app_route_log() {
+        for direction in [
+            "Receiving (<-203.0.113.1:9009)",
+            "Receiving (192.168.1.2:9009<-192.168.1.3:9009)",
+        ] {
+            for header_first in [true, false] {
+                let mut app = DataBeamApp::default();
+                app.selected_tool = SelectedTool::Croc;
+                app.view = AppView::Receive;
+                let (tx, rx) = mpsc::channel();
+                app.transfer_rx = Some(rx);
+                tx.send(TransferMsg::Started).unwrap();
+                let header = "Receiving text message (11 B)";
+                let lines = if header_first {
+                    [header, direction]
+                } else {
+                    [direction, header]
+                };
+                for line in lines {
+                    tx.send(TransferMsg::Output(line.to_string())).unwrap();
+                    app.poll_transfer();
+                    assert_eq!(app.croc_received_text, None);
+                    assert!(!app.croc_text_popup_open);
+                }
+                assert!(app.transfer_log.iter().any(|line| line.starts_with("Route: ")));
+                tx.send(TransferMsg::Output(";ljwpiojpej".to_string())).unwrap();
+                tx.send(TransferMsg::Completed).unwrap();
+                app.poll_transfer();
+                assert_eq!(app.croc_received_text.as_deref(), Some(";ljwpiojpej"));
+                assert!(app.croc_text_popup_open);
+                assert_eq!(app.transfer_state, TransferState::Completed);
+            }
+        }
     }
 
     #[test]

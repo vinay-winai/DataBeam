@@ -14,5 +14,7 @@ _alt_sendme_inspect/
 _official_sendme_inspect/
 /third_party/sendme/target
 node_modules/
+.playwright-cli/
+/output/
 web/
 docs/app.js

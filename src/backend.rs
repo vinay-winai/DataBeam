@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{BufReader, Cursor, Read, Write};
+use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -13,6 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use flate2::read::GzDecoder;
+use rand::seq::IndexedRandom;
 use sendme_native::{
     check_and_export_local_in as native_check_and_export_local_in,
     cleanup_sendme_receive_artifacts_for_ticket_in as native_cleanup_sendme_receive_artifacts_for_ticket_in,
@@ -27,15 +29,16 @@ use sendme_native::{
 };
 pub use sendme_native::ticket_to_hex_hash as native_ticket_to_hex_hash;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
 // ── Embedded Binaries ──────────────────────────────────────────────
-// Embedded payloads are intentionally disabled.
-// DataBeam uses managed downloads or system-installed binaries.
-
-const CROC_GZ: &[u8] = &[];
+// Release builds embed the reproducibly built, patched engine. build.rs
+// generates its identity and hashes from patches/croc-engine.json.
+include!(concat!(env!("OUT_DIR"), "/croc_payload.rs"));
+pub const CROC_COMPATIBILITY_PINNED: bool = true;
 
 /// Get the cache directory for extracted binaries
 fn bundled_bin_dir() -> PathBuf {
@@ -56,47 +59,35 @@ fn new_hidden_command(program: impl AsRef<OsStr>) -> Command {
     }
 }
 
-/// Extract a gzip-compressed binary to the cache directory.
-/// Returns the path to the extracted binary, or None if data is empty.
-fn extract_bundled_binary(name: &str, gz_data: &[u8]) -> Option<PathBuf> {
-    if gz_data.is_empty() {
-        return None;
+fn restore_bundled_croc_to(output: &Path, gzip: &[u8], expected_sha256: &str) -> Result<PathBuf, String> {
+    if gzip.is_empty() {
+        return Err("This development build has no patched Croc payload. Run scripts/prepare_croc.py and rebuild DataBeam.".to_string());
     }
-
-    let bin_dir = bundled_bin_dir();
-    fs::create_dir_all(&bin_dir).ok()?;
-
-    let bin_path = bin_dir.join(name);
-
-    // If already extracted, verify it exists and is executable
-    if bin_path.exists() {
-        // Check file size matches (simple freshness check)
-        if let Ok(meta) = fs::metadata(&bin_path) {
-            if meta.len() > 0 {
-                return Some(bin_path);
-            }
-        }
+    let hash = |bytes: &[u8]| -> String {
+        Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+    };
+    if fs::read(output).ok().is_some_and(|bytes| hash(&bytes) == expected_sha256) {
+        set_executable_permissions(output);
+        return Ok(output.to_path_buf());
     }
-
-    // Decompress and write
-    let mut decoder = GzDecoder::new(gz_data);
-    let mut decompressed = Vec::new();
-    if decoder.read_to_end(&mut decompressed).is_err() {
-        return None;
+    let parent = output.parent().ok_or("Croc cache path has no parent")?;
+    fs::create_dir_all(parent).map_err(|e| format!("Create Croc cache: {e}"))?;
+    let mut staged = tempfile::Builder::new().prefix("croc-bundle-")
+        .suffix(if cfg!(windows) { ".exe" } else { "" }).tempfile_in(parent)
+        .map_err(|e| format!("Stage bundled Croc: {e}"))?;
+    let mut bytes = Vec::new();
+    GzDecoder::new(gzip).read_to_end(&mut bytes).map_err(|e| format!("Decode bundled Croc: {e}"))?;
+    if hash(&bytes) != expected_sha256 {
+        return Err("Bundled Croc SHA-256 mismatch".to_string());
     }
+    staged.write_all(&bytes).map_err(|e| format!("Write bundled Croc: {e}"))?;
+    set_executable_permissions(staged.path());
+    staged.persist(output).map_err(|e| format!("Restore bundled Croc: {}", e.error))?;
+    Ok(output.to_path_buf())
+}
 
-    let mut file = fs::File::create(&bin_path).ok()?;
-    file.write_all(&decompressed).ok()?;
-    drop(file);
-
-    // Make executable on unix
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&bin_path, fs::Permissions::from_mode(0o755));
-    }
-
-    Some(bin_path)
+fn restore_bundled_croc() -> Result<PathBuf, String> {
+    restore_bundled_croc_to(&managed_binary_path(&Tool::Croc), CROC_GZ, CROC_BINARY_SHA256)
 }
 
 // ── Tool Detection ─────────────────────────────────────────────────
@@ -183,7 +174,12 @@ fn managed_binary_name(tool: &Tool) -> String {
 }
 
 fn managed_binary_path(tool: &Tool) -> PathBuf {
-    bundled_bin_dir().join(managed_binary_name(tool))
+    let base = if matches!(tool, Tool::Croc) {
+        bundled_bin_dir().join(format!("croc-{SUPPORTED_CROC_VERSION}-{}", std::env::consts::ARCH))
+    } else {
+        bundled_bin_dir()
+    };
+    base.join(managed_binary_name(tool))
 }
 
 /// True when `path` is our own managed croc binary (not a system install).
@@ -208,17 +204,14 @@ fn github_repo(tool: &Tool) -> &'static str {
     }
 }
 
-fn fetch_latest_release(tool: &Tool) -> Result<GitHubRelease, String> {
-    // No version pinning: always resolve the latest stable release.
-    // Croc freshness after bootstrap is maintained by its own self-updater
-    // (`croc update`), not by this download path.
-    //
-    // NOTE for future croc versions: if the release asset naming changes
-    // (`croc_<ver>_<OS>-<arch>.tar.gz/zip`), bootstrap breaks here —
-    // `croc_asset_markers` + `find_release_asset` are the knobs.
+fn fetch_release(tool: &Tool) -> Result<GitHubRelease, String> {
+    let release = if matches!(tool, Tool::Croc) && CROC_COMPATIBILITY_PINNED {
+        format!("tags/{SUPPORTED_CROC_VERSION}")
+    } else {
+        "latest".to_string()
+    };
     let url = format!(
-        "https://api.github.com/repos/{}/releases/latest",
-        github_repo(tool)
+        "https://api.github.com/repos/{}/releases/{release}", github_repo(tool)
     );
     let json = download_bytes(&url)?;
     serde_json::from_slice::<GitHubRelease>(&json)
@@ -399,13 +392,10 @@ fn extract_binary_from_zip(
 }
 
 /// Non-empty cached managed binary, if present. Never touches the network.
-/// On macOS also strips the quarantine xattr best-effort so later
-/// `--version` probes can't stall in Gatekeeper verification.
+/// This path never launches subprocesses; version/quarantine work runs later.
 fn cached_managed_binary(tool: &Tool) -> Option<PathBuf> {
     let path = managed_binary_path(tool);
     if path.exists() && fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false) {
-        #[cfg(target_os = "macos")]
-        strip_quarantine(&path);
         Some(path)
     } else {
         None
@@ -414,7 +404,7 @@ fn cached_managed_binary(tool: &Tool) -> Option<PathBuf> {
 
 /// macOS tags files downloaded by an app with com.apple.quarantine; the
 /// first exec then stalls in Gatekeeper verification (on the calling
-/// thread). Managed binaries come from official upstream releases, so
+/// thread). Managed binaries are built from verified upstream source, so
 /// clearing the flag best-effort is safe.
 #[cfg(target_os = "macos")]
 fn strip_quarantine(path: &Path) {
@@ -425,84 +415,78 @@ fn strip_quarantine(path: &Path) {
 }
 
 pub fn install_managed_binary(tool: &Tool) -> Option<PathBuf> {
-    let output_path = managed_binary_path(tool);
-
-    // No version pinning: any non-empty cached binary is reused as-is.
-    // Freshness is handled by `croc update` (self-updater) after startup,
-    // plus the legacy-migration path in `refresh_managed_croc_to_latest`.
-
+    if matches!(tool, Tool::Croc) && CROC_COMPATIBILITY_PINNED {
+        return restore_bundled_croc().map_err(|e| eprintln!("Croc install failed: {e}")).ok();
+    }
     if let Some(cached) = cached_managed_binary(tool) {
         return Some(cached);
     }
+    download_managed_binary(tool).map_err(|e| {
+        eprintln!("{} install failed: {e}", tool.name());
+    }).ok()
+}
 
-    fs::create_dir_all(bundled_bin_dir()).ok()?;
-
-    let release = match fetch_latest_release(tool) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("{} latest-release lookup failed: {}", tool.name(), e);
-            return None;
-        }
-    };
-
-    let asset = match find_release_asset(tool, &release) {
-        Some(asset) => asset,
-        None => {
-            eprintln!(
-                "{} has no release asset for {}-{} in {}",
-                tool.name(),
-                std::env::consts::OS,
-                std::env::consts::ARCH,
-                release.tag_name
-            );
-            return None;
-        }
-    };
-
-    let bytes = match download_bytes(&asset.browser_download_url) {
-        Ok(data) => data,
-        Err(e) => {
-            eprintln!("{} download failed: {}", tool.name(), e);
-            return None;
-        }
-    };
-
-    let extract_result = if asset.name.ends_with(".tar.gz") {
-        extract_binary_from_tar_gz(&bytes, &managed_binary_name(tool), &output_path)
-    } else if asset.name.ends_with(".zip") {
-        extract_binary_from_zip(&bytes, &managed_binary_name(tool), &output_path)
-    } else {
-        Err(format!("Unsupported archive format: {}", asset.name))
-    };
-
-    if let Err(e) = extract_result {
-        let _ = fs::remove_file(&output_path);
-        eprintln!("{} extraction failed: {}", tool.name(), e);
-        return None;
+fn download_managed_binary(tool: &Tool) -> Result<PathBuf, String> {
+    if matches!(tool, Tool::Croc) && CROC_COMPATIBILITY_PINNED {
+        return restore_bundled_croc();
     }
+    let output_path = managed_binary_path(tool);
+    fs::create_dir_all(output_path.parent().ok_or("Binary path has no parent")?)
+        .map_err(|e| format!("Create binary cache: {e}"))?;
+    let release = fetch_release(tool)?;
+    let asset = find_release_asset(tool, &release).ok_or_else(|| format!(
+        "{} has no release asset for {}-{} in {}",
+        tool.name(), std::env::consts::OS, std::env::consts::ARCH, release.tag_name
+    ))?;
+    let bytes = download_bytes(&asset.browser_download_url)?;
+    stage_managed_binary(tool, &asset.name, &bytes, &release.tag_name, &output_path)?;
+    Ok(output_path)
+}
 
-    set_executable_permissions(&output_path);
+/// Stage beside the destination so replacement is atomic and a failed
+/// download, extraction or version probe leaves the working copy intact.
+fn stage_managed_binary(
+    tool: &Tool, asset_name: &str, bytes: &[u8], release_tag: &str, output_path: &Path,
+) -> Result<(), String> {
+    let parent = output_path.parent().ok_or("Binary path has no parent")?;
+    let staged = tempfile::Builder::new().prefix("croc-stage-")
+        .suffix(if cfg!(windows) { ".exe" } else { "" }).tempfile_in(parent)
+        .map_err(|e| format!("Stage binary: {e}"))?.into_temp_path();
+    if asset_name.ends_with(".tar.gz") {
+        extract_binary_from_tar_gz(bytes, &managed_binary_name(tool), &staged)?;
+    } else if asset_name.ends_with(".zip") {
+        extract_binary_from_zip(bytes, &managed_binary_name(tool), &staged)?;
+    } else {
+        return Err(format!("Unsupported archive format: {asset_name}"));
+    }
+    if fs::metadata(&staged).map_err(|e| e.to_string())?.len() == 0 {
+        return Err("Downloaded binary is empty".to_string());
+    }
+    set_executable_permissions(&staged);
     #[cfg(target_os = "macos")]
-    strip_quarantine(&output_path);
-
-    Some(output_path)
+    strip_quarantine(&staged);
+    if matches!(tool, Tool::Croc) {
+        let reported = croc_version_string(&staged.to_string_lossy())
+            .ok_or("Downloaded croc could not report its version")?;
+        verify_croc_version(&reported, release_tag)?;
+    }
+    staged.persist(output_path).map_err(|e| format!("Replace cached binary: {}", e.error))?;
+    Ok(())
 }
 
 // ── Croc Self-Update (`croc update`) ─────────────────────────────────
-// Managed croc is no longer version-pinned. Freshness is maintained via
-// the croc binary's own self-updater:
+// Managed croc is compatibility-pinned. The self-update machinery remains
+// available for a future verified release, but cannot replace the pin:
 //
 //   1. `croc update --check`  → detect whether an update is available.
 //   2. `croc update --yes`    → apply it non-interactively.
 //
-// Legacy cached binaries that predate the `update` subcommand cannot
-// self-update; for those we fall back to re-downloading the latest managed
-// release once (see `refresh_managed_croc_to_latest`), after which the
-// self-updater takes over.
+// Restoring a managed copy extracts the bundled patch while pinned.
 
 /// Result of `croc update --check`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CrocUpdateCheck {
+    Pinned { version: String },
     UpToDate {
         version: String,
         raw: String,
@@ -656,8 +640,10 @@ pub fn parse_croc_update_apply_output(output: &str) -> CrocUpdateApplyOutcome {
         };
     }
     let already_up_to_date = lower.contains("is up to date");
-    let not_writable = contains_package_manager_guidance(&lower);
     let needs_redownload = !already_up_to_date && is_self_update_refusal(&lower);
+    // A refused standalone update also prints "Upgrade with ..." guidance.
+    // Keep the refusal distinct so our managed copy reaches the fallback.
+    let not_writable = !needs_redownload && contains_package_manager_guidance(&lower);
     let mut updated = lower.contains("updated croc from");
     let mut new_version: Option<String> = None;
     // "Updated croc from v11.2.5 to v11.5.0."
@@ -685,42 +671,73 @@ pub fn parse_croc_update_apply_output(output: &str) -> CrocUpdateApplyOutcome {
 }
 
 fn run_croc_command(binary: &str, args: &[&str], stdin_input: Option<&[u8]>) -> Result<String, String> {
-    use std::io::Write;
-
+    use std::io::{Read, Write};
     let mut cmd = new_hidden_command(binary);
-    cmd.args(args);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    if stdin_input.is_some() {
-        cmd.stdin(Stdio::piped());
-    } else {
-        cmd.stdin(Stdio::null());
-    }
-    // Run from temp dir so croc never touches the app working directory.
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(if stdin_input.is_some() { Stdio::piped() } else { Stdio::null() });
     cmd.current_dir(std::env::temp_dir());
-
     let mut child = cmd.spawn().map_err(|e| format!("Failed to start croc: {e}"))?;
     if let Some(input) = stdin_input {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(input);
-            // stdin is closed on drop so the child sees EOF.
         }
     }
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("Failed to wait for croc: {e}"))?;
-    let mut combined = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    if !stderr.is_empty() {
-        if !combined.is_empty() {
-            combined.push('\n');
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let out_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        bytes
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr.read_to_end(&mut bytes);
+        bytes
+    });
+    let limit = if args == ["--version"] { 10 } else { 210 };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(limit);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(format!("croc {} timed out after {limit}s", args.join(" ")));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(format!("Failed to wait for croc: {e}"));
+            }
         }
-        combined.push_str(&stderr);
+    };
+    let out = out_reader.join().unwrap_or_default();
+    let err = err_reader.join().unwrap_or_default();
+    let mut combined = String::from_utf8_lossy(&out).to_string();
+    if !err.is_empty() {
+        if !combined.is_empty() { combined.push('\n'); }
+        combined.push_str(&String::from_utf8_lossy(&err));
+    }
+    let status = status?;
+    // Old croc versions reject `update` with a nonzero status; callers need
+    // that output for migration. Actual network/process errors must surface.
+    if !status.success()
+        && !matches!(parse_croc_update_check_output(&combined), CrocUpdateCheck::Unsupported { .. } | CrocUpdateCheck::NotWritable { .. })
+        && !is_self_update_refusal(&combined.to_lowercase())
+    {
+        return Err(format!("croc exited with {status}: {}", combined.trim()));
     }
     Ok(combined)
 }
 
 /// Run `croc update --check` and parse the result.
 pub fn croc_update_check(binary: &str) -> Result<CrocUpdateCheck, String> {
+    if CROC_COMPATIBILITY_PINNED {
+        return Ok(CrocUpdateCheck::Pinned { version: SUPPORTED_CROC_VERSION.to_string() });
+    }
     let output = run_croc_command(binary, &["update", "--check"], None)?;
     Ok(parse_croc_update_check_output(&output))
 }
@@ -731,11 +748,14 @@ pub fn croc_update_check(binary: &str) -> Result<CrocUpdateCheck, String> {
 /// invocations: a decline/cancel surfaces as `updated == false`, which the
 /// caller treats as a no-op.
 pub fn croc_update_apply(binary: &str) -> Result<CrocUpdateApplyOutcome, String> {
+    if CROC_COMPATIBILITY_PINNED {
+        return Err(format!("croc {SUPPORTED_CROC_VERSION} is pinned for relay compatibility"));
+    }
     // Fast path: `--yes` skips the prompt when self-update is safe.
     let output = run_croc_command(binary, &["update", "--yes"], None)?;
     let mut outcome = parse_croc_update_apply_output(&output);
-    if outcome.updated || outcome.already_up_to_date || outcome.not_writable {
-        return Ok(outcome);
+    if outcome.updated || outcome.already_up_to_date || outcome.not_writable || outcome.needs_redownload {
+        return verify_croc_update_result(binary, outcome);
     }
     // If --yes was rejected (very old/new flag variants) or the prompt is
     // still pending, answer `y` explicitly.
@@ -747,34 +767,36 @@ pub fn croc_update_apply(binary: &str) -> Result<CrocUpdateApplyOutcome, String>
         let fallback = run_croc_command(binary, &["update"], Some(b"y\n"))?;
         outcome = parse_croc_update_apply_output(&fallback);
     }
+    verify_croc_update_result(binary, outcome)
+}
+
+fn verify_croc_update_result(binary: &str, outcome: CrocUpdateApplyOutcome) -> Result<CrocUpdateApplyOutcome, String> {
+    if outcome.updated {
+        let expected = outcome.new_version.as_deref().ok_or("croc reported success without a version")?;
+        let reported = croc_version_string(binary).ok_or("Updated croc could not report its installed version")?;
+        verify_croc_version(&reported, expected)?;
+    }
     Ok(outcome)
+}
+
+fn verify_croc_version(reported: &str, expected: &str) -> Result<(), String> {
+    let expected = format!("croc version {}", expected.trim_start_matches('v'));
+    if reported.trim() != expected {
+        return Err(format!("croc reports {reported:?}; expected {expected:?}"));
+    }
+    Ok(())
 }
 
 /// Best-effort `croc --version` string (without managed/system suffix).
 pub fn croc_version_string(binary: &str) -> Option<String> {
-    let output = new_hidden_command(binary)
-        .arg("--version")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let ver = if stdout.is_empty() { stderr } else { stdout };
-    if ver.is_empty() {
-        None
-    } else {
-        Some(ver)
-    }
+    let output = run_croc_command(binary, &["--version"], None).ok()?;
+    let version = output.trim();
+    (!version.is_empty()).then(|| version.to_string())
 }
 
-/// Re-download the latest managed croc release, replacing the cached binary.
-/// Used once to migrate legacy binaries that predate `croc update`.
-pub fn refresh_managed_croc_to_latest() -> Option<PathBuf> {
-    let output_path = managed_binary_path(&Tool::Croc);
-    let _ = fs::remove_file(&output_path);
-    install_managed_binary(&Tool::Croc)
+/// Restore the bundled patched engine (download latest only when unpinned).
+pub fn refresh_managed_croc_to_latest() -> Result<PathBuf, String> {
+    download_managed_binary(&Tool::Croc)
 }
 
 /// Re-run version detection for croc after an update so the home page
@@ -783,18 +805,14 @@ pub fn redetect_croc_status(bundled_croc: Option<&PathBuf>) -> ToolStatus {
     detect_tool_with_bundled(&Tool::Croc, bundled_croc)
 }
 
-/// Fast, non-blocking half of startup init: embedded extract + cached reuse
-/// only — never touches the network. When the managed croc is missing, the
-/// caller must run `install_managed_binary` on a background thread and
-/// re-detect afterwards; downloading here would hang first paint (on macOS
-/// the dock icon bounces forever with no window until startup returns).
+/// Startup extraction and cached reuse; never touches the network or executes
+/// Croc. Version probes and quarantine handling run on a worker.
 pub fn init_bundled_binaries_fast() -> (Option<PathBuf>, Option<PathBuf>) {
-    let mut croc_path = extract_bundled_binary(&managed_binary_name(&Tool::Croc), CROC_GZ);
+    let mut croc_path = if CROC_GZ.is_empty() { None } else { restore_bundled_croc().ok() };
 
     // Prefer managed Croc binaries on every platform for consistent behavior.
-    // With no cached copy, detection falls back to system PATH until a
-    // background install lands.
-    if croc_path.is_none() {
+    // Only a version-verified system copy may stand in during background install.
+    if croc_path.is_none() && CROC_GZ.is_empty() {
         croc_path = cached_managed_binary(&Tool::Croc);
     }
 
@@ -810,24 +828,10 @@ fn detect_tool_with_bundled(tool: &Tool, bundled_path: Option<&PathBuf>) -> Tool
     // Try managed binary first
     if let Some(bp) = bundled_path {
         if bp.exists() {
-            let mut cmd = new_hidden_command(bp);
-
-            let version = cmd
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .ok()
-                .and_then(|o| {
-                    let stdout = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                    let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                    let ver = if stdout.is_empty() { stderr } else { stdout };
-                    if ver.is_empty() {
-                        None
-                    } else {
-                        Some(format!("{} (managed)", ver))
-                    }
-                });
+            #[cfg(target_os = "macos")]
+            strip_quarantine(bp);
+            let version = croc_version_string(&bp.to_string_lossy())
+                .map(|version| format!("{version} (managed)"));
 
             return ToolStatus {
                 tool: tool.clone(),
@@ -842,29 +846,14 @@ fn detect_tool_with_bundled(tool: &Tool, bundled_path: Option<&PathBuf>) -> Tool
     let name = tool.name();
     let sys_path = which::which(name).ok();
     let path_str = sys_path.as_ref().map(|p| p.to_string_lossy().to_string());
-    let available = path_str.is_some();
-
-    let version = if let Some(path) = sys_path {
-        let mut cmd = new_hidden_command(path);
-
-        cmd.arg("--version")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .ok()
-            .and_then(|o| {
-                let stdout = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                let ver = if stdout.is_empty() { stderr } else { stdout };
-                if ver.is_empty() {
-                    None
-                } else {
-                    Some(format!("{} (system)", ver))
-                }
-            })
+    let reported = if let Some(path) = sys_path {
+        croc_version_string(&path.to_string_lossy())
     } else {
         None
     };
+    let available = path_str.is_some() && (!matches!(tool, Tool::Croc)
+        || reported.as_deref().is_some_and(|version| verify_croc_version(version, SUPPORTED_CROC_VERSION).is_ok()));
+    let version = reported.map(|version| format!("{version} (system)"));
 
     ToolStatus {
         tool: tool.clone(),
@@ -872,6 +861,18 @@ fn detect_tool_with_bundled(tool: &Tool, bundled_path: Option<&PathBuf>) -> Tool
         path: path_str,
         version,
     }
+}
+
+/// Initial status without executing croc: safe before first paint.
+pub fn detect_tool_paths(bundled_croc: Option<&PathBuf>) -> Vec<ToolStatus> {
+    // A system copy is only eligible after background version verification.
+    let path = bundled_croc.filter(|path| path.exists()).cloned();
+    vec![ToolStatus {
+        tool: Tool::Croc,
+        available: path.is_some(),
+        path: path.map(|path| path.to_string_lossy().to_string()),
+        version: None,
+    }, detect_native_sendme()]
 }
 
 pub fn detect_all_tools(
@@ -1221,7 +1222,7 @@ fn format_sender_request_line(state: &SenderRequestRenderState) -> String {
 fn read_lines_cr_aware(
     reader: impl Read + Send + 'static,
     tx: mpsc::Sender<TransferMsg>,
-    parser: fn(&str, &mpsc::Sender<TransferMsg>, &Arc<AtomicBool>),
+    parser: impl Fn(&str, &mpsc::Sender<TransferMsg>, &Arc<AtomicBool>),
     cancel: Arc<AtomicBool>,
 ) {
     let mut reader = BufReader::new(reader);
@@ -1263,201 +1264,371 @@ fn read_lines_cr_aware(
     }
 }
 
-// ── Croc Send ──────────────────────────────────────────────────────
+// ── Croc transfers ─────────────────────────────────────────────────
+
+#[derive(Default)]
+struct CrocAttemptOutput {
+    code: Option<String>,
+    error: Option<String>,
+    error_from_stdout: bool,
+    payload_started: bool,
+}
+
+impl CrocAttemptOutput {
+    fn observe(&mut self, line: &str, is_stdout: bool) {
+        let cleaned = strip_ansi(line);
+        let line = cleaned.trim();
+        if let Some(code) = extract_croc_code(line) {
+            self.code = Some(code);
+        }
+        self.payload_started |= parse_croc_direction(line).is_some();
+        let lower = line.to_lowercase();
+        if lower.contains("could not connect")
+            || lower.starts_with("could not ")
+            || lower.contains("relay connection failed")
+            || lower.contains("decompress")
+            || lower.contains("corrupt input")
+            || lower.contains("error:")
+            || lower.contains("failed:")
+            || lower.contains("room not found")
+            || lower.contains("room is full")
+            || lower.contains("connection reset")
+            || lower.contains("connection refused")
+            || lower.contains("no public relay")
+            || lower.contains("relay closed")
+            || lower == "eof"
+        {
+            // croc prints its returned error on stdout at exit. A stderr
+            // reader draining older warnings later must not replace it.
+            if lower.starts_with("close decompressor:") && self.error_from_stdout {
+                return; // Preserve the primary decoding error, not its duplicate close error.
+            }
+            if is_stdout || !self.error_from_stdout {
+                self.error = Some(line.to_owned());
+                self.error_from_stdout = is_stdout;
+            }
+        }
+    }
+
+    fn dns_relay(&self) -> Option<String> {
+        if self.payload_started {
+            return None;
+        }
+        relay_dns_endpoint(self.error.as_deref()?)
+    }
+}
+
+/// Only retry the exact public relay named in a terminal DNS error. Croc's
+/// code-to-relay routing must not be changed, or the peers join different rooms.
+fn relay_dns_endpoint(line: &str) -> Option<String> {
+    let lower = line.to_lowercase();
+    let (_, lookup) = lower.split_once("lookup ")?;
+    let (host, cause) = lookup.split_once(':')?;
+    let host = host.trim();
+    if ![
+        "i/o timeout",
+        "no such host",
+        "server misbehaving",
+        "temporary failure",
+    ]
+    .iter()
+    .any(|cause_text| cause.contains(cause_text))
+    {
+        return None;
+    }
+    if !matches!(
+        host,
+        "1.getcroc.com"
+            | "2.getcroc.com"
+            | "3.getcroc.com"
+            | "4.getcroc.com"
+            | "croc.schollz.com"
+            | "croc6.schollz.com"
+            | "ipv4.getcroc.com"
+            | "ipv6.getcroc.com"
+    ) {
+        return None;
+    }
+    // Keep the original port, including non-default deployments. Do not infer
+    // an endpoint from just an unrelated mention of a DNS failure in a log.
+    let (_, destination) = lower.split_once("could not connect to ")?;
+    let endpoint = destination.split(": ").next()?;
+    let (endpoint_host, port) = endpoint.rsplit_once(':')?;
+    if endpoint_host != host || port.parse::<u16>().ok()? == 0 {
+        return None;
+    }
+    Some(endpoint.to_owned())
+}
+
+fn resolve_croc_relay(endpoint: &str) -> Option<String> {
+    // Rust uses the host resolver. Go's netgo releases can time out even while
+    // the host can resolve the same name. Resolve anew, never hardcode relay IPs.
+    let addresses: Vec<_> = endpoint.to_socket_addrs().ok()?.collect();
+    addresses
+        .iter()
+        .find(|address| address.is_ipv4())
+        .or_else(|| addresses.first())
+        .map(ToString::to_string)
+}
+
+static CROC_CODE_WORDS: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+    include_str!("../assets/wordlists/eff-short-wordlist-1.txt")
+        .lines()
+        .collect()
+});
+
+fn random_croc_code() -> String {
+    // Match croc's default: three independent, uniformly selected EFF words.
+    // Generate locally so relay selection can use system DNS without croc's
+    // one-second probe race. rand::rng() is seeded from operating-system entropy.
+    let mut rng = rand::rng();
+    let words: [&str; 3] = std::array::from_fn(|_| {
+        CROC_CODE_WORDS
+            .choose(&mut rng)
+            .copied()
+            .expect("croc word list is non-empty")
+    });
+    words.join("-")
+}
+
+/// Current croc web/CLI routing: SHA-256 of the exact UTF-8 code, interpreted
+/// big-endian, modulo the ordered four-relay pool. Pick the same relay as web
+/// peers without depending on croc's short probe race or its Go DNS resolver.
+fn croc_relay_for_code(code: &str) -> &'static str {
+    const RELAYS: [&str; 4] = [
+        "1.getcroc.com:9009",
+        "2.getcroc.com:9009",
+        "3.getcroc.com:9009",
+        "4.getcroc.com:9009",
+    ];
+    let digest = Sha256::digest(code.as_bytes());
+    RELAYS[(digest[digest.len() - 1] % 4) as usize]
+}
+
+fn croc_transfer_command(binary: &str, code: Option<&str>, relay: Option<&str>) -> Command {
+    let mut cmd = new_hidden_command(binary);
+    // A GUI must not let croc treat an inherited pipe as the payload instead
+    // of the selected files or --text. All these flags are global.
+    cmd.args(["--yes", "--ignore-stdin"]);
+    let custom_relay = ["CROC_RELAY", "CROC_RELAY6"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()));
+    let default_relay = if relay.is_none() && !custom_relay {
+        code.map(|code| {
+            let endpoint = croc_relay_for_code(code);
+            resolve_croc_relay(endpoint).unwrap_or_else(|| endpoint.to_string())
+        })
+    } else {
+        None
+    };
+    if let Some(relay) = relay.or(default_relay.as_deref()) {
+        cmd.arg("--relay").arg(relay);
+    }
+    if let Some(code) = code {
+        cmd.env("CROC_SECRET", code);
+    } else {
+        cmd.env_remove("CROC_SECRET");
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd.current_dir(std::env::temp_dir());
+    cmd
+}
+
+fn spawn_croc_transfer(
+    initial_code: Option<String>,
+    announce_code: bool,
+    make_command: impl Fn(Option<&str>, Option<&str>) -> Command + Send + 'static,
+    resolve_relay: impl Fn(&str) -> Option<String> + Send + 'static,
+) -> (mpsc::Receiver<TransferMsg>, ProcessHandle) {
+    let (tx, rx) = mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel2 = cancel.clone();
+    let child_pid = Arc::new(std::sync::Mutex::new(None));
+    let pid_handle = child_pid.clone();
+
+    thread::spawn(move || {
+        let mut code = initial_code;
+        let mut relay_override: Option<String> = None;
+        let mut dns_retried = false;
+        let _ = tx.send(TransferMsg::Started);
+        // At most one probe fallback and one DNS fallback, before payload
+        // transfer only. Never replay a partially completed transfer.
+        for _ in 0..3 {
+            if cancel2.load(Ordering::Relaxed) {
+                break;
+            }
+            let mut cmd = make_command(code.as_deref(), relay_override.as_deref());
+            let mut child = match cmd.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    let _ = tx.send(TransferMsg::Error(format!("Failed to start croc: {error}")));
+                    return;
+                }
+            };
+            if let Ok(mut pid) = pid_handle.lock() {
+                *pid = Some(child.id());
+                // Cover cancellation between the pre-spawn check and publishing
+                // the PID so a cancelled recovery cannot leave a child behind.
+                if cancel2.load(Ordering::Relaxed) {
+                    let _ = child.kill();
+                }
+            }
+            track_child_pid(child.id());
+            // The sender already knows its secret. Publish it independently
+            // of croc's human-readable command/clipboard output.
+            if announce_code {
+                if let Some(code) = &code {
+                    let _ = tx.send(TransferMsg::Code(code.clone()));
+                }
+            }
+            let output = Arc::new(std::sync::Mutex::new(CrocAttemptOutput::default()));
+            let readers: Vec<_> = [
+                child
+                    .stdout
+                    .take()
+                    .map(|r| (true, Box::new(r) as Box<dyn Read + Send>)),
+                child
+                    .stderr
+                    .take()
+                    .map(|r| (false, Box::new(r) as Box<dyn Read + Send>)),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|(is_stdout, reader)| {
+                let tx = tx.clone();
+                let cancel = cancel2.clone();
+                let output = output.clone();
+                thread::spawn(move || {
+                    read_lines_cr_aware(
+                        reader,
+                        tx,
+                        move |line, tx, cancel| {
+                            if let Ok(mut output) = output.lock() {
+                                output.observe(line, is_stdout);
+                            }
+                            parse_croc_output(line, tx, cancel);
+                        },
+                        cancel,
+                    )
+                })
+            })
+            .collect();
+            let status = child.wait();
+            untrack_child_pid(child.id());
+            if let Ok(mut pid) = pid_handle.lock() {
+                *pid = None;
+            }
+            for reader in readers {
+                let _ = reader.join();
+            }
+            if cancel2.load(Ordering::Relaxed) {
+                break;
+            }
+            let status = match status {
+                Ok(status) => status,
+                Err(error) => {
+                    let _ = tx.send(TransferMsg::Error(format!("Process error: {error}")));
+                    return;
+                }
+            };
+            if status.success() {
+                let _ = tx.send(TransferMsg::Completed);
+                return;
+            }
+            let output = output.lock().unwrap_or_else(|error| error.into_inner());
+            if code.is_none() {
+                code = output.code.clone();
+            }
+            if !output.payload_started
+                && code.is_none()
+                && output
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.to_lowercase().contains("no public relay available"))
+            {
+                // Newer croc releases give their public-relay probe race only
+                // one second. A custom secret bypasses that race and lets croc
+                // use its normal connection timeout and code-to-relay routing.
+                code = Some(random_croc_code());
+                let _ = tx.send(TransferMsg::Output(
+                    "Public relay probes failed; retrying with a fresh random code and croc's normal connection timeout.".to_string()
+                ));
+                continue;
+            }
+            if !dns_retried {
+                if let Some(endpoint) = output.dns_relay() {
+                    dns_retried = true;
+                    if code.is_some() {
+                        relay_override = resolve_relay(&endpoint);
+                    }
+                    let detail = if relay_override.is_some() {
+                        "retrying the same relay with the system-resolved address"
+                    } else {
+                        "retrying croc once"
+                    };
+                    let _ = tx.send(TransferMsg::Output(format!(
+                        "Relay DNS lookup failed; {detail}."
+                    )));
+                    continue;
+                }
+            }
+            let error = output
+                .error
+                .clone()
+                .unwrap_or_else(|| format!("Process exited with code: {status}"));
+            let _ = tx.send(TransferMsg::Error(error));
+            return;
+        }
+        let _ = tx.send(TransferMsg::Error("Transfer cancelled".to_string()));
+    });
+    (rx, ProcessHandle { cancel, child_pid })
+}
 
 pub fn croc_send(
     opts: CrocSendOptions,
     binary_path: &str,
 ) -> (mpsc::Receiver<TransferMsg>, ProcessHandle) {
-    let (tx, rx) = mpsc::channel();
-    let cancel = Arc::new(AtomicBool::new(false));
-    let cancel2 = cancel.clone();
-    let child_pid = Arc::new(std::sync::Mutex::new(None));
-    let pid_handle = child_pid.clone();
-    let binary = binary_path.to_string();
-
-    let _worker = thread::spawn(move || {
-        let mut cmd = new_hidden_command(&binary);
-
-        // --yes is a GLOBAL flag, must come before the subcommand
-        cmd.arg("--yes");
-        cmd.arg("send");
-
-        if let Some(code) = &opts.custom_code {
-            cmd.env("CROC_SECRET", code);
-        }
-        if opts.text_mode {
-            cmd.arg("--text");
-            if let Some(text) = &opts.text_value {
-                cmd.arg(text);
+    let binary = binary_path.to_owned();
+    let code = opts.custom_code.clone().unwrap_or_else(random_croc_code);
+    spawn_croc_transfer(
+        Some(code),
+        true,
+        move |code, relay| {
+            let mut cmd = croc_transfer_command(&binary, code, relay);
+            cmd.arg("send");
+            if opts.text_mode {
+                if let Some(text) = &opts.text_value {
+                    cmd.arg("--text").arg(text);
+                }
+            } else {
+                // Stop option parsing so a filename beginning with '-' is a path.
+                cmd.arg("--").args(&opts.paths);
             }
-        } else {
-            for path in &opts.paths {
-                cmd.arg(path);
-            }
-        }
-
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        // Use temp dir for execution to ensure croc can write/remove its internal temp files
-        cmd.current_dir(std::env::temp_dir());
-
-        let _ = tx.send(TransferMsg::Started);
-
-        match cmd.spawn() {
-            Ok(mut child) => {
-                if let Ok(mut guard) = pid_handle.lock() {
-                    *guard = Some(child.id());
-                }
-                // Tracked for tray instant-quit (see kill_all_tracked_children).
-                track_child_pid(child.id());
-
-                let stderr = child.stderr.take();
-                let stdout = child.stdout.take();
-
-                let tx2 = tx.clone();
-                let c2 = cancel2.clone();
-                let stderr_thread = stderr.map(|stderr| {
-                    thread::spawn(move || {
-                        read_lines_cr_aware(stderr, tx2, parse_croc_output, c2);
-                    })
-                });
-
-                let tx3 = tx.clone();
-                let c3 = cancel2.clone();
-                let stdout_thread = stdout.map(|stdout| {
-                    thread::spawn(move || {
-                        read_lines_cr_aware(stdout, tx3, parse_croc_output, c3);
-                    })
-                });
-
-                let status = child.wait();
-                untrack_child_pid(child.id());
-                if let Some(h) = stderr_thread {
-                    let _ = h.join();
-                }
-                if let Some(h) = stdout_thread {
-                    let _ = h.join();
-                }
-                if cancel2.load(Ordering::Relaxed) {
-                    let _ = tx.send(TransferMsg::Error("Transfer cancelled".to_string()));
-                    return;
-                }
-                match status {
-                    Ok(s) if s.success() => {
-                        let _ = tx.send(TransferMsg::Completed);
-                    }
-                    Ok(s) => {
-                        let _ = tx.send(TransferMsg::Error(format!(
-                            "Process exited with code: {}",
-                            s
-                        )));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(TransferMsg::Error(format!("Process error: {}", e)));
-                    }
-                }
-            }
-            Err(e) => {
-                let _ = tx.send(TransferMsg::Error(format!("Failed to start croc: {}", e)));
-            }
-        }
-    });
-
-    (rx, ProcessHandle { cancel, child_pid })
+            cmd
+        },
+        resolve_croc_relay,
+    )
 }
-
-// ── Croc Receive ───────────────────────────────────────────────────
 
 pub fn croc_receive(
     opts: CrocReceiveOptions,
     binary_path: &str,
 ) -> (mpsc::Receiver<TransferMsg>, ProcessHandle) {
-    let (tx, rx) = mpsc::channel();
-    let cancel = Arc::new(AtomicBool::new(false));
-    let cancel2 = cancel.clone();
-    let child_pid = Arc::new(std::sync::Mutex::new(None));
-    let pid_handle = child_pid.clone();
-    let binary = binary_path.to_string();
-
-    let _worker = thread::spawn(move || {
-        let mut cmd = new_hidden_command(&binary);
-
-        // croc v10.3.1: code must be passed via CROC_SECRET env var
-        // (passing code as CLI arg is no longer supported in non-classic mode)
-        cmd.env("CROC_SECRET", &opts.code);
-        cmd.arg("--yes");
-
-        if let Some(dir) = &opts.output_dir {
-            cmd.arg("--out").arg(dir);
-        }
-
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        // Use temp dir for execution to ensure croc can write/remove its internal temp files safely
-        cmd.current_dir(std::env::temp_dir());
-
-        let _ = tx.send(TransferMsg::Started);
-
-        match cmd.spawn() {
-            Ok(mut child) => {
-                if let Ok(mut guard) = pid_handle.lock() {
-                    *guard = Some(child.id());
-                }
-                // Tracked for tray instant-quit (see kill_all_tracked_children).
-                track_child_pid(child.id());
-
-                let stderr = child.stderr.take();
-                let stdout = child.stdout.take();
-
-                let tx2 = tx.clone();
-                let c2 = cancel2.clone();
-                let stderr_thread = stderr.map(|stderr| {
-                    thread::spawn(move || {
-                        read_lines_cr_aware(stderr, tx2, parse_croc_output, c2);
-                    })
-                });
-
-                let tx3 = tx.clone();
-                let c3 = cancel2.clone();
-                let stdout_thread = stdout.map(|stdout| {
-                    thread::spawn(move || {
-                        read_lines_cr_aware(stdout, tx3, parse_croc_output, c3);
-                    })
-                });
-
-                let status = child.wait();
-                untrack_child_pid(child.id());
-                if let Some(h) = stderr_thread {
-                    let _ = h.join();
-                }
-                if let Some(h) = stdout_thread {
-                    let _ = h.join();
-                }
-                if cancel2.load(Ordering::Relaxed) {
-                    let _ = tx.send(TransferMsg::Error("Transfer cancelled".to_string()));
-                    return;
-                }
-                match status {
-                    Ok(s) if s.success() => {
-                        let _ = tx.send(TransferMsg::Completed);
-                    }
-                    Ok(s) => {
-                        let _ = tx.send(TransferMsg::Error(format!(
-                            "Process exited with code: {}",
-                            s
-                        )));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(TransferMsg::Error(format!("Process error: {}", e)));
-                    }
-                }
+    let binary = binary_path.to_owned();
+    spawn_croc_transfer(
+        Some(opts.code),
+        false,
+        move |code, relay| {
+            let mut cmd = croc_transfer_command(&binary, code, relay);
+            if let Some(dir) = &opts.output_dir {
+                cmd.arg("--out").arg(dir);
             }
-            Err(e) => {
-                let _ = tx.send(TransferMsg::Error(format!("Failed to start croc: {}", e)));
-            }
-        }
-    });
-
-    (rx, ProcessHandle { cancel, child_pid })
+            cmd
+        },
+        resolve_croc_relay,
+    )
 }
 
 // ── Sendme Send ────────────────────────────────────────────────────
@@ -2204,8 +2375,8 @@ fn extract_croc_code(trimmed: &str) -> Option<String> {
         }
     }
 
-    // croc 11.5.0 sender shape: `croc <code> (code copied to clipboard)`.
-    // Older releases log `Code is: <code>` (handled above). The paren
+    // Sender shapes include `croc <code> (code copied to clipboard)` and
+    // `croc --relay <address> <code> (code copied to clipboard)`. The paren
     // requirement distinguishes the code line from subcommand echoes
     // (`croc send …`, `croc relay`, …) which never carry `(…)` directly.
     {
@@ -2220,13 +2391,18 @@ fn extract_croc_code(trimmed: &str) -> Option<String> {
             .get(..5)
             .is_some_and(|head| head.eq_ignore_ascii_case("croc "));
         if is_croc_prefix {
-            let rest = text[5..].trim_start();
-            if let Some(space) = rest.find(char::is_whitespace) {
-                let token = rest[..space].trim_matches('"');
-                let tail = rest[space..].trim_start();
+            let mut tokens = text[5..].split_whitespace();
+            let mut token = tokens.next()?;
+            while matches!(token, "--relay" | "--relay6") {
+                tokens.next()?; // relay address, not the secret
+                token = tokens.next()?;
+            }
+            let token = token.trim_matches('"');
+            if let Some(tail) = tokens.next() {
                 if tail.starts_with('(')
                     && !token.is_empty()
                     && !token.starts_with('-')
+                    && !matches!(token, "send" | "relay" | "update" | "upgrade" | "store" | "ssh" | "help")
                     && !token.contains(['/', '\\', ':', '?', '#'])
                 {
                     return Some(token.to_string());
@@ -2381,6 +2557,454 @@ pub(crate) fn kill_all_tracked_children() {
 #[cfg(test)]
 mod tests {
     use super::cleanup_sendme_send_dirs;
+
+    const CROC_DNS_ERROR: &str = "could not connect to 1.getcroc.com:9009: 1.getcroc.com:9009: comm.NewConnection failed: dial tcp: lookup 1.getcroc.com: i/o timeout";
+
+    fn assert_croc_word_code(code: &str) {
+        let mut remaining = code;
+        for index in 0..3 {
+            // "yo-yo" is one upstream word, even though it contains a hyphen.
+            let word = super::CROC_CODE_WORDS.iter().find(|word| {
+                remaining == **word || remaining.strip_prefix(**word).is_some_and(|tail| tail.starts_with('-'))
+            }).expect("code must use the upstream croc word list");
+            remaining = remaining.strip_prefix(*word).unwrap();
+            if index < 2 { remaining = remaining.strip_prefix('-').expect("three words are required"); }
+        }
+        assert!(remaining.is_empty(), "code must contain exactly three words");
+    }
+
+    #[test]
+    fn croc_random_codes_match_the_cli_word_format() {
+        use sha2::Digest;
+        assert_eq!(super::CROC_CODE_WORDS.len(), 1296);
+        let canonical = super::CROC_CODE_WORDS.join("\n") + "\n";
+        let checksum: String = super::Sha256::digest(canonical.as_bytes()).iter()
+            .map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(checksum,
+            "36ecca49e4fa20ca84b176c32f2e9c82f98f446585190e75f9879a95c08247bf");
+        assert_croc_word_code("lip-swab-jab");
+        assert_croc_word_code("yo-yo-swab-yo-yo");
+        for _ in 0..100 { assert_croc_word_code(&super::random_croc_code()); }
+    }
+
+    #[test]
+    fn croc_codes_match_current_web_relay_routing() {
+        for (code, endpoint) in [
+            ("stew-skate-blog", "4.getcroc.com:9009"),
+            ("maker-decal-from", "4.getcroc.com:9009"),
+            ("databeam-test-60787ae3cac17f94", "1.getcroc.com:9009"),
+        ] {
+            assert_eq!(super::croc_relay_for_code(code), endpoint);
+        }
+    }
+
+    #[test]
+    fn managed_croc_pin_cannot_be_undone_by_self_update() {
+        assert_eq!(
+            super::croc_update_check("unused").unwrap(),
+            super::CrocUpdateCheck::Pinned {
+                version: super::SUPPORTED_CROC_VERSION.to_string()
+            }
+        );
+        assert!(super::croc_update_apply("unused")
+            .unwrap_err()
+            .contains("pinned"));
+        assert!(super::managed_binary_path(&super::Tool::Croc)
+            .to_string_lossy()
+            .contains(&format!("croc-{}", super::SUPPORTED_CROC_VERSION)));
+    }
+
+    #[test]
+    fn croc_dns_recovery_requires_the_failed_relay_endpoint() {
+        assert_eq!(
+            super::relay_dns_endpoint(CROC_DNS_ERROR).as_deref(),
+            Some("1.getcroc.com:9009")
+        );
+        assert_eq!(
+            super::relay_dns_endpoint(&CROC_DNS_ERROR.replace(":9009", ":9011")).as_deref(),
+            Some("1.getcroc.com:9011")
+        );
+        for line in [
+            "dial tcp: lookup 1.getcroc.com: i/o timeout",
+            "could not connect to 2.getcroc.com:9009: lookup 1.getcroc.com: i/o timeout",
+            "could not connect to custom.example:9009: lookup custom.example: i/o timeout",
+            "could not connect to 1.getcroc.com:9009: connection refused",
+            "decompress data: flate: corrupt input before offset 6",
+        ] {
+            assert_eq!(super::relay_dns_endpoint(line), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn croc_final_compression_error_wins_over_earlier_dns_warning() {
+        let mut output = super::CrocAttemptOutput::default();
+        output.observe(CROC_DNS_ERROR, false);
+        assert!(output.dns_relay().is_some());
+        let error = "decompress data: flate: corrupt input before offset 6";
+        output.observe(error, true);
+        // A stderr reader can drain an old warning after the final stdout error.
+        output.observe(CROC_DNS_ERROR, false);
+        assert_eq!(output.error.as_deref(), Some(error));
+        assert_eq!(output.dns_relay(), None);
+    }
+
+    fn fake_croc(lines: &[&str], exit_code: i32) -> std::process::Command {
+        #[cfg(windows)]
+        {
+            let script = lines
+                .iter()
+                .map(|line| format!("Write-Output '{}';", line.replace('\'', "''")))
+                .collect::<String>()
+                + &format!("exit {exit_code}");
+            let mut cmd = super::new_hidden_command("powershell.exe");
+            cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+            cmd.stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            cmd
+        }
+        #[cfg(not(windows))]
+        {
+            let script = lines
+                .iter()
+                .map(|line| format!("printf '%s\\n' '{}';", line.replace('\'', "'\\''")))
+                .collect::<String>()
+                + &format!("exit {exit_code}");
+            let mut cmd = super::new_hidden_command("sh");
+            cmd.args(["-c", &script]);
+            cmd.stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            cmd
+        }
+    }
+
+    fn croc_terminal_message(
+        rx: std::sync::mpsc::Receiver<super::TransferMsg>,
+    ) -> super::TransferMsg {
+        loop {
+            let msg = rx
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .expect("croc terminated");
+            if matches!(
+                msg,
+                super::TransferMsg::Completed | super::TransferMsg::Error(_)
+            ) {
+                return msg;
+            }
+        }
+    }
+
+    #[test]
+    fn croc_sender_announces_its_code_without_cli_code_output() {
+        for sender in [true, false] {
+            let code = "lip-swab-jab";
+            let (rx, _) = super::spawn_croc_transfer(
+                Some(code.to_string()),
+                sender,
+                |_, _| fake_croc(&[], 0),
+                |_| panic!("successful child must not retry"),
+            );
+            let next = || rx.recv_timeout(std::time::Duration::from_secs(15)).unwrap();
+            assert!(matches!(next(), super::TransferMsg::Started));
+            if sender {
+                assert!(matches!(next(), super::TransferMsg::Code(actual) if actual == code));
+            }
+            assert!(matches!(next(), super::TransferMsg::Completed));
+        }
+    }
+
+    #[test]
+    fn croc_dns_recovery_preserves_generated_code_and_only_retries_once() {
+        use std::sync::{Arc, Mutex};
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let (rx, handle) = super::spawn_croc_transfer(
+            None,
+            true,
+            move |code, relay| {
+                let mut calls = recorded.lock().unwrap();
+                calls.push((code.map(str::to_owned), relay.map(str::to_owned)));
+                if calls.len() == 1 {
+                    fake_croc(
+                        &[
+                            "croc birch-coral-otter (code copied to clipboard)",
+                            CROC_DNS_ERROR,
+                        ],
+                        1,
+                    )
+                } else {
+                    fake_croc(&[CROC_DNS_ERROR], 1)
+                }
+            },
+            |endpoint| {
+                assert_eq!(endpoint, "1.getcroc.com:9009");
+                Some("127.0.0.2:9009".to_string())
+            },
+        );
+        assert!(
+            matches!(croc_terminal_message(rx), super::TransferMsg::Error(error) if error == CROC_DNS_ERROR)
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                (None, None),
+                (
+                    Some("birch-coral-otter".to_string()),
+                    Some("127.0.0.2:9009".to_string())
+                ),
+            ]
+        );
+        assert!(handle.child_pid.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn croc_probe_failure_can_recover_then_use_the_same_code_for_dns_recovery() {
+        use std::sync::{Arc, Mutex};
+        let codes = Arc::new(Mutex::new(Vec::new()));
+        let recorded = codes.clone();
+        let (rx, _) = super::spawn_croc_transfer(
+            None,
+            true,
+            move |code, relay| {
+                let mut codes = recorded.lock().unwrap();
+                codes.push(code.map(str::to_owned));
+                match codes.len() {
+                    1 => fake_croc(&["no public relay available"], 1),
+                    2 => fake_croc(&[CROC_DNS_ERROR], 1),
+                    3 => {
+                        assert_eq!(relay, Some("127.0.0.2:9009"));
+                        fake_croc(&["sent"], 0)
+                    }
+                    _ => panic!("unbounded retry"),
+                }
+            },
+            |_| Some("127.0.0.2:9009".to_string()),
+        );
+        assert!(matches!(
+            croc_terminal_message(rx),
+            super::TransferMsg::Completed
+        ));
+        let codes = codes.lock().unwrap();
+        assert_eq!(codes[0], None);
+        assert_croc_word_code(codes[1].as_deref().unwrap());
+        assert_eq!(codes[1], codes[2]);
+    }
+
+    #[test]
+    fn croc_never_replays_compression_errors_or_a_started_payload() {
+        for lines in [
+            vec!["decompress data: flate: corrupt input before offset 6"],
+            vec!["Receiving (<-142.132.189.179)", CROC_DNS_ERROR],
+        ] {
+            let (rx, _) = super::spawn_croc_transfer(
+                Some("test-secret".to_string()),
+                false,
+                move |_, relay| {
+                    assert!(relay.is_none());
+                    fake_croc(&lines, 1)
+                },
+                |_| panic!("must not retry after payload begins or for compression errors"),
+            );
+            assert!(matches!(
+                croc_terminal_message(rx),
+                super::TransferMsg::Error(_)
+            ));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires DATABEAM_CROC_TEST_BINARY; uses the configured croc relay"]
+    fn croc_real_text_and_file_round_trip() {
+        use super::{croc_receive, CrocReceiveOptions, CrocSendOptions, TransferMsg};
+        use std::time::{Duration, Instant};
+        let binary = std::env::var("DATABEAM_CROC_TEST_BINARY").expect("explicit test binary");
+        let temp = tempfile::tempdir().unwrap();
+        let text = "DataBeam live regression test — hello from croc";
+        let random: Vec<u8> = (0..262144).map(|_| rand::random()).collect();
+        let repeated = vec![b'x'; 262144];
+        for (text_mode, receiver_first) in [(true, false), (true, true), (false, false), (false, true)] {
+            let output = temp.path().join(format!("{}-{receiver_first}", if text_mode { "text" } else { "files" }));
+            std::fs::create_dir(&output).unwrap();
+            let source_a = temp.path().join("random.bin");
+            let source_b = temp.path().join("compressed.txt");
+            std::fs::write(&source_a, &random).unwrap();
+            std::fs::write(&source_b, &repeated).unwrap();
+            let code = super::random_croc_code();
+            let opts = CrocSendOptions {
+                paths: if text_mode {
+                    vec![]
+                } else {
+                    vec![source_a, source_b]
+                },
+                custom_code: Some(code.clone()),
+                text_mode,
+                text_value: text_mode.then(|| text.to_string()),
+            };
+            let start_receiver = || croc_receive(
+                CrocReceiveOptions { code: code.clone(), output_dir: Some(output.clone()) }, &binary,
+            );
+            let waiting_receiver = if receiver_first {
+                let receiver = start_receiver();
+                // Leave time for the relay to deliver keepalives before the
+                // sender joins: the timing missed by sender-first smoke tests.
+                std::thread::sleep(Duration::from_secs(3));
+                Some(receiver)
+            } else { None };
+            // Force this integration test through the configured relay so LAN
+            // discovery cannot make a broken public-relay path appear healthy.
+            let sender_binary = binary.clone();
+            let (sender, send_handle) = super::spawn_croc_transfer(
+                Some(code.clone()),
+                true,
+                move |code, relay| {
+                    let mut cmd = super::croc_transfer_command(&sender_binary, code, relay);
+                    cmd.args(["send", "--no-local"]);
+                    if let Some(text) = &opts.text_value {
+                        cmd.arg("--text").arg(text);
+                    } else {
+                        cmd.arg("--").args(&opts.paths);
+                    }
+                    cmd
+                },
+                super::resolve_croc_relay,
+            );
+            let (receiver, receive_handle) = waiting_receiver.unwrap_or_else(start_receiver);
+            let deadline = Instant::now() + Duration::from_secs(90);
+            let mut sent = false;
+            let mut received = false;
+            let mut received_text = false;
+            let mut announced_code = false;
+            let mut error = None;
+            while Instant::now() < deadline && error.is_none() && !(sent && received) {
+                for (is_receiver, rx) in [(false, &sender), (true, &receiver)] {
+                    while let Ok(msg) = rx.try_recv() {
+                        match msg {
+                            TransferMsg::Code(value) if !is_receiver => {
+                                assert_eq!(value, code);
+                                assert!(!sent, "code must reach the UI before completion");
+                                announced_code = true;
+                            }
+                            TransferMsg::Completed if is_receiver => received = true,
+                            TransferMsg::Completed => sent = true,
+                            TransferMsg::Error(message) => error = Some(message),
+                            TransferMsg::Output(line) => {
+                                eprintln!(
+                                    "{}: {line}",
+                                    if is_receiver { "receiver" } else { "sender" }
+                                );
+                                if is_receiver && line.contains(text) {
+                                    received_text = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            send_handle.request_cancel();
+            receive_handle.request_cancel();
+            assert!(error.is_none(), "{error:?}");
+            assert!(sent && received, "transfer timed out");
+            assert!(announced_code, "sender did not publish the share code");
+            if text_mode {
+                assert!(received_text, "text bytes did not arrive");
+            } else {
+                assert_eq!(std::fs::read(output.join("random.bin")).unwrap(), random);
+                assert_eq!(
+                    std::fs::read(output.join("compressed.txt")).unwrap(),
+                    repeated
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual croc web interop: DATABEAM_CROC_TEST_BINARY, DATABEAM_CROC_WEB_CODE, DATABEAM_CROC_WEB_MODE"]
+    fn croc_web_text_interop() {
+        let binary = std::env::var("DATABEAM_CROC_TEST_BINARY").unwrap();
+        let code = std::env::var("DATABEAM_CROC_WEB_CODE").unwrap();
+        let mode = std::env::var("DATABEAM_CROC_WEB_MODE").unwrap();
+        let file = std::env::var_os("DATABEAM_CROC_WEB_FILE").map(std::path::PathBuf::from);
+        let text = "DataBeam croc regression test — text 2026-10-23";
+        let output = tempfile::tempdir().unwrap();
+        let (rx, handle) = if mode == "receive" {
+            super::croc_receive(
+                super::CrocReceiveOptions {
+                    code,
+                    output_dir: Some(output.path().to_owned()),
+                },
+                &binary,
+            )
+        } else {
+            assert_eq!(mode, "send");
+            super::croc_send(
+                super::CrocSendOptions {
+                    paths: file.clone().into_iter().collect(),
+                    custom_code: Some(code),
+                    text_mode: file.is_none(),
+                    text_value: file.is_none().then(|| text.to_owned()),
+                },
+                &binary,
+            )
+        };
+        let mut received = false;
+        let result = loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+                Ok(super::TransferMsg::Output(line)) => {
+                    received |= line.contains(text);
+                    eprintln!("{line}");
+                }
+                Ok(super::TransferMsg::Completed) => break Ok(()),
+                Ok(super::TransferMsg::Error(error)) => break Err(error),
+                Ok(_) => {}
+                Err(error) => break Err(error.to_string()),
+            }
+        };
+        handle.request_cancel();
+        result.unwrap();
+        if mode == "receive" {
+            if let Some(source) = file {
+                assert_eq!(std::fs::read(output.path().join(source.file_name().unwrap())).unwrap(),
+                    std::fs::read(source).unwrap(), "web file bytes did not match");
+            } else {
+                assert!(received, "text did not arrive intact");
+            }
+        }
+    }
+
+    #[test]
+    fn croc_bundled_engine_extracts_and_reports_patched_version() {
+        if super::CROC_GZ.is_empty() { return; } // unbundled development builds
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join(super::managed_binary_name(&super::Tool::Croc));
+        super::restore_bundled_croc_to(&binary, super::CROC_GZ, super::CROC_BINARY_SHA256).unwrap();
+        assert!(super::verify_croc_version(&super::croc_version_string(&binary.to_string_lossy()).unwrap(),
+            super::SUPPORTED_CROC_VERSION).is_ok());
+        assert!(super::verify_croc_version("croc version 11.2.5", super::SUPPORTED_CROC_VERSION).is_err());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn croc_bundle_repairs_bad_cache_and_preserves_it_on_invalid_payload() {
+        use std::io::Write;
+        use sha2::{Digest, Sha256};
+        let bytes = b"patched Croc fixture";
+        let hash: String = Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(bytes).unwrap();
+        let gzip = encoder.finish().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("croc");
+        std::fs::write(&binary, b"old unpatched copy").unwrap();
+        super::restore_bundled_croc_to(&binary, &gzip, &hash).unwrap();
+        assert_eq!(std::fs::read(&binary).unwrap(), bytes);
+        assert!(super::restore_bundled_croc_to(&binary, &gzip, "wrong hash").is_err());
+        assert_eq!(std::fs::read(&binary).unwrap(), bytes);
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+        assert!(super::restore_bundled_croc_to(&binary, &[], &hash).is_err());
+    }
     use std::fs;
 
     #[test]
@@ -2489,6 +3113,68 @@ mod tests {
     }
 
     #[test]
+    fn standalone_refusal_with_installer_guidance_reaches_download_fallback() {
+        for reason in [
+            "This installation is not registered as an official standalone install.",
+            "The official installer registration does not match the running executable.",
+            "This platform cannot safely replace the running executable in place.",
+        ] {
+            let output = format!("croc v11.5.1 is available (current: v11.5.0).\n{reason}\nUpgrade with the official installer: curl https://getcroc.com | bash\n");
+            let outcome = super::parse_croc_update_apply_output(&output);
+            assert!(outcome.needs_redownload, "{output}");
+            assert!(!outcome.not_writable, "{output}");
+        }
+        let package = super::parse_croc_update_apply_output(
+            "The running croc command resolves through a symlink and will not be overwritten.\nUpgrade with Homebrew: brew upgrade croc"
+        );
+        assert!(package.not_writable);
+        assert!(!package.needs_redownload);
+    }
+
+    #[test]
+    fn unchanged_installed_version_cannot_report_update_success() {
+        assert!(super::verify_croc_version("croc version 11.5.0", "v11.5.1").is_err());
+        assert!(super::verify_croc_version("croc version 11.5.1\n", "v11.5.1").is_ok());
+        assert!(super::verify_croc_version("", "v11.5.1").is_err());
+    }
+
+    #[test]
+    fn failed_managed_extraction_preserves_working_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join(super::managed_binary_name(&super::Tool::Croc));
+        std::fs::write(&binary, b"working binary").unwrap();
+        assert!(super::stage_managed_binary(
+            &super::Tool::Croc, "croc.zip", b"invalid archive", "v11.5.1", &binary
+        ).is_err());
+        assert_eq!(std::fs::read(&binary).unwrap(), b"working binary");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn staged_archive_replaces_binary_after_extraction() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let name = super::managed_binary_name(&super::Tool::Sendme);
+        let binary = dir.path().join(&name);
+        std::fs::write(&binary, b"previous binary").unwrap();
+        let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        archive.start_file(&name, zip::write::FileOptions::default()).unwrap();
+        archive.write_all(b"replacement binary").unwrap();
+        let archive = archive.finish().unwrap().into_inner();
+        super::stage_managed_binary(&super::Tool::Sendme, "sendme.zip", &archive, "v1.0.0", &binary).unwrap();
+        assert_eq!(std::fs::read(&binary).unwrap(), b"replacement binary");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn croc_command_surfaces_nonzero_exit_status() {
+        let error = super::run_croc_command("cmd.exe", &["/D", "/C", "echo network unavailable & exit /B 7"], None).unwrap_err();
+        assert!(error.contains("network unavailable"), "{error}");
+        assert!(error.contains("7"), "{error}");
+    }
+
+    #[test]
     fn test_extract_croc_code_sender_shapes() {
         use super::extract_croc_code;
 
@@ -2501,6 +3187,14 @@ mod tests {
             extract_croc_code("croc coach-wasp-quill (code copied to clipboard)"),
             Some("coach-wasp-quill".to_string())
         );
+        for line in [
+            "croc --relay 142.132.189.179:9009 lip-swab-jab (code copied to clipboard)",
+            "croc --relay relay.example:9009 lip-swab-jab (code copied to clipboard)",
+            "[Croc] croc --relay6 [::1]:9009 lip-swab-jab (code copied to clipboard)",
+            "croc --relay 127.0.0.1:9009 --relay6 [::1]:9009 lip-swab-jab (code copied to clipboard)",
+        ] {
+            assert_eq!(extract_croc_code(line).as_deref(), Some("lip-swab-jab"), "{line}");
+        }
         // Tolerate a log-level tag prefix.
         assert_eq!(
             extract_croc_code("[Croc] croc asdfasdf (code copied to clipboard)"),
@@ -2518,6 +3212,9 @@ mod tests {
         // Must not fire on subcommand echoes, progress, or links.
         assert_eq!(extract_croc_code("croc send file.txt"), None);
         assert_eq!(extract_croc_code("croc relay"), None);
+        assert_eq!(extract_croc_code("croc --relay"), None);
+        assert_eq!(extract_croc_code("croc --relay relay.example:9009"), None);
+        assert_eq!(extract_croc_code("croc --relay relay.example:9009 send file.txt (example)"), None);
         assert_eq!(extract_croc_code("Sending (->192.168.1.60:56052)"), None);
         assert_eq!(
             extract_croc_code("Or open: https://getcroc.com/?code=asdfasdf"),

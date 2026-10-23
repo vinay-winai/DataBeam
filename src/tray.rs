@@ -1,18 +1,12 @@
 //! System-tray integration for close-to-tray behaviour.
 //!
-//! Wake-up design (required, not optional): `update()` polling alone cannot
-//! work — a hidden/idle window receives no `update()` calls, so tray clicks
-//! would queue unseen. Raw [`TrayIconEvent`] / [`MenuEvent`]s are therefore
-//! forwarded from installed handlers into an app-owned channel together with
-//! a [`egui::Context::request_repaint`] wakeup; [`TrayState::drain_actions`]
-//! (called from `update()`) then maps them to [`TrayAction`]s. The mapping
-//! functions are pure and unit-tested.
+//! Tray callbacks wake the native window and queue meaningful actions for
+//! the app thread. Hover events are ignored. Actions run once in update(),
+//! and Exit uses eframe's normal close path so ownership and settings drop.
 //!
-//! Window semantics mirror proven tray apps on the same stack: hide goes
-//! through the winit-consistent viewport command; restore calls raw Win32
-//! ShowWindow FIRST on Windows (needs no event loop — its OS messages wake
-//! a hidden loop) followed by the same viewport commands; any left-click
-//! restores, menu Exit quits.
+//! On Windows, close keeps the window iconic to avoid the current eframe
+//! hidden-window redraw spin. Native tool-window styles suppress its taskbar
+//! and Alt+Tab entries; restore puts back its original extended style.
 //!
 //! macOS menu-bar diffs (see [`tray_title_text`] and `init_tray`): the
 //! status item is icon-only with the icon as a template silhouette (native
@@ -46,6 +40,7 @@ pub const TRAY_QUIT_ID: &str = "databeam_quit";
 /// Owned tray handles. Keep inside `DataBeamApp` for the app lifetime.
 pub struct TrayState {
     _tray: TrayIcon,
+    generation: u64,
     _menu: Menu,
     _show_item: MenuItem,
     _quit_item: MenuItem,
@@ -85,11 +80,9 @@ pub enum TrayAction {
 /// Process-wide forward entry, refreshed on every [`init_tray`] so
 /// toggle-off/on cycles can never strand events on a dropped channel.
 /// Handlers are installed once (both crates ignore later `set` calls).
-/// The handler thread applies Show/Quit DIRECTLY (raw Win32 wake + shared
-/// quit flag) because `update()` does not run while the window is hidden —
-/// verified: ~150 forwarded events, zero `update()` drains. The `update()`
-/// drain stays as a backup for when the loop is already awake.
+/// The handler wakes the native window; update() owns action application.
 struct TrayForward {
+    generation: u64,
     tx: mpsc::Sender<TrayRawEvent>,
     ctx: eframe::egui::Context,
     // Plain strings: Menu/MenuItem handles are main-thread-only (!Send),
@@ -127,26 +120,19 @@ pub fn restore_window_now(
     ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Focus);
 }
 
-fn apply_from_handler(action: TrayAction) {
-    // Snapshot what the handler needs, then act without holding the lock.
-    // Quit is immediate (see hard_quit): no loop roundtrips.
-    let snapshot = forward_entry().lock().ok().and_then(|guard| {
-        guard.as_ref().map(|fwd| {
-            (
-                fwd.ctx.clone(),
-                fwd.hwnd,
-            )
-        })
-    });
-    if let Some((ctx, hwnd)) = snapshot {
-        match action {
-            TrayAction::Show => {
-                debug_log("tray action applied: Show");
-                restore_window_now(&ctx, hwnd);
-            }
-            TrayAction::Quit => {
-                debug_log("tray action applied: Quit");
-                hard_quit();
+/// Only wake the native window here. The app applies the queued action
+/// once, including graceful Exit, when this wake resumes its event loop.
+fn wake_from_handler() {
+    if let Some(hwnd) = tray_hwnd() {
+        sw_show(hwnd);
+    }
+}
+
+impl Drop for TrayState {
+    fn drop(&mut self) {
+        if let Ok(mut entry) = forward_entry().lock() {
+            if entry.as_ref().is_some_and(|entry| entry.generation == self.generation) {
+                *entry = None;
             }
         }
     }
@@ -159,7 +145,8 @@ static DEBUG_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 pub fn set_debug_enabled(enabled: bool) {
-    DEBUG_ENABLED.store(enabled, std::sync::atomic::Ordering::SeqCst);
+    // A saved debug setting must not enable hidden logging in a release build.
+    DEBUG_ENABLED.store(cfg!(debug_assertions) && enabled, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Append one line to the tray debug log in the system temp dir.
@@ -185,27 +172,26 @@ pub fn debug_log(line: &str) {
     }
 }
 
+fn raw_event_has_action(event: &TrayRawEvent) -> bool {
+    match event {
+        TrayRawEvent::Icon(event) => map_icon_event(event),
+        TrayRawEvent::Menu(event) => map_menu_id(TRAY_SHOW_ID, TRAY_QUIT_ID, event).is_some(),
+    }
+}
+
 fn forward_raw(event: TrayRawEvent) {
-    // Hover move/enter/leave spam the log at 60Hz; clicks/menu/leave prove flow.
-    let noisy = matches!(
-        event,
-        TrayRawEvent::Icon(
-            TrayIconEvent::Move { .. } | TrayIconEvent::Enter { .. }
-        )
-    );
-    if !noisy {
-        debug_log(&format!("tray event forwarded: {}", event.kind()));
-    }
-    let mut delivered = false;
-    if let Ok(guard) = forward_entry().lock() {
-        if let Some(fwd) = guard.as_ref() {
-            delivered = fwd.tx.send(event).is_ok();
-            fwd.ctx.request_repaint();
-        }
-    }
-    if !noisy || !delivered {
-        debug_log(&format!("tray forward delivered: {delivered}"));
-    }
+    // Hover, movement and unrelated menu events must neither queue nor wake
+    // an idle application. A click is delivered exactly once to update().
+    if !raw_event_has_action(&event) { return; }
+    debug_log(&format!("tray event forwarded: {}", event.kind()));
+    let delivered = forward_entry().lock().ok().and_then(|guard| {
+        guard.as_ref().map(|fwd| {
+            let delivered = fwd.tx.send(event).is_ok();
+            if delivered { fwd.ctx.request_repaint(); }
+            delivered
+        })
+    }).unwrap_or(false);
+    debug_log(&format!("tray forward delivered: {delivered}"));
 }
 
 fn install_handlers_once() {
@@ -214,11 +200,10 @@ fn install_handlers_once() {
     if INSTALLED.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
     }
-    // Icon clicks are mapped here (no item ids needed) and applied at once:
-    // the hidden loop may never wake to drain the backup channel.
+    // Native restore wakes an iconic window before the app drains actions.
     TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
         if map_icon_event(&event) {
-            apply_from_handler(TrayAction::Show);
+            wake_from_handler();
         }
         forward_raw(TrayRawEvent::Icon(event));
     }));
@@ -228,8 +213,8 @@ fn install_handlers_once() {
             let fwd = guard.as_ref()?;
             map_menu_id(&fwd.show_id, &fwd.quit_id, &event)
         });
-        if let Some(action) = action {
-            apply_from_handler(action);
+        if action.is_some() {
+            wake_from_handler();
         }
         forward_raw(TrayRawEvent::Menu(event));
     }));
@@ -317,9 +302,12 @@ pub fn init_tray(
     };
     debug_log("tray icon built");
 
+    static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let generation = GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (tx, rx) = mpsc::channel();
     if let Ok(mut guard) = forward_entry().lock() {
         *guard = Some(TrayForward {
+            generation,
             tx,
             ctx,
             show_id: TRAY_SHOW_ID.to_string(),
@@ -331,6 +319,7 @@ pub fn init_tray(
 
     Some((
         TrayState {
+            generation,
             _tray: tray,
             _menu: menu,
             _show_item: show_item,
@@ -349,8 +338,8 @@ pub fn is_active() -> bool {
 }
 
 /// Drain the forwarded raw-event channel without blocking, mapping to
-/// actions with the stored item ids. Backup path for when the loop runs;
-/// the handler already applies directly.
+/// actions with the stored item ids. The handler wakes the native loop;
+/// update() owns the sole action-application path.
 pub fn drain_actions_global(rx: &mpsc::Receiver<TrayRawEvent>) -> Vec<TrayAction> {
     let mut actions = Vec::new();
     while let Ok(event) = rx.try_recv() {
@@ -374,27 +363,15 @@ pub fn drain_actions_global(rx: &mpsc::Receiver<TrayRawEvent>) -> Vec<TrayAction
     actions
 }
 
-/// Instant quit for the tray Exit path: kill tracked transfer children (no
-/// orphans — `process::exit` skips `Drop`), then exit. Deterministic: needs
-/// no event loop cooperation, so quit time equals taskkill time (~100ms).
-/// Tradeoffs vs graceful close: the tray icon ghosts until the next
-/// mouse-over (Windows clears dead icons on hover) and eframe UI-state
-/// persistence (window geometry) is skipped. Settings are safe
-/// (`settings.json` persists incrementally).
-pub fn hard_quit() -> ! {
-    debug_log("tray hard quit: killing children");
-    crate::backend::kill_all_tracked_children();
-    debug_log("tray hard quit: exiting");
-    std::process::exit(0);
-}
-
-/// Any left-click (press or release) and left double-click restores the
-/// window — matching proven tray apps on this stack, which do not depend on
-/// a particular button-state delivery. Right-clicks (menu opens separately)
+/// A left-click release or left double-click restores the
+/// window. Button press is ignored to avoid applying one click twice.
+/// Right-clicks (menu opens separately)
 /// and other buttons are ignored.
 pub fn map_icon_event(event: &TrayIconEvent) -> bool {
     match event {
-        TrayIconEvent::Click { button, .. } => *button == MouseButton::Left,
+        TrayIconEvent::Click { button, button_state, .. } => {
+            *button == MouseButton::Left && *button_state == tray_icon::MouseButtonState::Up
+        },
         TrayIconEvent::DoubleClick { button, .. } => *button == MouseButton::Left,
         _ => false,
     }
@@ -413,21 +390,62 @@ pub fn map_menu_id(show_id: &str, quit_id: &str, event: &MenuEvent) -> Option<Tr
 }
 
 // ── Window visibility ──────────────────────────────────────────────
-// Hide goes through the winit-consistent egui viewport command issued by
-// the caller (the OS-agnostic equivalent of Tauri's window.hide()).
-// Restore additionally calls raw Win32 ShowWindow FIRST: showing needs no
-// event loop, and its OS messages wake a hidden loop so queued viewport
-// commands get processed. Verified necessary: repaint wakeups alone never
-// produced an update() while hidden.
 
-/// Restore a hidden/minimized window via raw Win32. Thread-safe: callable
-/// from the tray handler thread. Idempotent when already visible.
+#[cfg(windows)]
+fn hidden_window_style() -> &'static Mutex<Option<(isize, isize)>> {
+    static STYLE: OnceLock<Mutex<Option<(isize, isize)>>> = OnceLock::new();
+    STYLE.get_or_init(|| Mutex::new(None))
+}
+
+/// Native taskbar/Alt+Tab suppression while retaining the iconic state
+/// required by the current eframe backend for low CPU. The original style
+/// is restored exactly when a tray action brings the main window back.
+#[cfg(windows)]
+pub fn sw_hide_to_tray(hwnd: isize) {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+    let window = hwnd as HWND;
+    unsafe {
+        if IsWindow(window) == 0 { return; }
+        let style = GetWindowLongPtrW(window, GWL_EXSTYLE);
+        if let Ok(mut saved) = hidden_window_style().lock() {
+            if saved.is_some() { return; }
+            *saved = Some((hwnd, style));
+        } else { return; }
+        // Windows requires hiding before changing taskbar-related styles.
+        ShowWindow(window, SW_MINIMIZE);
+        ShowWindow(window, SW_HIDE);
+        SetWindowLongPtrW(window, GWL_EXSTYLE,
+            (style & !(WS_EX_APPWINDOW as isize)) | WS_EX_TOOLWINDOW as isize);
+        SetWindowPos(window, std::ptr::null_mut(), 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        ShowWindow(window, SW_SHOWMINNOACTIVE);
+    }
+}
+
+/// Wake and restore the native main window. Repeated calls leave a visible
+/// window's geometry (including maximization) alone.
 #[cfg(windows)]
 pub fn sw_show(hwnd: isize) {
     use windows_sys::Win32::Foundation::HWND;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_RESTORE};
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+    let saved = hidden_window_style().lock().ok().and_then(|mut saved| {
+        if saved.as_ref().is_some_and(|(window, _)| *window == hwnd) {
+            saved.take().map(|(_, style)| style)
+        } else { None }
+    });
     unsafe {
-        ShowWindow(hwnd as HWND, SW_RESTORE);
+        let window = hwnd as HWND;
+        if IsWindow(window) == 0 { return; }
+        if let Some(style) = saved {
+            ShowWindow(window, SW_HIDE);
+            SetWindowLongPtrW(window, GWL_EXSTYLE, style);
+            SetWindowPos(window, std::ptr::null_mut(), 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        }
+        if saved.is_some() || IsIconic(window) != 0 || IsWindowVisible(window) == 0 {
+            ShowWindow(window, SW_RESTORE);
+        }
     }
 }
 
@@ -459,12 +477,12 @@ mod tests {
 
     #[test]
     fn tray_icon_click_mapping() {
-        // Any left-click restores the window (press or release).
+        // Only release restores: press must not duplicate the action.
         assert!(map_icon_event(&click_event(
             MouseButton::Left,
             MouseButtonState::Up
         )));
-        assert!(map_icon_event(&click_event(
+        assert!(!map_icon_event(&click_event(
             MouseButton::Left,
             MouseButtonState::Down
         )));
@@ -478,6 +496,50 @@ mod tests {
             MouseButton::Middle,
             MouseButtonState::Up
         )));
+    }
+
+    #[test]
+    fn hover_events_do_not_wake_or_queue_actions() {
+        assert!(!raw_event_has_action(&TrayRawEvent::Icon(TrayIconEvent::Move {
+            id: TrayIconId::new("test"),
+            position: dpi::PhysicalPosition::new(0.0, 0.0),
+            rect: Rect::default(),
+        })));
+        assert!(!raw_event_has_action(&TrayRawEvent::Icon(click_event(MouseButton::Right, MouseButtonState::Up))));
+        assert!(!raw_event_has_action(&TrayRawEvent::Menu(MenuEvent { id: "unrelated".into() })));
+        assert!(raw_event_has_action(&TrayRawEvent::Icon(click_event(MouseButton::Left, MouseButtonState::Up))));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_tray_hide_restores_window_style_and_geometry() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::*;
+        use windows_sys::Win32::Foundation::RECT;
+        let class = [83u16, 84, 65, 84, 73, 67, 0]; // built-in STATIC class
+        unsafe {
+            let window = CreateWindowExW(WS_EX_APPWINDOW, class.as_ptr(), std::ptr::null(),
+                WS_OVERLAPPEDWINDOW, -32000, -32000, 460, 400,
+                std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null());
+            assert!(!window.is_null());
+            let original = GetWindowLongPtrW(window, GWL_EXSTYLE);
+            sw_hide_to_tray(window as isize);
+            assert_ne!(IsIconic(window), 0);
+            let hidden = GetWindowLongPtrW(window, GWL_EXSTYLE);
+            assert_eq!(hidden & WS_EX_APPWINDOW as isize, 0);
+            assert_ne!(hidden & WS_EX_TOOLWINDOW as isize, 0);
+            sw_show(window as isize);
+            assert_eq!(GetWindowLongPtrW(window, GWL_EXSTYLE), original);
+            assert_eq!(IsIconic(window), 0);
+            assert_ne!(IsWindowVisible(window), 0);
+            let mut rect: RECT = std::mem::zeroed();
+            GetWindowRect(window, &mut rect);
+            assert_eq!((rect.right - rect.left, rect.bottom - rect.top), (460, 400));
+            // Repeat a toggle cycle to catch stale saved styles.
+            sw_hide_to_tray(window as isize);
+            sw_show(window as isize);
+            assert_eq!(GetWindowLongPtrW(window, GWL_EXSTYLE), original);
+            DestroyWindow(window);
+        }
     }
 
     #[test]
@@ -550,6 +612,7 @@ mod tests {
         };
         // Simulate toggle-off: drop the first icon.
         drop(_state1);
+        assert!(!is_active());
         let Some((_state2, rx2)) = init_tray(ctx.clone(), None) else {
             return;
         };

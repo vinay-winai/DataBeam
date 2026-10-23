@@ -1434,7 +1434,7 @@ dependencies = [
 
 [[package]]
 name = "databeam"
-version = "0.6.0"
+version = "0.6.5"
 dependencies = [
  "dirs",
  "eframe",
@@ -1446,11 +1446,13 @@ dependencies = [
  "open",
  "portable-pty",
  "qrcode",
+ "rand 0.9.2",
  "raw-window-handle",
  "rfd",
  "sendme",
  "serde",
  "serde_json",
+ "sha2",
  "single-instance",
  "tar",
  "tempfile",
@@ -1594,6 +1596,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
 dependencies = [
  "block-buffer 0.12.1",
+ "const-oid",
  "crypto-common 0.2.2",
 ]
 

@@ -2,3 +2,5 @@
 * text=auto
 # Shell scripts must stay LF or they break on Linux/macOS.
 *.sh text eol=lf
+# Keep upstream patch bytes stable for application and payload hash checks.
+*.patch text eol=lf

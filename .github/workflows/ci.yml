@@ -26,8 +26,22 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.0'
+          cache: false
+
+      - name: Install Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
+
+      - name: Build patched Croc payload and test keepalive handling
+        run: python scripts/prepare_croc.py --target host
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'

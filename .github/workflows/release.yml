@@ -42,8 +42,22 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.0'
+          cache: false
+
+      - name: Install Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
+
+      - name: Build patched Croc engine
+        run: python scripts/prepare_croc.py --target x86_64-pc-windows-msvc
 
       - name: Update Cargo.toml version
         shell: bash
@@ -52,6 +66,7 @@ jobs:
           sed -i.bak "s/^version = \".*\"/version = \"${version}\"/" Cargo.toml
 
       - name: Build release binary
+        # Release builds fail if the patched payload has not been prepared.
         run: cargo build --release --features release-single-instance
 
       - name: Package Windows x64 executable
@@ -60,6 +75,12 @@ jobs:
           $version = "${env:RELEASE_TAG}".TrimStart('v')
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item "target/release/databeam.exe" "dist/databeam_v${version}_windows-x64.exe"
+          $package = "target/windows-release-package"
+          New-Item -ItemType Directory -Force -Path "$package/LICENSES" | Out-Null
+          Copy-Item "target/release/databeam.exe" "$package/databeam.exe"
+          Copy-Item "LICENSE", "THIRD_PARTY_NOTICES.md" $package
+          Copy-Item "LICENSES/*.txt" "$package/LICENSES"
+          Compress-Archive -Path "$package/*" -DestinationPath "dist/databeam_v${version}_windows-x64.zip" -Force
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v6
@@ -82,8 +103,22 @@ jobs:
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
 
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.0'
+          cache: false
+
+      - name: Install Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
+
+      - name: Build patched Croc engines for both architectures
+        run: python scripts/prepare_croc.py --target aarch64-apple-darwin --target x86_64-apple-darwin
 
       - name: Update Cargo.toml version
         shell: bash
@@ -152,8 +187,22 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.0'
+          cache: false
+
+      - name: Install Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
+
+      - name: Build patched Croc engine
+        run: python scripts/prepare_croc.py --target x86_64-unknown-linux-gnu
 
       - name: Install Linux build dependencies
         run: |
@@ -250,7 +299,7 @@ jobs:
           # Create release if it doesn't already exist
           if ! gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
             echo "Creating release ${RELEASE_TAG}..."
-            gh release create "${RELEASE_TAG}" --title "DataBeam ${RELEASE_TAG}" --generate-notes
+            gh release create "${RELEASE_TAG}" --target "${GITHUB_SHA}" --title "DataBeam ${RELEASE_TAG}" --generate-notes
           fi
 
           # Merge or generate SHA256SUMS.txt

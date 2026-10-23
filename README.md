@@ -18,12 +18,15 @@ You can:
 - EasySendMe mode: Croc-style convenience with the modern improvements of Sendme
 - auto-retry system when network disconnections.
 - automatic safe file overwrite confilct resolution system.
-- small executables, typically in the single-digit MB range
+- portable executables with the patched Croc engine included
 - standalone `croc` mode and `sendme` modes are still available if you want to use them for specific situations
 - sending text in Croc mode
 - support for custom code as short as 7 characters in croc and easysendme modes
+
 - support for transferring multiple files/folders at once
 - QR code generation for transfer codes/tickets
 - modern native desktop UI with no browser runtime
 - visible transfer logs inside the app
+
+DataBeam bundles **Croc 11.2.5-databeam-keepalive**, built from verified upstream source with a receiver keepalive fix. It uses a separate versioned cache and restores the bundled engine if that copy is damaged. Automatic engine upgrades are held until a verified official release replaces the patch. Public relay names are resolved through the operating system; custom `CROC_RELAY` settings remain supported. See the [keepalive investigation](investigations/croc-relay-keepalive.md) and [build instructions](CONTRIBUTING.md#patched-croc-engine).
 
