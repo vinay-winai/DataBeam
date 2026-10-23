@@ -1,6 +1,6 @@
 {
   "upstream_tag": "v11.2.5",
-  "engine_version": "11.2.5-databeam-keepalive",
+  "engine_version": "11.2.5-databeam-keepalive-route",
   "source_sha256": "3ed128b10be42cfb39793162eb0346ece31dd858876646ce2c59529a20393fa6",
   "patch": "croc-v11.2.5-relay-keepalive.patch",
   "go_version": "1.27.0"

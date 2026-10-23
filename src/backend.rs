@@ -2819,6 +2819,7 @@ mod tests {
         use super::{croc_receive, CrocReceiveOptions, CrocSendOptions, TransferMsg};
         use std::time::{Duration, Instant};
         let binary = std::env::var("DATABEAM_CROC_TEST_BINARY").expect("explicit test binary");
+        let require_direct = std::env::var_os("DATABEAM_CROC_TEST_REQUIRE_DIRECT").is_some();
         let temp = tempfile::tempdir().unwrap();
         let text = "DataBeam live regression test — hello from croc";
         let random: Vec<u8> = (0..262144).map(|_| rand::random()).collect();
@@ -2851,30 +2852,35 @@ mod tests {
                 std::thread::sleep(Duration::from_secs(3));
                 Some(receiver)
             } else { None };
-            // Force this integration test through the configured relay so LAN
-            // discovery cannot make a broken public-relay path appear healthy.
+            // Normally force relay coverage. Direct mode uses the production
+            // sender unchanged and must prove a direct route on both peers.
             let sender_binary = binary.clone();
-            let (sender, send_handle) = super::spawn_croc_transfer(
-                Some(code.clone()),
-                true,
-                move |code, relay| {
-                    let mut cmd = super::croc_transfer_command(&sender_binary, code, relay);
-                    cmd.args(["send", "--no-local"]);
-                    if let Some(text) = &opts.text_value {
-                        cmd.arg("--text").arg(text);
-                    } else {
-                        cmd.arg("--").args(&opts.paths);
-                    }
-                    cmd
-                },
-                super::resolve_croc_relay,
-            );
+            let (sender, send_handle) = if require_direct {
+                super::croc_send(opts, &binary)
+            } else {
+                super::spawn_croc_transfer(
+                    Some(code.clone()),
+                    true,
+                    move |code, relay| {
+                        let mut cmd = super::croc_transfer_command(&sender_binary, code, relay);
+                        cmd.args(["send", "--no-local"]);
+                        if let Some(text) = &opts.text_value {
+                            cmd.arg("--text").arg(text);
+                        } else {
+                            cmd.arg("--").args(&opts.paths);
+                        }
+                        cmd
+                    },
+                    super::resolve_croc_relay,
+                )
+            };
             let (receiver, receive_handle) = waiting_receiver.unwrap_or_else(start_receiver);
             let deadline = Instant::now() + Duration::from_secs(90);
             let mut sent = false;
             let mut received = false;
             let mut received_text = false;
             let mut announced_code = false;
+            let mut routes = [None; 2];
             let mut error = None;
             while Instant::now() < deadline && error.is_none() && !(sent && received) {
                 for (is_receiver, rx) in [(false, &sender), (true, &receiver)] {
@@ -2889,6 +2895,9 @@ mod tests {
                             TransferMsg::Completed => sent = true,
                             TransferMsg::Error(message) => error = Some(message),
                             TransferMsg::Output(line) => {
+                                if let Some(route) = super::parse_croc_direction(&line) {
+                                    routes[is_receiver as usize] = Some(route);
+                                }
                                 eprintln!(
                                     "{}: {line}",
                                     if is_receiver { "receiver" } else { "sender" }
@@ -2908,6 +2917,12 @@ mod tests {
             assert!(error.is_none(), "{error:?}");
             assert!(sent && received, "transfer timed out");
             assert!(announced_code, "sender did not publish the share code");
+            let expected_route = if require_direct {
+                super::CrocRoute::Direct
+            } else {
+                super::CrocRoute::Relay
+            };
+            assert_eq!(routes, [Some(expected_route); 2], "both peers must report the actual route");
             if text_mode {
                 assert!(received_text, "text bytes did not arrive");
             } else {

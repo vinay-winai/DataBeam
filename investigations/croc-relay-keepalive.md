@@ -2,7 +2,7 @@
 
 Investigated on 2026-10-23, Windows x64. **Root cause reproduced outside
 DataBeam; a minimal Croc receiver patch passed the targeted regression tests.**
-DataBeam now bundles the patched engine as `11.2.5-databeam-keepalive`.
+DataBeam now bundles the patched engine as `11.2.5-databeam-keepalive-route`.
 The build recipe verifies the upstream source archive, applies the tracked
 patch, tests it, and generates a compressed payload for each release target.
 Runtime extraction verifies SHA-256 and uses a separate version/architecture
@@ -10,6 +10,34 @@ cache. Restore and update paths preserve the patch; they do not download the
 unpatched official binary. See [build instructions](../CONTRIBUTING.md#patched-croc-engine).
 
 ## Root cause
+
+### Route-display follow-up
+
+The original v11.2.5 engine always printed `Sending (->peer)` and
+`Receiving (<-peer)`, including local transfers. DataBeam's route parser
+understood the newer CLI convention in which arrow-only means relayed and
+`local->peer` / `local<-peer` means direct. Consequently, a direct local
+transfer could be mislabeled "via public relay". Relay IP resolution did
+not disable LAN discovery or the local-endpoint probe.
+
+The `keepalive-route` engine revision changes display bookkeeping only:
+it records control routes selected by successful LAN discovery/probing or
+the sender's own local relay, and prints the matching direction format.
+Reconnecting through a different relay clears the direct classification;
+private custom-relay addresses alone are not treated as direct. The local
+socket address supplies the direct-format prefix. Peer metadata can still
+contain a public address; that is not evidence that payload used a public
+relay. Connection selection, authentication, and payload handling are unchanged.
+
+Two Go route tests cover formatting and route/fallback bookkeeping. The
+production DataBeam sender/receiver wrappers also completed text and two
+256-KiB files with either peer starting first, with both peers required to
+report Direct and the actual bytes verified. These four direct-route trials
+ran on one Windows PC using a local interface; they do not establish behavior
+between two separate Wi-Fi devices. The earlier public-relay-only harness
+still uses `--no-local` solely for its relay coverage; production sends do not.
+
+### Receiver keepalives
 
 Croc's receiver asks the sender for local-network endpoints over the relay
 before entering the compressed transfer protocol. This exchange uses plain
@@ -83,7 +111,7 @@ The exact commit that first introduced the bug was not bisected.
 - 79 Rust tests passed, including random-code UI completion, sender code
   publication, embedded engine version, bad-cache repair, and preserving a
   working binary if an invalid replacement is presented.
-- The embedded Windows payload reports `11.2.5-databeam-keepalive`; the
+- The original keepalive-only Windows payload reported `11.2.5-databeam-keepalive`; the
   official `11.2.5` version string is rejected as a replacement for this engine.
 - DataBeam's transfer wrappers passed text and mixed random/compressible
   files through public relays in both sender-first and receiver-first order.

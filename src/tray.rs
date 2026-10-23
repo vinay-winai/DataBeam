@@ -29,6 +29,10 @@
 
 use std::sync::{mpsc, Mutex, OnceLock};
 
+// Native tray tests share the process-wide forwarding entry.
+#[cfg(test)]
+pub(crate) static TRAY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent,
@@ -618,6 +622,7 @@ mod tests {
     #[cfg_attr(not(target_os = "windows"), ignore)]
     #[test]
     fn tray_double_init_replaces_forward_entry() {
+        let _test_guard = TRAY_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         use tray_icon::menu::MenuEvent;
         let ctx = eframe::egui::Context::default();
         let Some((_state1, _rx1)) = init_tray(ctx.clone(), None) else {

@@ -21,6 +21,11 @@ on:
         description: "Release tag to publish to (for example: v0.1.13)"
         type: string
         required: true
+      replace_existing:
+        description: "Replace the existing release and move its tag to this commit (target: all)"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
@@ -287,6 +292,9 @@ jobs:
       !contains(needs.*.result, 'cancelled')
 
     steps:
+      - name: Checkout release notes
+        uses: actions/checkout@v6
+
       - name: Download all artifacts
         uses: actions/download-artifact@v6
         with:
@@ -298,9 +306,16 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
+          REPLACE_EXISTING: ${{ github.event.inputs.replace_existing || 'false' }}
+          RELEASE_TARGET: ${{ github.event.inputs.target }}
         shell: bash
         run: |
           set -euo pipefail
+
+          if [ "${REPLACE_EXISTING}" = "true" ] && [ "${RELEASE_TARGET}" != "all" ]; then
+            echo "Replacing a release tag requires rebuilding all targets."
+            exit 1
+          fi
 
           # Create release if it doesn't already exist
           if ! gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
@@ -325,4 +340,16 @@ jobs:
 
           echo "Uploading release assets with --clobber..."
           gh release upload "${RELEASE_TAG}" dist/* --clobber
+
+          if [ "${REPLACE_EXISTING}" = "true" ]; then
+            # Use the workflow token so updating the existing tag does not
+            # trigger a second release run. Retarget only after all uploads.
+            gh api --method PATCH "repos/${GH_REPO}/git/refs/tags/${RELEASE_TAG}" \
+              -f sha="${GITHUB_SHA}" -F force=true > /dev/null
+          fi
+
+          notes_path="release-notes/${RELEASE_TAG}.md"
+          if [ -f "${notes_path}" ]; then
+            gh release edit "${RELEASE_TAG}" --notes-file "${notes_path}"
+          fi
 

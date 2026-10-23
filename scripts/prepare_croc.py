@@ -65,7 +65,7 @@ def main():
         test_env['GOTOOLCHAIN'] = 'go' + RECIPE['go_version']
         for key in ('GOOS', 'GOARCH', 'CROC_SECRET', 'CROC_RELAY', 'CROC_RELAY6'):
             test_env.pop(key, None)
-        run('go', 'test', './src/croc', '-run', 'TestLocalProbeResponse', '-count=1',
+        run('go', 'test', './src/croc', '-run', 'Test(LocalProbeResponse|DataBeamRoute)', '-count=1',
             '-timeout', '60s', cwd=source, env=test_env)
         for target in args.target:
             goos, goarch = TARGETS[target]

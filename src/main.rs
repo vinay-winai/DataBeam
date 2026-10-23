@@ -3426,11 +3426,13 @@ impl DataBeamApp {
         if self.cleanup_prompt_open {
             self.render_cleanup_popup(ctx);
         }
+        #[cfg(target_os = "windows")]
         if self.settings_popup_open {
             self.render_settings_popup(ctx);
         }
     }
 
+    #[cfg(target_os = "windows")]
     fn render_settings_popup(&mut self, ctx: &egui::Context) {
         let mut open = self.settings_popup_open;
         egui::Window::new("Settings")
@@ -3470,28 +3472,30 @@ impl DataBeamApp {
                         }
                     }
                 }
-                ui.add_space(4.0);
-                ui.separator();
-                ui.add_space(4.0);
                 // Croc self-update status + manual check (automatic checks
-                // run on Windows only, on open and every 6 hours).
-                if let Some(line) = self.croc_update_status_line() {
-                    ui.label(RichText::new(line).size(11.0).color(TEXT_MUTED).italics());
-                }
-                ui.horizontal(|ui| {
-                    let checking = self.croc_update_phase != CrocUpdatePhase::Idle;
-                    let btn = ui.add_enabled(
-                        !checking,
-                        egui::Button::new("↻ Check croc update now"),
-                    );
-                    if btn.clicked() {
-                        self.croc_update_startup_check_done = true;
-                        self.start_croc_update_check(ctx);
-                        if self.croc_update_phase == CrocUpdatePhase::Idle {
-                            self.show_toast("croc is busy or unavailable".to_string(), WARNING);
-                        }
+                // run on Windows only). A pinned engine cannot be updated.
+                if !CROC_COMPATIBILITY_PINNED {
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    if let Some(line) = self.croc_update_status_line() {
+                        ui.label(RichText::new(line).size(11.0).color(TEXT_MUTED).italics());
                     }
-                });
+                    ui.horizontal(|ui| {
+                        let checking = self.croc_update_phase != CrocUpdatePhase::Idle;
+                        let btn = ui.add_enabled(
+                            !checking,
+                            egui::Button::new("↻ Check croc update now"),
+                        );
+                        if btn.clicked() {
+                            self.croc_update_startup_check_done = true;
+                            self.start_croc_update_check(ctx);
+                            if self.croc_update_phase == CrocUpdatePhase::Idle {
+                                self.show_toast("croc is busy or unavailable".to_string(), WARNING);
+                            }
+                        }
+                    });
+                }
             });
         self.settings_popup_open = open;
     }
@@ -3903,6 +3907,8 @@ impl eframe::App for DataBeamApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Settings cog: lives in the always-visible top bar
                         // (the bottom status bar only renders mid-transfer).
+                        // Its controls (tray and Croc updater) are Windows-only.
+                        #[cfg(target_os = "windows")]
                         if ui
                             .add(egui::Button::new(RichText::new("⚙").size(14.0)).frame(false))
                             .on_hover_text("Settings")
@@ -7554,6 +7560,7 @@ mod parse_tests {
     #[cfg_attr(not(target_os = "windows"), ignore)]
     #[test]
     fn tray_toggle_setter_drives_init_drop_and_persist() {
+        let _test_guard = super::tray::TRAY_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         // Redirect settings so this test never touches real user data.
         // Regression test: the checkbox must go through the setter with the
         // not-yet-applied value. Binding `&mut app.minimize_to_tray`

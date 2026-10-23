@@ -9,7 +9,7 @@ The license notices below are provided to satisfy attribution requirements.
 - Copyright: (c) 2017-2025 Zack and contributors to `croc`
 - License: MIT
 - License text: [LICENSES/CROC-MIT.txt](LICENSES/CROC-MIT.txt), unchanged upstream notice
-- Bundled engine: upstream v11.2.5 plus [DataBeam's receiver keepalive patch](patches/croc-v11.2.5-relay-keepalive.patch), labeled `11.2.5-databeam-keepalive`.
+- Bundled engine: upstream v11.2.5 plus [DataBeam's receiver keepalive and route-display patch](patches/croc-v11.2.5-relay-keepalive.patch), labeled `11.2.5-databeam-keepalive-route`.
 
 ## 2) sendme (official upstream reference)
 

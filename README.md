@@ -28,7 +28,7 @@ You can:
 - modern native desktop UI with no browser runtime
 - visible transfer logs inside the app
 
-DataBeam bundles **Croc 11.2.5-databeam-keepalive**, built from verified upstream source with a receiver keepalive fix. It uses a separate versioned cache and restores the bundled engine if that copy is damaged. Automatic engine upgrades are held until a verified official release replaces the patch. Public relay names are resolved through the operating system; custom `CROC_RELAY` settings remain supported. See the [keepalive investigation](investigations/croc-relay-keepalive.md) and [build instructions](CONTRIBUTING.md#patched-croc-engine).
+DataBeam bundles **Croc 11.2.5-databeam-keepalive-route**, built from verified upstream source with receiver keepalive and route-display fixes. It uses a separate versioned cache and restores the bundled engine if that copy is damaged. Automatic engine upgrades are held until a verified official release replaces the patch, and the update button is hidden while pinned. Public relay names are resolved through the operating system; LAN discovery and direct transfers remain enabled. Custom `CROC_RELAY` settings remain supported. See the [keepalive investigation](investigations/croc-relay-keepalive.md) and [build instructions](CONTRIBUTING.md#patched-croc-engine).
 
 System tray support is Windows-only. On macOS and Linux, closing the window exits the app, and automatic Croc update checks are disabled. Saved tray settings cannot enable tray behavior on those platforms.
 

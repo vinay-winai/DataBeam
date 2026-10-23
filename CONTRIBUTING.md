@@ -80,6 +80,18 @@ Keep bundle metadata compatible with that version. Linux terminal settings
 belong under `[package.metadata.bundle.linux]` as `use_terminal`, as described
 in the [0.12.0 manifest documentation](https://github.com/burtonageo/cargo-bundle/blob/v0.12.0/Readme.md#linux-specific-settings).
 Packaging uses `--binary-path` to reuse the release binary already built by CI.
+When rebuilding an already-published release, dispatch all targets with
+`replace_existing=true`. After successful uploads, the workflow moves that
+existing tag to the build commit. Notes in `release-notes/<tag>.md`, when
+present, replace generated notes on the published release.
 The macOS and Linux release jobs run `non_windows_` regression tests to verify
 automatic Croc checks and tray initialization stay disabled, including when
 saved settings request a tray icon.
+
+The ignored `croc_real_text_and_file_round_trip` test normally forces public
+relay transfers. Set `DATABEAM_CROC_TEST_BINARY` to the prepared engine and
+`DATABEAM_CROC_TEST_REQUIRE_DIRECT=1` to exercise the production sender with
+LAN discovery enabled instead. This mode requires both peers to report a
+direct route and verifies text/file bytes in both startup orders. Running
+both peers on one PC checks local transfer behavior; it does not replace a
+test between two separate devices on Wi-Fi.

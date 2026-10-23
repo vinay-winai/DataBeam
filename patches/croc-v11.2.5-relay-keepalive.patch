@@ -1,6 +1,22 @@
 --- a/src/croc/croc.go
 +++ b/src/croc/croc.go
-@@ -1774,6 +1774,23 @@
+@@ -183,6 +183,7 @@
+ 	pakeConfirmationPending bool
+ 	nextReconnectRoom       string
+ 	relayControlAddress     string
++	directControlAddress    string
+ 	reconnectRelayAddresses []string
+ 	reconnectRelayMu        sync.Mutex
+ 	reconnectVersion        int
+@@ -1294,6 +1295,7 @@
+ 			log.Debugf("received unexpected handshake payload (%d bytes)", len(data))
+ 		}
+ 	}
++	c.rememberDirectRelayControlAddress(localControlAddress)
+ 	c.setRelayControlAddress(localControlAddress)
+ 	c.conn[0] = conn
+ 	log.Debug("exchanged header message")
+@@ -1774,6 +1776,23 @@
  	return
  }
  
@@ -24,7 +40,17 @@
  // Receive will receive a file
  func (c *Client) Receive() (err error) {
  	defer func() { err = c.redactError(err) }()
-@@ -1906,7 +1923,7 @@
+@@ -1862,6 +1881,9 @@
+ 		c.conn[0], banner, c.ExternalIP, err = tcp.ConnectToTCPServer(address, c.Options.RelayPassword, c.Options.RoomName, durations[i])
+ 		if err == nil {
+ 			c.setRelayControlAddress(address)
++			if usingLocal || isIPset {
++				c.rememberDirectRelayControlAddress(address)
++			}
+ 			break
+ 		}
+ 		log.Debugf("could not establish '%s'", address)
+@@ -1906,7 +1928,7 @@
  				log.Errorf("dataMessage send error: %v", err)
  				return
  			}
@@ -33,7 +59,7 @@
  			if err != nil {
  				return
  			}
-@@ -1955,7 +1972,7 @@
+@@ -1955,7 +1977,7 @@
  			if err = c.conn[0].Send(data); err != nil {
  				log.Errorf("ips send error: %v", err)
  			}
@@ -42,6 +68,32 @@
  			if err != nil {
  				return
  			}
+@@ -2010,6 +2032,7 @@
+ 				log.Debugf("banner: %s", banner2)
+ 				// reset to the local port
+ 				banner = banner2
++				c.rememberDirectRelayControlAddress(serverTry)
+ 				c.setRelayControlAddress(serverTry)
+ 				c.ExternalIPConnected = peerIP(serverTry)
+ 				c.ExternalIP = externalIP
+@@ -2339,7 +2362,7 @@
+ 		fmt.Fprintf(output, "\rReceiving %s (%s) \n", fname, utils.ByteCountDecimal(totalSize))
+ 	}
+ 	output, _ := termui.Output(os.Stderr)
+-	fmt.Fprintf(output, "\nReceiving (<-%s)\n", peerIP(c.ExternalIPConnected))
++	fmt.Fprintf(output, "\nReceiving (%s)\n", c.transferDirection())
+ 
+ 	for i := 0; i < len(c.EmptyFoldersToTransfer); i += 1 {
+ 		root, rootErr := c.receiveFilesystem()
+@@ -3151,7 +3174,7 @@
+ 
+ 		if !c.firstSend {
+ 			output, _ := termui.Output(os.Stderr)
+-			fmt.Fprintf(output, "\nSending (->%s)\n", peerIP(c.ExternalIPConnected))
++			fmt.Fprintf(output, "\nSending (%s)\n", c.transferDirection())
+ 			c.firstSend = true
+ 			// if there are empty files, show them as already have been transferred now
+ 			for i := range c.FilesToTransfer {
 --- /dev/null
 +++ b/src/croc/local_probe_keepalive_test.go
 @@ -0,0 +1,54 @@
@@ -97,5 +149,94 @@
 +	_, err := receiveLocalProbeResponse(reader)
 +	if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrClosedPipe) {
 +		t.Fatalf("got %v; want a closed connection error", err)
++	}
++}
+--- /dev/null
++++ b/src/croc/databeam_route_display.go
+@@ -0,0 +1,41 @@
++package croc
++
++// Record only routes selected by LAN discovery/probing or the sender's own
++// local relay. A private address alone does not make a custom relay direct.
++func (c *Client) rememberDirectRelayControlAddress(address string) {
++	c.reconnectRelayMu.Lock()
++	defer c.reconnectRelayMu.Unlock()
++	c.directControlAddress = normalizeRelayAddress(address)
++}
++
++func (c *Client) usesDirectRelayControl() bool {
++	c.reconnectRelayMu.Lock()
++	defer c.reconnectRelayMu.Unlock()
++	return c.directControlAddress != "" &&
++		c.relayControlAddress == c.directControlAddress
++}
++
++// Match the newer CLI's display shape without changing transfer negotiation.
++func formatDataBeamTransferDirection(sender, direct bool, local, peer string) string {
++	local, peer = peerIP(local), peerIP(peer)
++	arrow := "<-"
++	if sender {
++		arrow = "->"
++	}
++	if !direct {
++		return arrow + peer
++	}
++	if local == "" {
++		local = "local"
++	}
++	return local + arrow + peer
++}
++
++func (c *Client) transferDirection() string {
++	direct := c.usesDirectRelayControl()
++	local := c.ExternalIP
++	if direct && len(c.conn) > 0 && c.conn[0] != nil {
++		local = c.conn[0].Connection().LocalAddr().String()
++	}
++	return formatDataBeamTransferDirection(c.Options.IsSender, direct, local, c.ExternalIPConnected)
++}
+--- /dev/null
++++ b/src/croc/databeam_route_display_test.go
+@@ -0,0 +1,42 @@
++package croc
++
++import "testing"
++
++func TestDataBeamRouteFormatting(t *testing.T) {
++	for _, tc := range []struct {
++		sender, direct    bool
++		local, peer, want string
++	}{
++		{true, false, "192.168.1.2:9009", "203.0.113.1:9009", "->203.0.113.1"},
++		{false, false, "192.168.1.2", "192.168.1.3", "<-192.168.1.3"},
++		{true, true, "192.168.1.2:9009", "192.168.1.3:9009", "192.168.1.2->192.168.1.3"},
++		{false, true, "[fe80::1]:9009", "[fe80::2]:9009", "fe80::1<-fe80::2"},
++		{false, true, "", "192.168.1.3", "local<-192.168.1.3"},
++	} {
++		if got := formatDataBeamTransferDirection(tc.sender, tc.direct, tc.local, tc.peer); got != tc.want {
++			t.Errorf("got %q, want %q", got, tc.want)
++		}
++	}
++}
++
++func TestDataBeamRouteTracksSelectedConnection(t *testing.T) {
++	c := &Client{}
++	c.ExternalIP = "192.168.1.2"
++	c.ExternalIPConnected = "192.168.1.3"
++	c.setRelayControlAddress("192.168.1.3:9009")
++	if c.usesDirectRelayControl() {
++		t.Fatal("a private custom relay must not be inferred to be direct")
++	}
++	c.rememberDirectRelayControlAddress("192.168.1.3:9009")
++	if got := c.transferDirection(); got != "192.168.1.2<-192.168.1.3" {
++		t.Fatalf("direct route: %s", got)
++	}
++	c.setRelayControlAddress("203.0.113.1:9009")
++	if got := c.transferDirection(); got != "<-192.168.1.3" {
++		t.Fatalf("relay fallback must clear the direct display: %s", got)
++	}
++	c.setRelayControlAddress("192.168.1.3:9009")
++	if !c.usesDirectRelayControl() {
++		t.Fatal("reconnecting to the known direct route must preserve its display")
 +	}
 +}
