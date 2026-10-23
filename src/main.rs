@@ -440,7 +440,7 @@ impl Default for DataBeamApp {
             cleanup_targets: Vec::new(),
             cleanup_bytes: 0,
             cleanup_prompt_open: false,
-            minimize_to_tray: true,
+            minimize_to_tray: cfg!(target_os = "windows"),
             window_in_tray: false,
             tray_quit_requested: false,
             tray_state: None,
@@ -625,9 +625,9 @@ impl DataBeamApp {
         self.eazysendme_auto_retry = true; // Always true on launch
         self.croc_custom_code = settings.croc_custom_code;
         self.croc_use_custom_code = settings.croc_use_custom_code;
-        self.minimize_to_tray = settings.minimize_to_tray;
-        self.tray_debug_log = settings.tray_debug_log;
-        tray::set_debug_enabled(settings.tray_debug_log);
+        self.minimize_to_tray = cfg!(target_os = "windows") && settings.minimize_to_tray;
+        self.tray_debug_log = cfg!(target_os = "windows") && settings.tray_debug_log;
+        tray::set_debug_enabled(self.tray_debug_log);
         // Limit map size to 20 entries (keep newest)
         // Accept the full map; 20 entries is tiny for JSON anyway.
         self.eazysendme_code_ticket_map = settings.eazysendme_code_ticket_map;
@@ -1283,6 +1283,7 @@ impl DataBeamApp {
     /// Windows-only tray path (see mod tray).
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     fn set_minimize_to_tray(&mut self, ctx: &egui::Context, enabled: bool) {
+        let enabled = cfg!(target_os = "windows") && enabled;
         if self.minimize_to_tray == enabled {
             return;
         }
@@ -2211,8 +2212,8 @@ impl DataBeamApp {
     /// Decide whether a periodic (or startup) check is due. Called every frame;
     /// cheap no-op most of the time.
     fn maybe_trigger_croc_update_check(&mut self, ctx: &egui::Context) {
-        // macOS remains manual-only until its launch behavior is verified.
-        if cfg!(target_os = "macos") {
+        // Automatic update checks are Windows-only. macOS/Linux remain manual-only.
+        if !cfg!(target_os = "windows") {
             return;
         }
         if self.croc_update_phase != CrocUpdatePhase::Idle {
@@ -3473,7 +3474,7 @@ impl DataBeamApp {
                 ui.separator();
                 ui.add_space(4.0);
                 // Croc self-update status + manual check (automatic checks
-                // run on open and every 6 hours).
+                // run on Windows only, on open and every 6 hours).
                 if let Some(line) = self.croc_update_status_line() {
                     ui.label(RichText::new(line).size(11.0).color(TEXT_MUTED).italics());
                 }
@@ -3772,7 +3773,7 @@ impl eframe::App for DataBeamApp {
         self.handle_dropped_files(ctx);
         self.poll_size_updates();
         self.poll_transfer();
-        // Automatic checks on Windows/Linux; macOS remains manual-only.
+        // Automatic checks are Windows-only; macOS/Linux remain manual-only.
         self.poll_tool_detection();
         self.poll_managed_install(ctx);
         self.poll_croc_update(ctx);
@@ -6704,6 +6705,46 @@ mod parse_tests {
             app.poll_transfer();
             assert_eq!(app.transfer_state, TransferState::Failed(error.to_string()));
         }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn non_windows_never_schedules_automatic_croc_updates() {
+        let mut app = DataBeamApp::default();
+        app.tool_statuses = vec![crate::backend::ToolStatus {
+            tool: crate::backend::Tool::Croc,
+            available: true,
+            path: Some("unused-croc".to_string()),
+            version: None,
+        }];
+        let ctx = eframe::egui::Context::default();
+        for startup_done in [false, true] {
+            app.croc_update_startup_check_done = startup_done;
+            app.croc_update_last_check_at = Some(0.0);
+            app.animation_time = DataBeamApp::CROC_UPDATE_INTERVAL_SECS + 1.0;
+            app.maybe_trigger_croc_update_check(&ctx);
+            assert_eq!(app.croc_update_phase, super::CrocUpdatePhase::Idle);
+            assert!(app.croc_update_check_rx.is_none());
+            assert_eq!(app.croc_update_startup_check_done, startup_done);
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn non_windows_saved_settings_cannot_enable_tray() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        std::fs::write(&path, r#"{"minimize_to_tray":true,"tray_debug_log":true}"#).unwrap();
+        let _guard = SettingsFileGuard::set(&path);
+        let mut app = DataBeamApp::default();
+        assert!(!app.minimize_to_tray);
+        app.load_user_settings();
+        assert!(!app.minimize_to_tray);
+        assert!(!app.tray_debug_log);
+        app.set_minimize_to_tray(&eframe::egui::Context::default(), true);
+        assert!(!app.minimize_to_tray);
+        assert!(app.tray_state.is_none());
+        assert!(app.tray_action_rx.is_none());
     }
 
     #[test]

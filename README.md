@@ -30,3 +30,5 @@ You can:
 
 DataBeam bundles **Croc 11.2.5-databeam-keepalive**, built from verified upstream source with a receiver keepalive fix. It uses a separate versioned cache and restores the bundled engine if that copy is damaged. Automatic engine upgrades are held until a verified official release replaces the patch. Public relay names are resolved through the operating system; custom `CROC_RELAY` settings remain supported. See the [keepalive investigation](investigations/croc-relay-keepalive.md) and [build instructions](CONTRIBUTING.md#patched-croc-engine).
 
+System tray support is Windows-only. On macOS and Linux, closing the window exits the app, and automatic Croc update checks are disabled. Saved tray settings cannot enable tray behavior on those platforms.
+

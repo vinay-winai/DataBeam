@@ -131,8 +131,11 @@ jobs:
           cargo build --release --features release-single-instance --target aarch64-apple-darwin
           cargo build --release --features release-single-instance --target x86_64-apple-darwin
 
+      - name: Verify non-Windows platform policy
+        run: cargo test --locked --bin databeam non_windows_
+
       - name: Install cargo-bundle
-        run: cargo install cargo-bundle --locked
+        run: cargo install cargo-bundle --version 0.12.0 --locked
 
       - name: Package macOS universal app bundle
         shell: bash
@@ -140,7 +143,7 @@ jobs:
           set -euo pipefail
           version="${RELEASE_TAG#v}"
           mkdir -p dist
-          cargo bundle --release --features release-single-instance --target aarch64-apple-darwin --format osx
+          cargo bundle --release --features release-single-instance --target aarch64-apple-darwin --format osx --binary-path target/aarch64-apple-darwin/release/databeam
 
           app_path="target/aarch64-apple-darwin/release/bundle/osx/DataBeam.app"
           if [ ! -d "${app_path}" ]; then
@@ -234,7 +237,10 @@ jobs:
         run: cargo build --release --features release-single-instance
 
       - name: Install cargo-bundle
-        run: cargo install cargo-bundle --locked
+        run: cargo install cargo-bundle --version 0.12.0 --locked
+
+      - name: Verify non-Windows platform policy
+        run: cargo test --locked --bin databeam non_windows_
 
       - name: Package Linux x64 deb and AppImage
         shell: bash
@@ -243,7 +249,7 @@ jobs:
           version="${RELEASE_TAG#v}"
           mkdir -p dist
 
-          cargo bundle --release --features release-single-instance --format deb
+          cargo bundle --release --features release-single-instance --format deb --binary-path target/release/databeam
           deb_path="$(find target/release/bundle/deb -maxdepth 1 -name '*.deb' -print -quit)"
           if [ -z "${deb_path}" ]; then
             echo "No .deb produced under target/release/bundle/deb"
@@ -252,7 +258,7 @@ jobs:
           fi
           cp "${deb_path}" "dist/databeam_v${version}_linux-x64.deb"
 
-          cargo bundle --release --features release-single-instance --format appimage
+          cargo bundle --release --features release-single-instance --format appimage --binary-path target/release/databeam
           appimage_path="$(find target/release/bundle/appimage -maxdepth 1 -name '*.AppImage' -print -quit)"
           if [ -z "${appimage_path}" ]; then
             echo "No .AppImage produced under target/release/bundle/appimage"

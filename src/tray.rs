@@ -146,7 +146,7 @@ static DEBUG_ENABLED: std::sync::atomic::AtomicBool =
 
 pub fn set_debug_enabled(enabled: bool) {
     // A saved debug setting must not enable hidden logging in a release build.
-    DEBUG_ENABLED.store(cfg!(debug_assertions) && enabled, std::sync::atomic::Ordering::SeqCst);
+    DEBUG_ENABLED.store(cfg!(target_os = "windows") && cfg!(debug_assertions) && enabled, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Append one line to the tray debug log in the system temp dir.
@@ -252,6 +252,11 @@ pub fn init_tray(
     ctx: eframe::egui::Context,
     hwnd: Option<isize>,
 ) -> Option<(TrayState, mpsc::Receiver<TrayRawEvent>)> {
+    // Guard the factory too: no caller or saved setting may create a tray
+    // or construct native menu objects on macOS/Linux.
+    if !cfg!(target_os = "windows") {
+        return None;
+    }
     let menu = Menu::new();
     let show_item = MenuItem::with_id(TRAY_SHOW_ID, "Show DataBeam", true, None);
     let quit_item = MenuItem::with_id(TRAY_QUIT_ID, "Exit", true, None);
@@ -464,6 +469,14 @@ pub fn hwnd_from_raw(handle: raw_window_handle::RawWindowHandle) -> Option<isize
 mod tests {
     use super::*;
     use tray_icon::{MouseButtonState, Rect, TrayIconId, dpi};
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn non_windows_tray_factory_stays_disabled() {
+        assert!(init_tray(eframe::egui::Context::default(), None).is_none());
+        set_debug_enabled(true);
+        assert!(!DEBUG_ENABLED.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     fn click_event(button: MouseButton, button_state: MouseButtonState) -> TrayIconEvent {
         TrayIconEvent::Click {

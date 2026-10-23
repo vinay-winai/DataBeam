@@ -67,3 +67,19 @@ Run before opening PRs:
 cargo check
 cargo test
 ```
+
+### Release packaging
+
+The release workflow pins `cargo-bundle` to 0.12.0:
+
+```bash
+cargo install cargo-bundle --version 0.12.0 --locked
+```
+
+Keep bundle metadata compatible with that version. Linux terminal settings
+belong under `[package.metadata.bundle.linux]` as `use_terminal`, as described
+in the [0.12.0 manifest documentation](https://github.com/burtonageo/cargo-bundle/blob/v0.12.0/Readme.md#linux-specific-settings).
+Packaging uses `--binary-path` to reuse the release binary already built by CI.
+The macOS and Linux release jobs run `non_windows_` regression tests to verify
+automatic Croc checks and tray initialization stay disabled, including when
+saved settings request a tray icon.

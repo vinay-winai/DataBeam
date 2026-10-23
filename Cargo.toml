@@ -67,7 +67,6 @@ icon = [
   "assets/icons/icon.icns",
 ]
 copyright = "Copyright (c) DataBeam"
-linux_use_terminal = false
 deb_depends = [
   "libasound2",
   "libglib2.0-0",
@@ -82,4 +81,6 @@ deb_depends = [
   "libwayland-egl1",
 ]
 
+[package.metadata.bundle.linux]
+use_terminal = false
 
