@@ -1,0 +1,51 @@
+[
+  {
+    "engine": "Croc",
+    "file": "received\\DataBeam-test-100MB.bin",
+    "bytes": 104857600,
+    "sha256": "6526dba3e3465fb1138cdaa474559fd8c2d8880d23940c5cdad7394f6e044cee",
+    "matches": true
+  },
+  {
+    "engine": "Croc",
+    "file": "received\\DataBeam-test-250MB.bin",
+    "bytes": 262144000,
+    "sha256": "2d22de71e442a679b6f8186147cf3ba1a36f786c2dc742f8424f4414aa1a1622",
+    "matches": true
+  },
+  {
+    "engine": "Croc",
+    "file": "received\\DataBeam-test-300MB.bin",
+    "bytes": 314572800,
+    "sha256": "c0e296717f361797da1384b86ee4c9e6a818492ea441d1ed24c49730b123fb10",
+    "matches": true
+  },
+  {
+    "engine": "Sendme",
+    "file": "received\\files_databeam\\files\\DataBeam-test-100MB.bin",
+    "bytes": 104857600,
+    "sha256": "6526dba3e3465fb1138cdaa474559fd8c2d8880d23940c5cdad7394f6e044cee",
+    "matches": true
+  },
+  {
+    "engine": "Sendme",
+    "file": "received\\files_databeam\\files\\DataBeam-test-250MB.bin",
+    "bytes": 262144000,
+    "sha256": "2d22de71e442a679b6f8186147cf3ba1a36f786c2dc742f8424f4414aa1a1622",
+    "matches": true
+  },
+  {
+    "engine": "Sendme",
+    "file": "received\\files_databeam\\files\\DataBeam-test-300MB.bin",
+    "bytes": 314572800,
+    "sha256": "c0e296717f361797da1384b86ee4c9e6a818492ea441d1ed24c49730b123fb10",
+    "matches": true
+  },
+  {
+    "engine": "EazySendme",
+    "file": "received\\DataBeam-test-250MB._databeam\\DataBeam-test-250MB.bin",
+    "bytes": 262144000,
+    "sha256": "2d22de71e442a679b6f8186147cf3ba1a36f786c2dc742f8424f4414aa1a1622",
+    "matches": true
+  }
+]

@@ -1,0 +1,256 @@
+{
+  "verified_file_copies": 33,
+  "all_hashes_match": true,
+  "checks": [
+    {
+      "scenario": "EazySendme multiple files after auto-retry",
+      "file": "extended\\eazy-multi-received\\1_DataBeam-test-300MB._and_more_databeam\\DataBeam-test-100MB.bin",
+      "bytes": 104857600,
+      "sha256": "6526dba3e3465fb1138cdaa474559fd8c2d8880d23940c5cdad7394f6e044cee",
+      "matches": true
+    },
+    {
+      "scenario": "EazySendme multiple files after auto-retry",
+      "file": "extended\\eazy-multi-received\\1_DataBeam-test-300MB._and_more_databeam\\DataBeam-test-250MB.bin",
+      "bytes": 262144000,
+      "sha256": "2d22de71e442a679b6f8186147cf3ba1a36f786c2dc742f8424f4414aa1a1622",
+      "matches": true
+    },
+    {
+      "scenario": "EazySendme multiple files after auto-retry",
+      "file": "extended\\eazy-multi-received\\1_DataBeam-test-300MB._and_more_databeam\\DataBeam-test-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "c0e296717f361797da1384b86ee4c9e6a818492ea441d1ed24c49730b123fb10",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast short receiver 1",
+      "file": "extended\\broadcast-receiver-1\\DataBeam-test-300MB._and_more_databeam\\DataBeam-test-100MB.bin",
+      "bytes": 104857600,
+      "sha256": "6526dba3e3465fb1138cdaa474559fd8c2d8880d23940c5cdad7394f6e044cee",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast short receiver 1",
+      "file": "extended\\broadcast-receiver-1\\DataBeam-test-300MB._and_more_databeam\\DataBeam-test-250MB.bin",
+      "bytes": 262144000,
+      "sha256": "2d22de71e442a679b6f8186147cf3ba1a36f786c2dc742f8424f4414aa1a1622",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast short receiver 1",
+      "file": "extended\\broadcast-receiver-1\\DataBeam-test-300MB._and_more_databeam\\DataBeam-test-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "c0e296717f361797da1384b86ee4c9e6a818492ea441d1ed24c49730b123fb10",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast short receiver 2",
+      "file": "extended\\broadcast-receiver-2\\DataBeam-test-300MB._and_more_databeam\\DataBeam-test-100MB.bin",
+      "bytes": 104857600,
+      "sha256": "6526dba3e3465fb1138cdaa474559fd8c2d8880d23940c5cdad7394f6e044cee",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast short receiver 2",
+      "file": "extended\\broadcast-receiver-2\\DataBeam-test-300MB._and_more_databeam\\DataBeam-test-250MB.bin",
+      "bytes": 262144000,
+      "sha256": "2d22de71e442a679b6f8186147cf3ba1a36f786c2dc742f8424f4414aa1a1622",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast short receiver 2",
+      "file": "extended\\broadcast-receiver-2\\DataBeam-test-300MB._and_more_databeam\\DataBeam-test-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "c0e296717f361797da1384b86ee4c9e6a818492ea441d1ed24c49730b123fb10",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast concurrent receiver 1",
+      "file": "extended\\broadcast-receiver-1\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-01-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "f7f4966e8079764fed25adad5f4f268a01ed1c5091f120facac4f8fb77f1453a",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast concurrent receiver 1",
+      "file": "extended\\broadcast-receiver-1\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-02-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "44caa5070d3495dc555d4a809105acae2e83ff9c04d9416281683e937ba80ab6",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast concurrent receiver 1",
+      "file": "extended\\broadcast-receiver-1\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-03-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "9deebd1bbc97ff02dc0ef191b20a150da8c8ad40b2d32c9e290bc6790e993a4e",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast concurrent receiver 1",
+      "file": "extended\\broadcast-receiver-1\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-04-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "a06a6131acf077e8743bb98a9b0d0c6551ecc8585bf3cec6f770b908ec0bc9c5",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast concurrent receiver 1",
+      "file": "extended\\broadcast-receiver-1\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-05-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "db8b5c8c759d29a36601663a0ddc6c4ded60c89fcdda8a45c16a5bc6532305f7",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast concurrent receiver 1",
+      "file": "extended\\broadcast-receiver-1\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-06-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "944092b30fb00f079a873308a8279aad04f0279df115853a714c820098cdf0fc",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast concurrent receiver 1",
+      "file": "extended\\broadcast-receiver-1\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-07-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "7482572a9f583bcab01539ce75e1a633c1772d3496e883b6d10a96d4f61a6751",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast concurrent receiver 1",
+      "file": "extended\\broadcast-receiver-1\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-08-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "80ef146efa840b04cd145d1614d8e9cf8ba60da9bfc35cc12ca69554026a7076",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast concurrent receiver 1",
+      "file": "extended\\broadcast-receiver-1\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-09-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "4ddb407a1f2c0e829c9e9e0a53db8f4d1c154a54d690ad55c06bda1a19a75ff8",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast concurrent receiver 1",
+      "file": "extended\\broadcast-receiver-1\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-10-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "f7ce335a599df6a3c710594633d51f2ae21d51f2bf8ae005f1964ab371e71473",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast concurrent receiver 1",
+      "file": "extended\\broadcast-receiver-1\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-11-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "9c8761cfeda0d072a25f540abd113b26817ff8fb7e9b400eac7ddafb45f6e035",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast concurrent receiver 1",
+      "file": "extended\\broadcast-receiver-1\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-12-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "9e78527671b2c674ba07e07e6aec6bbcbe15c91b9963fa19284b5e2b049fc9c4",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast concurrent receiver 2",
+      "file": "extended\\broadcast-receiver-2\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-01-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "f7f4966e8079764fed25adad5f4f268a01ed1c5091f120facac4f8fb77f1453a",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast concurrent receiver 2",
+      "file": "extended\\broadcast-receiver-2\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-02-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "44caa5070d3495dc555d4a809105acae2e83ff9c04d9416281683e937ba80ab6",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast concurrent receiver 2",
+      "file": "extended\\broadcast-receiver-2\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-03-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "9deebd1bbc97ff02dc0ef191b20a150da8c8ad40b2d32c9e290bc6790e993a4e",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast concurrent receiver 2",
+      "file": "extended\\broadcast-receiver-2\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-04-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "a06a6131acf077e8743bb98a9b0d0c6551ecc8585bf3cec6f770b908ec0bc9c5",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast concurrent receiver 2",
+      "file": "extended\\broadcast-receiver-2\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-05-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "db8b5c8c759d29a36601663a0ddc6c4ded60c89fcdda8a45c16a5bc6532305f7",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast concurrent receiver 2",
+      "file": "extended\\broadcast-receiver-2\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-06-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "944092b30fb00f079a873308a8279aad04f0279df115853a714c820098cdf0fc",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast concurrent receiver 2",
+      "file": "extended\\broadcast-receiver-2\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-07-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "7482572a9f583bcab01539ce75e1a633c1772d3496e883b6d10a96d4f61a6751",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast concurrent receiver 2",
+      "file": "extended\\broadcast-receiver-2\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-08-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "80ef146efa840b04cd145d1614d8e9cf8ba60da9bfc35cc12ca69554026a7076",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast concurrent receiver 2",
+      "file": "extended\\broadcast-receiver-2\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-09-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "4ddb407a1f2c0e829c9e9e0a53db8f4d1c154a54d690ad55c06bda1a19a75ff8",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast concurrent receiver 2",
+      "file": "extended\\broadcast-receiver-2\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-10-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "f7ce335a599df6a3c710594633d51f2ae21d51f2bf8ae005f1964ab371e71473",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast concurrent receiver 2",
+      "file": "extended\\broadcast-receiver-2\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-11-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "9c8761cfeda0d072a25f540abd113b26817ff8fb7e9b400eac7ddafb45f6e035",
+      "matches": true
+    },
+    {
+      "scenario": "Broadcast concurrent receiver 2",
+      "file": "extended\\broadcast-receiver-2\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-12-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "9e78527671b2c674ba07e07e6aec6bbcbe15c91b9963fa19284b5e2b049fc9c4",
+      "matches": true
+    }
+  ],
+  "overwrite_protection": {
+    "existing_sentinel_unchanged": true,
+    "sentinel_sha256": "c8a7df793d01f25e8a1303f33fff4b1d334d462b99375a9c67e21cda3814c8a3",
+    "incoming_folder": "1_DataBeam-test-300MB._and_more_databeam"
+  },
+  "auto_retry": {
+    "induced_fault": "Temporary output directory obstruction with independent OS-temp blob cache",
+    "retry_wait_seconds": 36,
+    "manual_retry_clicked": false,
+    "recovery": "Automatic verification and export of complete cached blobs"
+  },
+  "broadcast": {
+    "sender_instances": 1,
+    "receiver_instances": 2,
+    "captured_sender_status": "2 transfers in progress",
+    "payload_files": 12,
+    "payload_bytes": 3774873600
+  },
+  "known_display_issue": "Cached export completion showed 300 MiB for the three-file 650 MiB batch; all three exported files passed SHA-256 checks."
+}

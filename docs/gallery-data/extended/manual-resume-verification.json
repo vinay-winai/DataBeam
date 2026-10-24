@@ -1,0 +1,86 @@
+{
+  "scenario": "EazySendme Stop and manual Retry with auto-retry off on both peers",
+  "payload_bytes": 3774873600,
+  "payload_files": 12,
+  "cache_bytes_retained_at_stop": 1976656522,
+  "sender_retry_clicked": true,
+  "receiver_retry_clicked": true,
+  "auto_retry_enabled": false,
+  "complete": true,
+  "all_hashes_match": true,
+  "checks": [
+    {
+      "file": "extended\\manual-resume-received\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-01-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "f7f4966e8079764fed25adad5f4f268a01ed1c5091f120facac4f8fb77f1453a",
+      "matches": true
+    },
+    {
+      "file": "extended\\manual-resume-received\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-02-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "44caa5070d3495dc555d4a809105acae2e83ff9c04d9416281683e937ba80ab6",
+      "matches": true
+    },
+    {
+      "file": "extended\\manual-resume-received\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-03-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "9deebd1bbc97ff02dc0ef191b20a150da8c8ad40b2d32c9e290bc6790e993a4e",
+      "matches": true
+    },
+    {
+      "file": "extended\\manual-resume-received\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-04-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "a06a6131acf077e8743bb98a9b0d0c6551ecc8585bf3cec6f770b908ec0bc9c5",
+      "matches": true
+    },
+    {
+      "file": "extended\\manual-resume-received\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-05-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "db8b5c8c759d29a36601663a0ddc6c4ded60c89fcdda8a45c16a5bc6532305f7",
+      "matches": true
+    },
+    {
+      "file": "extended\\manual-resume-received\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-06-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "944092b30fb00f079a873308a8279aad04f0279df115853a714c820098cdf0fc",
+      "matches": true
+    },
+    {
+      "file": "extended\\manual-resume-received\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-07-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "7482572a9f583bcab01539ce75e1a633c1772d3496e883b6d10a96d4f61a6751",
+      "matches": true
+    },
+    {
+      "file": "extended\\manual-resume-received\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-08-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "80ef146efa840b04cd145d1614d8e9cf8ba60da9bfc35cc12ca69554026a7076",
+      "matches": true
+    },
+    {
+      "file": "extended\\manual-resume-received\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-09-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "4ddb407a1f2c0e829c9e9e0a53db8f4d1c154a54d690ad55c06bda1a19a75ff8",
+      "matches": true
+    },
+    {
+      "file": "extended\\manual-resume-received\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-10-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "f7ce335a599df6a3c710594633d51f2ae21d51f2bf8ae005f1964ab371e71473",
+      "matches": true
+    },
+    {
+      "file": "extended\\manual-resume-received\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-11-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "9c8761cfeda0d072a25f540abd113b26817ff8fb7e9b400eac7ddafb45f6e035",
+      "matches": true
+    },
+    {
+      "file": "extended\\manual-resume-received\\broadcast-payload_databeam\\broadcast-payload\\Broadcast-12-300MB.bin",
+      "bytes": 314572800,
+      "sha256": "9e78527671b2c674ba07e07e6aec6bbcbe15c91b9963fa19284b5e2b049fc9c4",
+      "matches": true
+    }
+  ],
+  "note": "The interrupted one-shot sender was retried as well as the receiver. The cache directory persisted across reconnection. Stop + Retry is the app workflow, not a dedicated Pause control."
+}
