@@ -1,8 +1,14 @@
 # Croc relay keepalive investigation
 
+**2026-10-26 update:** DataBeam has moved to official 11.5.5 source, whose
+`receiveControlFrame` and route tracking implement the fixes described below.
+The older observations and patch are retained as historical evidence; they do
+not describe the newly downloaded 11.5.5 source. See the
+[11.5.5 upgrade](croc-11.5.5-upgrade.md) for the current bundle and validation.
+
 Investigated on 2026-10-23, Windows x64. **Root cause reproduced outside
 DataBeam; a minimal Croc receiver patch passed the targeted regression tests.**
-DataBeam now bundles the patched engine as `11.2.5-databeam-keepalive-route`.
+At the time, DataBeam bundled the patched engine as `11.2.5-databeam-keepalive-route`.
 The build recipe verifies the upstream source archive, applies the tracked
 patch, tests it, and generates a compressed payload for each release target.
 Runtime extraction verifies SHA-256 and uses a separate version/architecture

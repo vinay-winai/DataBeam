@@ -248,6 +248,7 @@ struct DataBeamApp {
     /// cleared per transfer. Croc mode only — never set from the EazySendme
     /// ticket leg (that leg's path says nothing about the sendme data leg).
     croc_route: Option<CrocRoute>,
+    sendme_route: Option<SendmeRoute>,
     transfer_phase: TransferPhase,
     preparing_progress: f32,
     transfer_payload_start_time: Option<f64>,
@@ -258,6 +259,7 @@ struct DataBeamApp {
     eazy_local_check_started_at: Option<f64>,
     croc_qr_popup_open: bool,
     croc_text_popup_open: bool,
+    croc_text_copied_until: Option<f64>,
     settings_popup_open: bool,
     /// Tray debug log to temp file (default off; see tray::set_debug_enabled).
     tray_debug_log: bool,
@@ -386,6 +388,7 @@ impl Default for DataBeamApp {
             croc_received_text: None,
             croc_expect_text_payload: false,
             croc_route: None,
+            sendme_route: None,
             transfer_phase: TransferPhase::Preparing,
             preparing_progress: 0.0,
             transfer_payload_start_time: None,
@@ -396,6 +399,7 @@ impl Default for DataBeamApp {
             eazy_local_check_started_at: None,
             croc_qr_popup_open: false,
             croc_text_popup_open: false,
+            croc_text_copied_until: None,
             settings_popup_open: false,
             tray_debug_log: false,
             toast_msg: None,
@@ -1138,6 +1142,7 @@ impl DataBeamApp {
         self.croc_received_text = None;
         self.croc_expect_text_payload = false;
         self.croc_route = None;
+        self.sendme_route = None;
         self.transfer_phase = TransferPhase::Preparing;
         self.preparing_progress = 0.0;
         self.transfer_payload_start_time = None;
@@ -1148,6 +1153,7 @@ impl DataBeamApp {
         self.eazysendme_croc_handle = None;
         self.eazysendme_croc_rx = None;
         self.croc_text_popup_open = false;
+        self.croc_text_copied_until = None;
         self.sendme_peer_connected = false;
         self.sendme_had_transfer = false;
         self.sendme_waiting_after_cycle = false;
@@ -2270,6 +2276,20 @@ impl DataBeamApp {
                     Ok(msg) => {
                         processed += 1;
                         match msg {
+                            TransferMsg::ReceivedText(text) => {
+                                self.croc_received_text = Some(text);
+                                self.croc_expect_text_payload = false;
+                                self.croc_text_copied_until = None;
+                            }
+                            TransferMsg::SendmeRoute(route) => {
+                                if self.sendme_route != route {
+                                    self.sendme_route = route;
+                                    self.transfer_log.push(format!(
+                                        "Transfer mode: {}",
+                                        route.map(SendmeRoute::label).unwrap_or("Reconnecting")
+                                    ));
+                                }
+                            }
                             TransferMsg::Output(line) => {
                                 let lower = line.to_lowercase();
                                 // Data-path route from croc's `Sending (...)`
@@ -2869,6 +2889,7 @@ impl DataBeamApp {
                                 };
                                 self.transfer_end_time = None;
                                 self.croc_route = None;
+                                self.sendme_route = None;
                                 self.transfer_speed_bps = None;
                                 self.transfer_speed_samples.clear();
                                 self.transfer_done_bytes = None;
@@ -3587,30 +3608,29 @@ impl DataBeamApp {
 
     fn render_croc_text_popup(&mut self, ctx: &egui::Context) {
         let mut open = self.croc_text_popup_open;
-        let text_opt = self.croc_received_text.clone();
-        let accent = self.engine_color();
-        egui::Window::new("Received Croc Text")
+        let screen = ctx.screen_rect().size() - Vec2::new(32.0, 48.0);
+        let copied = self.croc_text_copied_until.is_some_and(|until| self.animation_time < until);
+        let mut did_copy = false;
+        egui::Window::new("Received text")
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
+            .default_size(Vec2::new(720.0_f32.min(screen.x), 520.0_f32.min(screen.y)))
+            .min_size(Vec2::new(300.0_f32.min(screen.x), 200.0_f32.min(screen.y)))
+            .max_size(screen)
             .show(ctx, |ui| {
-                let Some(text) = text_opt.as_ref() else {
+                let Some(text) = self.croc_received_text.as_deref() else {
                     ui.label("No text received yet");
                     return;
                 };
-                if accent_button_sized(ui, "📋 Copy Text", accent, Vec2::new(100.0, 24.0)).clicked()
-                {
-                    ui.ctx().copy_text(text.clone());
-                    self.show_toast("Text copied".to_string(), SUCCESS);
-                }
-                let mut display = text.clone();
-                ui.add(
-                    egui::TextEdit::multiline(&mut display)
-                        .desired_rows(6)
-                        .interactive(false)
-                        .font(egui::FontId::new(12.0, egui::FontFamily::Monospace)),
-                );
+                let height = (ui.available_height() - 88.0).max(80.0);
+                did_copy = received_text_card(ui, text, copied, false,
+                    height, "croc_text_expanded").copied;
             });
+        if did_copy {
+            self.croc_text_copied_until = Some(self.animation_time + 2.0);
+            self.show_toast("Text copied".to_string(), SUCCESS);
+        }
         self.croc_text_popup_open = open;
     }
 }
@@ -5055,53 +5075,16 @@ impl DataBeamApp {
         {
             ui.add_space(6.0);
         }
-        if self.selected_tool == SelectedTool::Croc {
-            let text = self
-                .croc_received_text
-                .clone()
-                .unwrap_or_else(|| "No text received yet.".to_string());
-            let has_text = self.croc_received_text.is_some();
+        if self.selected_tool == SelectedTool::Croc && self.croc_received_text.is_some() {
             ui.add_space(6.0);
-            card_frame(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Received Text")
-                            .color(TEXT_PRIMARY)
-                            .strong()
-                            .size(12.0),
-                    );
-                    ui.add_enabled_ui(has_text, |ui| {
-                        if accent_button_sized(
-                            ui,
-                            "📋 Copy",
-                            self.engine_color(),
-                            Vec2::new(70.0, 22.0),
-                        )
-                        .clicked()
-                        {
-                            ui.ctx().copy_text(text.clone());
-                            self.show_toast("Text copied".to_string(), SUCCESS);
-                        }
-                        if accent_button_sized(
-                            ui,
-                            "🔍 Popup",
-                            self.engine_color(),
-                            Vec2::new(74.0, 22.0),
-                        )
-                        .clicked()
-                        {
-                            self.croc_text_popup_open = true;
-                        }
-                    });
-                });
-                let mut display = text;
-                ui.add(
-                    egui::TextEdit::multiline(&mut display)
-                        .desired_rows(4)
-                        .interactive(false)
-                        .font(egui::FontId::new(12.0, egui::FontFamily::Monospace)),
-                );
-            });
+            let copied = self.croc_text_copied_until.is_some_and(|until| self.animation_time < until);
+            let actions = received_text_card(ui, self.croc_received_text.as_deref().unwrap(),
+                copied, true, 260.0, "croc_text_inline");
+            if actions.copied {
+                self.croc_text_copied_until = Some(self.animation_time + 2.0);
+                self.show_toast("Text copied".to_string(), SUCCESS);
+            }
+            if actions.expand { self.croc_text_popup_open = true; }
         }
 
         if self.selected_tool == SelectedTool::EazySendme {
@@ -5256,6 +5239,13 @@ impl DataBeamApp {
                             let e = self.animation_time - start;
                             ui.label(
                                 RichText::new(format!("{}:{:02}", e as u64 / 60, e as u64 % 60))
+                                    .color(TEXT_MUTED)
+                                    .size(11.0),
+                            );
+                        }
+                        if let Some(route) = self.sendme_route {
+                            ui.label(
+                                RichText::new(format!("Transfer mode: {}", route.label()))
                                     .color(TEXT_MUTED)
                                     .size(11.0),
                             );
@@ -5548,6 +5538,14 @@ impl DataBeamApp {
                                 .size(10.0)
                                 .color(TEXT_MUTED)
                                 .monospace(),
+                            );
+                        }
+                        if let Some(route) = self.sendme_route {
+                            ui.label(
+                                RichText::new(format!("Transfer mode: {}", route.label()))
+                                    .size(10.0)
+                                    .color(TEXT_MUTED)
+                                    .monospace(),
                             );
                         }
                         // Data path seen on this transfer (Croc mode only).
@@ -7282,6 +7280,52 @@ mod parse_tests {
         let line = "received text hello from croc";
         let text = extract_croc_received_text(line).expect("text parsed");
         assert_eq!(text, "hello from croc");
+    }
+
+    #[test]
+    fn croc_complete_received_text_keeps_whitespace_and_uses_inline_view() {
+        let mut app = DataBeamApp::default();
+        app.selected_tool = SelectedTool::Croc;
+        app.view = AppView::Receive;
+        let (tx, rx) = mpsc::channel();
+        app.transfer_rx = Some(rx);
+        let text = format!("\n  \"start\"\r\n\n{}\nerror: file --overwrite\n\n", "x".repeat(20_000));
+        tx.send(TransferMsg::ReceivedText(text.clone())).unwrap();
+        app.poll_transfer();
+        assert_eq!(app.croc_received_text.as_deref(), Some(text.as_str()));
+        assert!(!app.croc_text_popup_open, "received text should not force a popup");
+        assert!(!app.transfer_log.iter().any(|line| line.contains("--overwrite")));
+    }
+
+    #[test]
+    fn sendme_route_updates_follow_the_payload_and_reset_between_transfers() {
+        use super::SendmeRoute;
+
+        for tool in [SelectedTool::Sendme, SelectedTool::EazySendme] {
+            let mut app = DataBeamApp::default();
+            app.selected_tool = tool;
+            app.view = AppView::Receive;
+            let (tx, rx) = mpsc::channel();
+            app.transfer_rx = Some(rx);
+
+            // Croc's ticket handoff must never determine Sendme's data path.
+            tx.send(TransferMsg::Output("Receiving (<-203.0.113.1:9009)".into())).unwrap();
+            app.poll_transfer();
+            assert_eq!(app.sendme_route, None);
+
+            for route in [Some(SendmeRoute::Relay), Some(SendmeRoute::Direct), None] {
+                tx.send(TransferMsg::SendmeRoute(route)).unwrap();
+                app.poll_transfer();
+                assert_eq!(app.sendme_route, route);
+            }
+            assert!(app.transfer_log.iter().any(|line| line == "Transfer mode: Relay"));
+            assert!(app.transfer_log.iter().any(|line| line == "Transfer mode: Direct"));
+
+            tx.send(TransferMsg::SendmeRoute(Some(SendmeRoute::Direct))).unwrap();
+            app.poll_transfer();
+            app.reset_transfer();
+            assert_eq!(app.sendme_route, None);
+        }
     }
 
     #[test]

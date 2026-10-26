@@ -143,6 +143,36 @@ pub async fn download(
                 }
             };
 
+            // Follow the selected data path, as upstream Sendme does. A ticket's
+            // relay address alone does not tell us how the payload is travelling.
+            // Abort the watcher when this download finishes or is cancelled.
+            let _route_watcher = n0_future::task::AbortOnDropHandle::new(tokio::spawn({
+                let connection = connection.clone();
+                let app_handle = app_handle.clone();
+                async move {
+                    let mut paths = connection.paths_stream();
+                    let mut last = None;
+                    while let Some(list) = paths.next().await {
+                        let selected = (&list)
+                            .into_iter()
+                            .find(|path| path.is_selected())
+                            .map(|path| path.is_relay());
+                        if selected != last {
+                            emit_event_with_payload(
+                                &app_handle,
+                                "receive-route",
+                                match selected {
+                                    Some(true) => "relay",
+                                    Some(false) => "direct",
+                                    None => "unknown",
+                                },
+                            );
+                            last = selected;
+                        }
+                    }
+                }
+            }));
+
             let sizes_result =
                 get_hash_seq_and_sizes(&connection, &hash_and_format.hash, 1024 * 1024 * 32, None)
                     .await;

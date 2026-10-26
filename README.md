@@ -27,6 +27,11 @@ You can:
 - QR code generation for transfer codes/tickets
 - modern native desktop UI with no browser runtime
 - visible transfer logs inside the app
+- live Direct/Relay transfer mode on Sendme and EasySendMe receivers
+- scrollable, selectable Croc received-text panel with Copy text and an expanded view; long messages preserve their original line breaks and whitespace
+
+The embedded Sendme engine includes the official 0.37.1 security fixes and
+receiver route reporting. See the [upstream synchronization notes](investigations/sendme-upstream-sync.md).
 
 ## Screenshot gallery
 
@@ -374,7 +379,7 @@ Known display issue shown in the captures: cached EazySendme export reports 300 
 
 [Initial transfer verification](docs/gallery-data/verification.json) · [Retry, conflict, and broadcast verification](docs/gallery-data/extended/verification.json) · [Manual-resume verification](docs/gallery-data/extended/manual-resume-verification.json)
 
-DataBeam bundles **Croc 11.2.5-databeam-keepalive-route**, built from verified upstream source with receiver keepalive and route-display fixes. It uses a separate versioned cache and restores the bundled engine if that copy is damaged. Automatic engine upgrades are held until a verified official release replaces the patch, and the update button is hidden while pinned. Public relay names are resolved through the operating system; LAN discovery and direct transfers remain enabled. Custom `CROC_RELAY` settings remain supported. See the [keepalive investigation](investigations/croc-relay-keepalive.md) and [build instructions](CONTRIBUTING.md#patched-croc-engine).
+DataBeam bundles **Croc 11.5.5-databeam**, built from verified official 11.5.5 source with compatibility fixes for Windows text reception and slow-relay probe responses. Upstream now supplies keepalive filtering, route reporting, and the local-listener startup fix; DataBeam retains regression tests for the earlier patches. It uses a separate versioned cache and restores the bundled engine if that copy is damaged. Automatic engine replacement stays pinned to this verified build, and the update button is hidden while pinned. Public relay names are resolved through the operating system; LAN discovery and direct transfers remain enabled. Custom `CROC_RELAY` settings remain supported. See the [upgrade notes](investigations/croc-11.5.5-upgrade.md) and [build instructions](CONTRIBUTING.md#patched-croc-engine).
 
 System tray support is Windows-only. On macOS and Linux, closing the window exits the app, and automatic Croc update checks are disabled. Saved tray settings cannot enable tray behavior on those platforms.
 

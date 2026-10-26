@@ -65,10 +65,10 @@ passes the resulting address to Croc. It preserves code-to-relay routing
 and resolves names at runtime; no relay IP is hardcoded into the app.
 An explicit user `CROC_RELAY` / `CROC_RELAY6` remains supported.
 
-The bundled `11.2.5-databeam-keepalive` engine is built without forcing
+The current bundled `11.5.5-databeam` engine is built without forcing
 `netgo`, allowing Go's normal platform resolver selection. On Windows and
 macOS this also preserves the native resolver path. The receiver keepalive
-patch remains separate from this build choice and the Rust DNS workaround.
+handling remains separate from this build choice and the Rust DNS workaround.
 
 The release recipe, source hash, patch hash, and per-target payload hashes
 make the engine identity explicit. Automatic updates remain held so an

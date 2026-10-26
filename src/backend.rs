@@ -898,6 +898,7 @@ pub fn resolve_tool_path(tool: &Tool, statuses: &[ToolStatus]) -> Option<String>
 #[derive(Debug, Clone)]
 pub enum TransferMsg {
     Output(String),
+    ReceivedText(String),
     Progress(f32),
     Code(String),
     Completed,
@@ -907,6 +908,22 @@ pub enum TransferMsg {
     WaitingForReceiver,
     SenderTransferActivity,
     ActiveTransfers(usize),
+    SendmeRoute(Option<SendmeRoute>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendmeRoute {
+    Direct,
+    Relay,
+}
+
+impl SendmeRoute {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Direct => "Direct",
+            Self::Relay => "Relay",
+        }
+    }
 }
 
 // ── Transfer Options ───────────────────────────────────────────────
@@ -1015,6 +1032,7 @@ enum NativeSendmeEvent {
     TransferFailed,
     ActiveConnectionCount(usize),
     ReceiveStarted,
+    ReceiveRoute(Option<SendmeRoute>),
     ReceiveProgress {
         done: u64,
         total: u64,
@@ -1056,6 +1074,12 @@ impl NativeSendmeEventEmitter for NativeSendmeEmitter {
 
     fn emit_event_with_payload(&self, event_name: &str, payload: &str) -> Result<(), String> {
         let evt = match event_name {
+            "receive-route" => NativeSendmeEvent::ReceiveRoute(match payload {
+                "direct" => Some(SendmeRoute::Direct),
+                "relay" => Some(SendmeRoute::Relay),
+                "unknown" => None,
+                _ => return Ok(()),
+            }),
             "transfer-progress" => {
                 let Some((done, total, speed_bps)) = parse_native_progress_payload(payload) else {
                     return Ok(());
@@ -1272,6 +1296,8 @@ struct CrocAttemptOutput {
     error: Option<String>,
     error_from_stdout: bool,
     payload_started: bool,
+    receiving_text: bool,
+    stdout_read_error: Option<String>,
 }
 
 impl CrocAttemptOutput {
@@ -1282,6 +1308,9 @@ impl CrocAttemptOutput {
             self.code = Some(code);
         }
         self.payload_started |= parse_croc_direction(line).is_some();
+        if !is_stdout && line.starts_with("Receiving text message (") {
+            self.receiving_text = true;
+        }
         let lower = line.to_lowercase();
         if lower.contains("could not connect")
             || lower.starts_with("could not ")
@@ -1484,6 +1513,7 @@ fn spawn_croc_transfer(
                 }
             }
             let output = Arc::new(std::sync::Mutex::new(CrocAttemptOutput::default()));
+            let received_stdout = Arc::new(std::sync::Mutex::new(Vec::new()));
             let readers: Vec<_> = [
                 child
                     .stdout
@@ -1500,7 +1530,21 @@ fn spawn_croc_transfer(
                 let tx = tx.clone();
                 let cancel = cancel2.clone();
                 let output = output.clone();
+                let received_stdout = received_stdout.clone();
                 thread::spawn(move || {
+                    if is_stdout && !announce_code {
+                        // Croc writes the exact text payload to stdout, while
+                        // transfer status/prompts use stderr. Do not split,
+                        // trim, strip ANSI, or interpret message text as logs.
+                        let mut reader = reader;
+                        let mut bytes = Vec::new();
+                        if let Err(error) = reader.read_to_end(&mut bytes) {
+                            output.lock().unwrap_or_else(|e| e.into_inner()).stdout_read_error =
+                                Some(format!("Read Croc text: {error}"));
+                        }
+                        *received_stdout.lock().unwrap_or_else(|e| e.into_inner()) = bytes;
+                        return;
+                    }
                     read_lines_cr_aware(
                         reader,
                         tx,
@@ -1533,6 +1577,30 @@ fn spawn_croc_transfer(
                     return;
                 }
             };
+            if !announce_code {
+                if let Some(error) = output.lock().unwrap_or_else(|e| e.into_inner()).stdout_read_error.clone() {
+                    let _ = tx.send(TransferMsg::Error(error));
+                    return;
+                }
+                let bytes = std::mem::take(&mut *received_stdout.lock().unwrap_or_else(|e| e.into_inner()));
+                let is_text = output.lock().unwrap_or_else(|e| e.into_inner()).receiving_text;
+                if status.success() && is_text {
+                    match String::from_utf8(bytes) {
+                        Ok(text) => { let _ = tx.send(TransferMsg::ReceivedText(text)); }
+                        Err(_) => {
+                            let _ = tx.send(TransferMsg::Error("Received text is not valid UTF-8".into()));
+                            return;
+                        }
+                    }
+                } else {
+                    // Returned CLI errors still need classification for the
+                    // existing DNS recovery path, after the process finishes.
+                    for line in String::from_utf8_lossy(&bytes).lines() {
+                        output.lock().unwrap_or_else(|e| e.into_inner()).observe(line, true);
+                        parse_croc_output(line, &tx, &cancel2);
+                    }
+                }
+            }
             if status.success() {
                 let _ = tx.send(TransferMsg::Completed);
                 return;
@@ -1933,6 +2001,7 @@ pub fn sendme_send(
                     }
                 }
                 Ok(NativeSendmeEvent::ReceiveStarted)
+                | Ok(NativeSendmeEvent::ReceiveRoute(_))
                 | Ok(NativeSendmeEvent::ReceiveProgress { .. })
                 | Ok(NativeSendmeEvent::ReceiveCompleted)
                 | Ok(NativeSendmeEvent::ReceiveExportStarted)
@@ -2097,6 +2166,9 @@ pub fn sendme_receive(
                 Ok(NativeSendmeEvent::ReceiveStarted) => {
                     let _ = tx.send(TransferMsg::Output("[2/4] Downloading...".to_string()));
                 }
+                Ok(NativeSendmeEvent::ReceiveRoute(route)) => {
+                    let _ = tx.send(TransferMsg::SendmeRoute(route));
+                }
                 Ok(NativeSendmeEvent::ReceiveProgress {
                     done,
                     total,
@@ -2160,11 +2232,15 @@ pub fn sendme_receive(
         }
 
         while let Ok(evt) = evt_rx.try_recv() {
-            if let NativeSendmeEvent::ReceiveProgress { done, total, .. } = evt {
-                if total > 0 {
+            match evt {
+                NativeSendmeEvent::ReceiveProgress { done, total, .. } if total > 0 => {
                     let progress = (done as f32 / total as f32).clamp(0.0, 1.0);
                     let _ = tx.send(TransferMsg::Progress(progress));
                 }
+                NativeSendmeEvent::ReceiveRoute(route) => {
+                    let _ = tx.send(TransferMsg::SendmeRoute(route));
+                }
+                _ => {}
             }
         }
 
@@ -2679,6 +2755,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn croc_received_text_preserves_large_multiline_stdout_verbatim() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("message.txt");
+        let mut expected = "\n  \"Quoted text\"\r\n\nUnicode: café — नमस्ते 🙂\nerror: failed --overwrite file receiving\n".to_string();
+        expected.push_str(&"long-unbroken-text".repeat(700));
+        expected.push_str("\n\n");
+        expected.push_str(&"Paragraph with indentation.\n  second line\n\n".repeat(1000));
+        expected.push_str(&"x".repeat(1024 * 1024 - expected.len() - 8));
+        expected.push_str("  END\n\n\n");
+        std::fs::write(&path, &expected).unwrap();
+        let (rx, handle) = super::spawn_croc_transfer(None, false, move |_, _| {
+            #[cfg(windows)]
+            let mut cmd = {
+                let mut cmd = super::new_hidden_command("powershell.exe");
+                let script = format!(
+                    "[Console]::Error.WriteLine('Receiving text message (1.0 MiB)'); $payload=[IO.File]::ReadAllBytes('{}'); [Console]::OpenStandardOutput().Write($payload,0,$payload.Length); exit 0",
+                    path.to_string_lossy().replace('\'', "''")
+                );
+                cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+                cmd
+            };
+            #[cfg(not(windows))]
+            let mut cmd = {
+                let mut cmd = super::new_hidden_command("sh");
+                cmd.args(["-c", "printf 'Receiving text message (1.0 MiB)\\n' >&2; cat \"$1\"", "sh"])
+                    .arg(&path);
+                cmd
+            };
+            cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            cmd
+        }, |_| None);
+        let mut received = None;
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(15)).unwrap() {
+                super::TransferMsg::ReceivedText(text) => {
+                    assert!(received.is_none(), "payload must arrive as one complete message");
+                    received = Some(text);
+                }
+                super::TransferMsg::Completed => break,
+                super::TransferMsg::Error(error) => panic!("payload was mistaken for a log: {error}"),
+                _ => {}
+            }
+        }
+        handle.request_cancel();
+        let received = received.expect("complete text payload event");
+        assert_eq!(received.len(), expected.len(), "payload byte count changed");
+        assert!(received == expected, "payload bytes changed");
+    }
+
     fn croc_terminal_message(
         rx: std::sync::mpsc::Receiver<super::TransferMsg>,
     ) -> super::TransferMsg {
@@ -2863,7 +2990,9 @@ mod tests {
                     true,
                     move |code, relay| {
                         let mut cmd = super::croc_transfer_command(&sender_binary, code, relay);
-                        cmd.args(["send", "--no-local"]);
+                        // Croc 11.5.5 can also select Tailcat in auto mode;
+                        // explicitly select relay for this relay-only trial.
+                        cmd.args(["send", "--transport", "relay", "--no-local"]);
                         if let Some(text) = &opts.text_value {
                             cmd.arg("--text").arg(text);
                         } else {
@@ -2894,6 +3023,9 @@ mod tests {
                             TransferMsg::Completed if is_receiver => received = true,
                             TransferMsg::Completed => sent = true,
                             TransferMsg::Error(message) => error = Some(message),
+                            TransferMsg::ReceivedText(text_value) if is_receiver => {
+                                received_text = text_value == text;
+                            }
                             TransferMsg::Output(line) => {
                                 if let Some(route) = super::parse_croc_direction(&line) {
                                     routes[is_receiver as usize] = Some(route);
@@ -2936,6 +3068,96 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires DATABEAM_CROC_TEST_BINARY and network access for real EasySendMe handoff"]
+    fn eazysendme_real_ticket_and_payload_round_trip() {
+        use super::*;
+
+        struct CancelOnDrop(ProcessHandle);
+        impl Drop for CancelOnDrop {
+            fn drop(&mut self) { self.0.request_cancel(); }
+        }
+
+        let binary = std::env::var("DATABEAM_CROC_TEST_BINARY").expect("explicit test binary");
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("hybrid.bin");
+        let bytes: Vec<u8> = (0..262144).map(|_| rand::random()).collect();
+        fs::write(&source, &bytes).unwrap();
+        let (share_rx, share_handle) = sendme_send(SendmeSendOptions {
+            paths: vec![source],
+            one_shot: true,
+            blob_dir: Some(temp.path().join("sender-cache")),
+        }, "");
+        let _share_guard = CancelOnDrop(share_handle);
+        let ticket = loop {
+            match share_rx.recv_timeout(Duration::from_secs(45)).expect("native share startup") {
+                TransferMsg::Code(ticket) => break ticket,
+                TransferMsg::Error(error) => panic!("native share failed: {error}"),
+                _ => {}
+            }
+        };
+
+        // Exercise the same receiver-first Croc text handoff used by the GUI.
+        let code = random_croc_code();
+        let handoff_dir = temp.path().join("handoff");
+        fs::create_dir(&handoff_dir).unwrap();
+        let (receive_rx, receive_handle) = croc_receive(CrocReceiveOptions {
+            code: code.clone(), output_dir: Some(handoff_dir),
+        }, &binary);
+        let _receive_guard = CancelOnDrop(receive_handle);
+        thread::sleep(Duration::from_secs(3));
+        let (send_rx, send_handle) = croc_send(CrocSendOptions {
+            paths: vec![], custom_code: Some(code), text_mode: true,
+            text_value: Some(ticket.clone()),
+        }, &binary);
+        let _send_guard = CancelOnDrop(send_handle);
+        let mut received_ticket = None;
+        let (mut sent, mut received) = (false, false);
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while Instant::now() < deadline && !(sent && received) {
+            for (receiver, rx) in [(false, &send_rx), (true, &receive_rx)] {
+                while let Ok(message) = rx.try_recv() {
+                    match message {
+                        TransferMsg::Completed if receiver => received = true,
+                        TransferMsg::Completed => sent = true,
+                        TransferMsg::Error(error) => panic!("Croc ticket handoff failed: {error}"),
+                        TransferMsg::ReceivedText(value) if receiver => {
+                            received_ticket = Some(value);
+                        }
+                        TransferMsg::Output(line) if receiver => {
+                            if let Some(value) = crate::normalize_sendme_ticket(&line) {
+                                received_ticket = Some(value);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(sent && received, "Croc ticket handoff timed out");
+        assert_eq!(received_ticket.as_deref(), Some(ticket.as_str()));
+
+        let output = temp.path().join("received");
+        let (payload_rx, payload_handle) = sendme_receive(SendmeReceiveOptions {
+            ticket: received_ticket.unwrap(), output_dir: Some(output.clone()),
+            blob_dir: Some(temp.path().join("receiver-cache")), overwrite: false,
+        }, "");
+        let _payload_guard = CancelOnDrop(payload_handle);
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let mut completed = false;
+        while Instant::now() < deadline && !completed {
+            match payload_rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(TransferMsg::Completed) => completed = true,
+                Ok(TransferMsg::Error(error)) => panic!("native receive failed: {error}"),
+                Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        assert!(completed, "native payload timed out");
+        assert_eq!(fs::read(output.join("hybrid.bin_databeam/hybrid.bin")).unwrap(), bytes);
+    }
+
+    #[test]
     #[ignore = "manual croc web interop: DATABEAM_CROC_TEST_BINARY, DATABEAM_CROC_WEB_CODE, DATABEAM_CROC_WEB_MODE"]
     fn croc_web_text_interop() {
         let binary = std::env::var("DATABEAM_CROC_TEST_BINARY").unwrap();
@@ -2971,6 +3193,9 @@ mod tests {
                     received |= line.contains(text);
                     eprintln!("{line}");
                 }
+                Ok(super::TransferMsg::ReceivedText(value)) => {
+                    received = value == text;
+                }
                 Ok(super::TransferMsg::Completed) => break Ok(()),
                 Ok(super::TransferMsg::Error(error)) => break Err(error),
                 Ok(_) => {}
@@ -2998,6 +3223,7 @@ mod tests {
         assert!(super::verify_croc_version(&super::croc_version_string(&binary.to_string_lossy()).unwrap(),
             super::SUPPORTED_CROC_VERSION).is_ok());
         assert!(super::verify_croc_version("croc version 11.2.5", super::SUPPORTED_CROC_VERSION).is_err());
+        assert!(super::verify_croc_version("croc version 11.5.5", super::SUPPORTED_CROC_VERSION).is_err());
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
     }
 

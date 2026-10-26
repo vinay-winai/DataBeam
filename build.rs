@@ -17,11 +17,11 @@ fn prepare_croc_payload() {
     use std::{env, fs, path::PathBuf};
     println!("cargo:rerun-if-env-changed=DATABEAM_CROC_BUNDLE_DIR");
     println!("cargo:rerun-if-changed=patches/croc-engine.json");
-    println!("cargo:rerun-if-changed=patches/croc-v11.2.5-relay-keepalive.patch");
     let recipe: serde_json::Value = serde_json::from_slice(
         &fs::read("patches/croc-engine.json").expect("read Croc engine recipe"),
     )
     .expect("parse Croc engine recipe");
+    println!("cargo:rerun-if-changed=patches/{}", recipe["patch"].as_str().expect("Croc patch path"));
     let version = recipe["engine_version"]
         .as_str()
         .expect("Croc engine version");

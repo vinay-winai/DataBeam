@@ -26,6 +26,11 @@ on:
         type: boolean
         required: false
         default: false
+      prerelease:
+        description: "Publish a preview release without changing Latest"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
@@ -50,7 +55,7 @@ jobs:
       - name: Install Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.27.0'
+          go-version: '1.27.2'
           cache: false
 
       - name: Install Python
@@ -72,7 +77,7 @@ jobs:
 
       - name: Build release binary
         # Release builds fail if the patched payload has not been prepared.
-        run: cargo build --release --features release-single-instance
+        run: cargo build --locked --release --features release-single-instance
 
       - name: Package Windows x64 executable
         shell: pwsh
@@ -111,7 +116,7 @@ jobs:
       - name: Install Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.27.0'
+          go-version: '1.27.2'
           cache: false
 
       - name: Install Python
@@ -133,8 +138,8 @@ jobs:
 
       - name: Build release binaries
         run: |
-          cargo build --release --features release-single-instance --target aarch64-apple-darwin
-          cargo build --release --features release-single-instance --target x86_64-apple-darwin
+          cargo build --locked --release --features release-single-instance --target aarch64-apple-darwin
+          cargo build --locked --release --features release-single-instance --target x86_64-apple-darwin
 
       - name: Verify non-Windows platform policy
         run: cargo test --locked --bin databeam non_windows_
@@ -198,7 +203,7 @@ jobs:
       - name: Install Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.27.0'
+          go-version: '1.27.2'
           cache: false
 
       - name: Install Python
@@ -239,7 +244,7 @@ jobs:
           sed -i.bak "s/^version = \".*\"/version = \"${version}\"/" Cargo.toml
 
       - name: Build release binary
-        run: cargo build --release --features release-single-instance
+        run: cargo build --locked --release --features release-single-instance
 
       - name: Install cargo-bundle
         run: cargo install cargo-bundle --version 0.12.0 --locked
@@ -308,6 +313,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           REPLACE_EXISTING: ${{ github.event.inputs.replace_existing || 'false' }}
           RELEASE_TARGET: ${{ github.event.inputs.target }}
+          RELEASE_PRERELEASE: ${{ github.event.inputs.prerelease || 'false' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -317,10 +323,17 @@ jobs:
             exit 1
           fi
 
-          # Create release if it doesn't already exist
+          preview_flags=()
+          release_title="DataBeam ${RELEASE_TAG}"
+          if [ "${RELEASE_PRERELEASE}" = "true" ]; then
+            preview_flags=(--prerelease --latest=false)
+            release_title="${release_title} Preview"
+          fi
+
+          # Keep new releases in draft until assets and notes have been uploaded.
           if ! gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
             echo "Creating release ${RELEASE_TAG}..."
-            gh release create "${RELEASE_TAG}" --target "${GITHUB_SHA}" --title "DataBeam ${RELEASE_TAG}" --generate-notes
+            gh release create "${RELEASE_TAG}" --target "${GITHUB_SHA}" --title "${release_title}" --generate-notes --draft "${preview_flags[@]}"
           fi
 
           # Merge or generate SHA256SUMS.txt
@@ -351,5 +364,11 @@ jobs:
           notes_path="release-notes/${RELEASE_TAG}.md"
           if [ -f "${notes_path}" ]; then
             gh release edit "${RELEASE_TAG}" --notes-file "${notes_path}"
+          fi
+
+          if [ "${RELEASE_PRERELEASE}" = "true" ]; then
+            gh release edit "${RELEASE_TAG}" --title "${release_title}" --draft=false --prerelease --latest=false
+          else
+            gh release edit "${RELEASE_TAG}" --draft=false
           fi
 

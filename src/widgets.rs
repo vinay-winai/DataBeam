@@ -4,6 +4,78 @@ use egui::{
     self, Color32, FontFamily, FontId, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2,
 };
 
+#[derive(Default)]
+pub struct ReceivedTextActions {
+    pub copied: bool,
+    pub expand: bool,
+}
+
+/// A bounded, selectable, read-only message, like Croc web's received-text card.
+pub fn received_text_card(
+    ui: &mut egui::Ui,
+    text: &str,
+    copied: bool,
+    allow_expand: bool,
+    max_height: f32,
+    id: &'static str,
+) -> ReceivedTextActions {
+    let mut actions = ReceivedTextActions::default();
+    egui::Frame::NONE
+        .fill(BG_INPUT)
+        .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+        .corner_radius(INPUT_ROUNDING)
+        .inner_margin(egui::Margin::same(14))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("TEXT RECEIVED").size(11.0).strong().color(TEXT_PRIMARY));
+                    ui.label(RichText::new(crate::backend::format_size_unit(text.len() as u64))
+                        .size(10.0).color(TEXT_MUTED));
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let button = egui::Button::new(
+                        RichText::new(if copied { "✓ Copied" } else { "Copy text" })
+                            .size(12.0).color(if copied { Color32::BLACK } else { TEXT_PRIMARY })
+                    ).min_size(Vec2::new(88.0, 30.0))
+                        .fill(if copied { SUCCESS } else { BG_CARD })
+                        .stroke(Stroke::new(1.0, BORDER_SUBTLE));
+                    if ui.add(button).on_hover_text("Copy the complete original message").clicked() {
+                        ui.ctx().copy_text(text.to_owned());
+                        ui.ctx().request_repaint_after(std::time::Duration::from_secs(2));
+                        actions.copied = true;
+                    }
+                    if allow_expand && ui.add(egui::Button::new("Expand")
+                        .min_size(Vec2::new(62.0, 30.0))).clicked() {
+                        actions.expand = true;
+                    }
+                });
+            });
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(8.0);
+            egui::ScrollArea::vertical()
+                .id_salt(id)
+                .max_height(max_height.min(ui.available_height()).max(80.0))
+                .min_scrolled_height(80.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    // &str implements egui's immutable TextBuffer: selection,
+                    // keyboard navigation and copy work without editing or
+                    // cloning a potentially large message every frame.
+                    let mut display = text;
+                    ui.add(egui::TextEdit::multiline(&mut display)
+                        .id_salt((id, "text"))
+                        .font(FontId::monospace(13.0))
+                        .text_color(TEXT_PRIMARY)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(1)
+                        .cursor_at_end(false)
+                        .frame(false));
+                });
+        });
+    actions
+}
+
 // ── Accent Button ──────────────────────────────────────────────────
 
 pub fn accent_button(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {

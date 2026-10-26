@@ -65,7 +65,15 @@ def main():
         test_env['GOTOOLCHAIN'] = 'go' + RECIPE['go_version']
         for key in ('GOOS', 'GOARCH', 'CROC_SECRET', 'CROC_RELAY', 'CROC_RELAY6'):
             test_env.pop(key, None)
-        run('go', 'test', './src/croc', '-run', 'Test(LocalProbeResponse|DataBeamRoute)', '-count=1',
+        # Upstream now implements the old runtime patches. Keep their DataBeam
+        # regressions plus coverage for the replacement local-listener startup.
+        test_flags = []
+        if os.name == 'nt':
+            # These upstream cases create symlinks and require Windows developer
+            # mode/admin rights. Retain declined-symlink protection coverage.
+            test_flags = ['-skip', '^TestReceiveStdinNamedFileCollision/symlink/(approved|overwrite|rename)$']
+        run('go', 'test', './src/croc', './src/tcp', *test_flags, '-run',
+            'Test(DataBeam|ReceiveControlFrame|FormatTransferDirection|LocalRelay|RunWithListener|SendingTextOffer|ReceiveStdinNamedFileCollision)', '-count=1',
             '-timeout', '60s', cwd=source, env=test_env)
         for target in args.target:
             goos, goarch = TARGETS[target]

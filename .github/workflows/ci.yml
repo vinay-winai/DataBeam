@@ -7,6 +7,9 @@ on:
       - develop
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -22,6 +25,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -29,7 +34,7 @@ jobs:
       - name: Install Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.27.0'
+          go-version: '1.27.2'
           cache: false
 
       - name: Install Python
@@ -66,3 +71,6 @@ jobs:
 
       - name: Test
         run: cargo test --locked
+
+      - name: Test native Sendme transfers and upload rejection
+        run: cargo test --manifest-path third_party/sendme/Cargo.toml --lib --no-default-features --locked --target-dir target
