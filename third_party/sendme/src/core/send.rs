@@ -149,7 +149,6 @@ pub async fn start_share(
     } else {
         "directory"
     };
-    let entry_type_for_progress = entry_type.to_string();
     let paths2 = paths.clone();
     let payload_root2 = payload_root.clone();
 
@@ -181,7 +180,6 @@ pub async fn start_share(
             progress_rx,
             app_handle_clone,
             size,
-            entry_type_for_progress,
         ));
 
         let router = iroh::protocol::Router::builder(endpoint)
@@ -463,7 +461,6 @@ async fn show_provide_progress_with_logging(
     mut recv: mpsc::Receiver<iroh_blobs::provider::events::ProviderMessage>,
     app_handle: AppHandle,
     total_file_size: u64,
-    entry_type: String,
 ) -> anyhow::Result<()> {
     use n0_future::FuturesUnordered;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -556,12 +553,17 @@ async fn show_provide_progress_with_logging(
                         let has_emitted_started_task = has_emitted_started.clone();
                         let has_any_transfer_task = has_any_transfer.clone();
                         let last_request_time_task = last_request_time.clone();
-                        let entry_type_task = entry_type.clone();
+                        // Size discovery reads the root and only the last chunk
+                        // of each child. Request IDs do not identify payloads:
+                        // retries and other peers can issue more size probes.
+                        let is_size_probe = msg.request.ranges
+                            == iroh_blobs::protocol::ChunkRangesSeq::verified_child_sizes();
 
                         let mut rx = msg.rx;
                         tasks.push(async move {
                             let mut transfer_started = false;
                             let mut request_completed = false;
+                            let mut payload_started = false;
 
                             while let Ok(Some(update)) = rx.recv().await {
                                 match update {
@@ -574,7 +576,10 @@ async fn show_provide_progress_with_logging(
                                             .unwrap_or_else(|| "?".to_string());
                                         let hash_short = msg.hash.fmt_short().to_string();
                                         let total_size = msg.size.max(1);
-                                        let count_toward_payload = request_id > 0 && msg.index > 0;
+                                        // Index 0 is the hash sequence and index 1
+                                        // is collection metadata, not file data.
+                                        let count_toward_payload = !is_size_probe && msg.index > 1;
+                                        payload_started |= count_toward_payload;
 
                                         let (active_count, done_bytes, speed_bps) = {
                                             let mut tracker = progress_tracker_task.lock().await;
@@ -730,10 +735,8 @@ async fn show_provide_progress_with_logging(
                                             let completed = completed_requests_task.fetch_add(1, Ordering::SeqCst) + 1;
                                             let active = active_requests_task.load(Ordering::SeqCst);
 
-                                            let min_required = if entry_type_task == "directory" { 2 } else { 1 };
-
-                                            if completed >= active
-                                                && completed >= min_required
+                                            if payload_started
+                                                && completed >= active
                                                 && has_any_transfer_task.load(Ordering::SeqCst) {
                                                 let active_before_wait = active;
 
@@ -759,7 +762,6 @@ async fn show_provide_progress_with_logging(
                                                 };
 
                                                 if completed_after >= active_after
-                                                    && completed_after >= min_required
                                                     && !new_requests_arrived
                                                     && !has_active_transfers
                                                     && !last_request_recent
@@ -807,65 +809,17 @@ async fn show_provide_progress_with_logging(
                             if transfer_started && !request_completed {
                                 let (done_bytes, speed_bps) = {
                                     let mut tracker = progress_tracker_task.lock().await;
-                                    if let Some(state) = tracker.transfers.remove(&(connection_id, request_id)) {
-                                        if state.count_toward_payload {
-                                            tracker.completed_bytes = tracker
-                                                .completed_bytes
-                                                .saturating_add(state.total_size);
-                                        }
-                                    }
+                                    tracker.transfers.remove(&(connection_id, request_id));
                                     snapshot_progress(&tracker, total_bytes)
                                 };
 
-                                emit_event_with_payload(
-                                    &app_handle_task,
-                                    "sender-request-completed",
-                                    &SenderRequestCompletedPayload {
-                                        connection_id,
-                                        request_id,
-                                    },
-                                );
                                 emit_progress_event(&app_handle_task, done_bytes, total_bytes, speed_bps);
 
-                                let completed = completed_requests_task.fetch_add(1, Ordering::SeqCst) + 1;
-                                let active = active_requests_task.load(Ordering::SeqCst);
-
-                                let min_required = if entry_type_task == "directory" { 2 } else { 1 };
-
-                                if completed >= active
-                                    && completed >= min_required
-                                    && has_any_transfer_task.load(Ordering::SeqCst) {
-                                    let active_before_wait = active;
-
-                                    tokio::time::sleep(Duration::from_millis(500)).await;
-
-                                    let completed_after = completed_requests_task.load(Ordering::SeqCst);
-                                    let active_after = active_requests_task.load(Ordering::SeqCst);
-
-                                    let new_requests_arrived = active_after > active_before_wait;
-
-                                    let has_active_transfers = {
-                                        let tracker = progress_tracker_task.lock().await;
-                                        !tracker.transfers.is_empty()
-                                    };
-
-                                    let last_request_recent = {
-                                        let last_time = last_request_time_task.lock().await;
-                                        if let Some(time) = *last_time {
-                                            time.elapsed() < Duration::from_millis(500)
-                                        } else {
-                                            false
-                                        }
-                                    };
-
-                                    if completed_after >= active_after
-                                        && completed_after >= min_required
-                                        && !new_requests_arrived
-                                        && !has_active_transfers
-                                        && !last_request_recent
-                                    {
-                                        emit_event(&app_handle_task, "transfer-completed");
-                                    }
+                                completed_requests_task.fetch_add(1, Ordering::SeqCst);
+                                // Losing the update stream is not a successful
+                                // payload completion, regardless of byte counts.
+                                if payload_started {
+                                    emit_event(&app_handle_task, "transfer-failed");
                                 }
                             }
                         });
@@ -878,17 +832,6 @@ async fn show_provide_progress_with_logging(
     }
 
     while tasks.next().await.is_some() {}
-
-    if has_any_transfer.load(Ordering::SeqCst) {
-        let completed = completed_requests.load(Ordering::SeqCst);
-        let active = active_requests.load(Ordering::SeqCst);
-
-        let min_required = if entry_type == "directory" { 2 } else { 1 };
-
-        if completed >= active && completed >= min_required && completed > 0 {
-            emit_event(&app_handle, "transfer-completed");
-        }
-    }
 
     Ok(())
 }
