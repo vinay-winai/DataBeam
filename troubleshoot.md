@@ -1,5 +1,16 @@
 # News
-v0.6.5 relesed
+
+## v0.6.6 released
+
+- Fix Sendme sender completion and delivery acknowledgment issues that could cause transfers to fail with VPN enabled or on slower relay connections. Transfers with VPN enabled have now succeeded from Windows to Mac and from Mac to Windows.
+- Update Sendme security dependencies, including the iroh-blobs fix that prevents unsolicited uploads into the sender's store.
+- Show live Direct/Relay connection status on Sendme and EasySendMe receivers.
+- Fix receiving files from the Sendme CLI. Sends without an enclosing folder are placed inside a `_databeam` folder; existing sender folders are preserved.
+- Improve Windows cache cleanup and retain more useful connection and export error details.
+- Update the bundled Croc engine to 11.5.5, fix the macOS local listener startup error, and improve slower relay probe handling and Windows text reception.
+- Improve the Croc received-text viewer for large messages with wrapping, scrolling, selection, copying, and an expanded view while preserving the full text.
+
+[DataBeam website](https://vinay-winai.github.io/DataBeam/) · [Download v0.6.6 and read the release notes](https://github.com/vinay-winai/DataBeam/releases/tag/v0.6.6)
 
 # Troubleshooting DataBeam
 - If transfers are failing check if vpn or dns is causing this.
