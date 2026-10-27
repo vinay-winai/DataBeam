@@ -57,7 +57,7 @@ function updateDownloadLinks() {
     gReleaseData.assets.forEach(asset => {
         const name = asset.name.toLowerCase();
         // Matching rules for DataBeam binaries
-        if (name.includes("win") || name.endsWith(".exe")) {
+        if (name.endsWith(".exe")) {
             windowsAsset = asset.browser_download_url;
         } else if (name.includes("macos-universal")) {
             macUnivAsset = asset.browser_download_url;
