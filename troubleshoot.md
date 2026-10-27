@@ -5,7 +5,7 @@ v0.6.5 relesed
 - If transfers are failing check if vpn or dns is causing this.
 
 ## Croc / EazySendme Transfer Issues
-- If transfer does not start and logs show room not found or room unavailable/room full/peer left, sender should retry with a different custom code. Avoid using simple codes like 1234567 or aaaaaaa.
+- If transfer does not start and logs show any errors like (including not limited to) room not found or room unavailable/room full/peer left, sender should **retry with a different Code Phrase**. Avoid using simple codes like 1234567 or aaaaaaa.
 
 ## Common UI Issues
 - Drag/ Drop is currently not working on linux. So use file / folder buttons instead.
