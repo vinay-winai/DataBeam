@@ -3919,7 +3919,7 @@ impl eframe::App for DataBeamApp {
                             .clicked()
                         {
                             let _ = open::that(
-                                "https://github.com/vinay-winai/DataBeam/blob/main/trubleshoot.md",
+                                "https://github.com/vinay-winai/DataBeam/blob/main/troubleshoot.md",
                             );
                         }
                     });
