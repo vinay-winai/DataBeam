@@ -46,7 +46,7 @@ fn bundled_bin_dir() -> PathBuf {
     base.join("databeam").join("bin")
 }
 
-fn new_hidden_command(program: impl AsRef<OsStr>) -> Command {
+pub(crate) fn new_hidden_command(program: impl AsRef<OsStr>) -> Command {
     #[cfg(target_os = "windows")]
     {
         let mut cmd = Command::new(program);

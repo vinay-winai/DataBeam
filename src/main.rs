@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod backend;
 mod theme;
+mod troubleshoot;
 // Tray stack is Windows-only for now (macOS menu-bar / Linux indicator
 // support deferred): silence dead code off-Windows. The pure mapping
 // helpers stay unit-tested on every OS.
@@ -183,6 +184,8 @@ struct UserSettings {
     /// Persisted so local-blob retry works even after app restart or reset_transfer.
     #[serde(default)]
     eazysendme_code_ticket_map: HashMap<String, EazyCacheEntry>,
+    #[serde(default)]
+    troubleshoot_news: troubleshoot::GuideNews,
 }
 
 
@@ -334,6 +337,8 @@ struct DataBeamApp {
     last_good_inner: [f32; 2],
     /// One-shot launch repair done (see update()).
     launch_size_fixed: bool,
+    troubleshoot_news: troubleshoot::GuideNews,
+    troubleshoot_monitor: troubleshoot::GuideMonitor,
 }
 
 impl Drop for DataBeamApp {
@@ -452,6 +457,8 @@ impl Default for DataBeamApp {
             startup_hwnd: None,
             last_good_inner: [WINDOW_DEFAULT_W, WINDOW_DEFAULT_H],
             launch_size_fixed: false,
+            troubleshoot_news: troubleshoot::GuideNews::default(),
+            troubleshoot_monitor: troubleshoot::GuideMonitor::default(),
         }
     }
 }
@@ -635,6 +642,7 @@ impl DataBeamApp {
         // Limit map size to 20 entries (keep newest)
         // Accept the full map; 20 entries is tiny for JSON anyway.
         self.eazysendme_code_ticket_map = settings.eazysendme_code_ticket_map;
+        self.troubleshoot_news = settings.troubleshoot_news;
     }
 
     fn persist_user_settings(&self) {
@@ -665,6 +673,7 @@ impl DataBeamApp {
             minimize_to_tray: self.minimize_to_tray,
             tray_debug_log: self.tray_debug_log,
             eazysendme_code_ticket_map: self.eazysendme_code_ticket_map.clone(),
+            troubleshoot_news: self.troubleshoot_news.clone(),
         };
         if let Ok(json) = serde_json::to_string_pretty(&settings) {
             let _ = fs::write(path, json);
@@ -3797,6 +3806,9 @@ impl eframe::App for DataBeamApp {
         self.handle_dropped_files(ctx);
         self.poll_size_updates();
         self.poll_transfer();
+        if self.troubleshoot_monitor.poll(ctx, &mut self.troubleshoot_news) {
+            self.persist_user_settings();
+        }
         // Automatic checks are Windows-only; macOS/Linux remain manual-only.
         self.poll_tool_detection();
         self.poll_managed_install(ctx);
@@ -3909,18 +3921,39 @@ impl eframe::App for DataBeamApp {
                         }
 
                         ui.add_space(8.0);
+                        let unread_news = self.troubleshoot_news.has_unread();
+                        let mut troubleshoot_label = egui::text::LayoutJob::default();
+                        troubleshoot_label.append("❓ Troubleshoot", 0.0, egui::TextFormat {
+                            font_id: egui::FontId::proportional(12.0),
+                            color: TEXT_SECONDARY,
+                            ..Default::default()
+                        });
+                        if unread_news {
+                            troubleshoot_label.append("  ●", 0.0, egui::TextFormat {
+                                font_id: egui::FontId::proportional(12.0),
+                                color: WARNING,
+                                ..Default::default()
+                            });
+                        }
                         if ui
-                            .selectable_label(
-                                false,
-                                RichText::new("❓ Troubleshoot")
-                                    .size(12.0)
-                                    .color(TEXT_SECONDARY),
-                            )
+                            .selectable_label(false, troubleshoot_label)
+                            .on_hover_text(if unread_news {
+                                "New troubleshooting guide or release news"
+                            } else {
+                                "Open troubleshooting guide and release news"
+                            })
                             .clicked()
                         {
-                            let _ = open::that(
-                                "https://github.com/vinay-winai/DataBeam/blob/main/troubleshoot.md",
-                            );
+                            match open::that(troubleshoot::GUIDE_URL) {
+                                Ok(()) => {
+                                    if self.troubleshoot_news.mark_read() {
+                                        self.persist_user_settings();
+                                    }
+                                }
+                                Err(error) => self.show_toast(
+                                    format!("Could not open troubleshooting guide: {error}"), ERROR,
+                                ),
+                            }
                         }
                     });
 
@@ -6661,6 +6694,19 @@ mod parse_tests {
     };
     use eframe::egui::Color32;
     use std::sync::mpsc;
+
+    #[test]
+    fn old_settings_support_troubleshoot_news_and_preserve_it_when_saved() {
+        let mut settings: super::UserSettings = serde_json::from_str("{}").unwrap();
+        assert!(!settings.troubleshoot_news.has_unread());
+        settings.troubleshoot_news = serde_json::from_value(serde_json::json!({
+            "seen_revision": "read guide", "latest_revision": "updated guide"
+        })).unwrap();
+        let restored: super::UserSettings = serde_json::from_str(
+            &serde_json::to_string(&settings).unwrap(),
+        ).unwrap();
+        assert!(restored.troubleshoot_news.has_unread());
+    }
 
     #[test]
     fn stage_progress_parses_bracket_with_spinner() {

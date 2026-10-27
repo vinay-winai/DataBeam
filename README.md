@@ -30,6 +30,7 @@ You can:
 - visible transfer logs inside the app
 - live Direct/Relay transfer mode on Sendme and EasySendMe receivers
 - scrollable, selectable Croc received-text panel with Copy text and an expanded view; long messages preserve their original line breaks and whitespace
+- Troubleshoot button shows an unread badge when the online guide changes; opening the guide clears it, and read status is remembered across restarts
 
 The embedded Sendme engine includes the official 0.37.1 security fixes and
 receiver route reporting. See the [upstream synchronization notes](investigations/sendme-upstream-sync.md).
