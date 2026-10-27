@@ -1773,8 +1773,6 @@ pub fn sendme_send(
             share.ticket
         )));
         let _ = tx.send(TransferMsg::WaitingForReceiver);
-
-        let mut had_transfer = false;
         let mut sender_activity_emitted = false;
         let mut last_progress_emit = Instant::now();
         let mut last_request_emit = Instant::now();
@@ -1797,7 +1795,6 @@ pub fn sendme_send(
                     if !opts.one_shot && waiting_for_new_connection {
                         continue;
                     }
-                    had_transfer = true;
                     if !sender_activity_emitted {
                         let _ = tx.send(TransferMsg::SenderTransferActivity);
                         sender_activity_emitted = true;
@@ -1812,7 +1809,6 @@ pub fn sendme_send(
                     if !opts.one_shot && waiting_for_new_connection {
                         continue;
                     }
-                    had_transfer = true;
                     if !sender_activity_emitted {
                         let _ = tx.send(TransferMsg::SenderTransferActivity);
                         sender_activity_emitted = true;
@@ -1846,7 +1842,6 @@ pub fn sendme_send(
                     if !opts.one_shot && waiting_for_new_connection {
                         continue;
                     }
-                    had_transfer = true;
                     if !sender_activity_emitted {
                         let _ = tx.send(TransferMsg::SenderTransferActivity);
                         sender_activity_emitted = true;
@@ -1875,7 +1870,6 @@ pub fn sendme_send(
                     if !opts.one_shot && waiting_for_new_connection {
                         continue;
                     }
-                    had_transfer = true;
                     if !sender_activity_emitted {
                         let _ = tx.send(TransferMsg::SenderTransferActivity);
                         sender_activity_emitted = true;
@@ -1924,7 +1918,6 @@ pub fn sendme_send(
                         } else if waiting_seen_zero_connections {
                             waiting_for_new_connection = false;
                             waiting_seen_zero_connections = false;
-                            had_transfer = true;
                             if !sender_activity_emitted {
                                 let _ = tx.send(TransferMsg::SenderTransferActivity);
                                 sender_activity_emitted = true;
@@ -1933,7 +1926,6 @@ pub fn sendme_send(
                         continue;
                     }
                     if count > 0 {
-                        had_transfer = true;
                         if !sender_activity_emitted {
                             let _ = tx.send(TransferMsg::SenderTransferActivity);
                             sender_activity_emitted = true;
@@ -1961,7 +1953,6 @@ pub fn sendme_send(
                         let _ = tx.send(TransferMsg::WaitingForReceiver);
                         waiting_for_new_connection = true;
                         waiting_seen_zero_connections = false;
-                        had_transfer = false;
                         sender_activity_emitted = false;
                         sender_progress_max = 0.0;
                         last_logged_done = 0;
@@ -1972,13 +1963,12 @@ pub fn sendme_send(
                 }
                 Ok(NativeSendmeEvent::TransferFailed) => {
                     if opts.one_shot {
-                        if had_transfer {
-                            let _ = tx.send(TransferMsg::PeerDisconnected);
-                        } else {
-                            let _ = tx.send(TransferMsg::Error(
-                                "Sendme transfer failed on sender side".to_string(),
-                            ));
-                        }
+                        // Written/queued byte counts are not proof of delivery.
+                        // Never turn an explicit provider failure into a peer
+                        // disconnect that the UI may interpret as success.
+                        let _ = tx.send(TransferMsg::Error(
+                            "Sendme transfer failed on sender side".to_string(),
+                        ));
                         break;
                     } else {
                         if waiting_for_new_connection {
@@ -1990,7 +1980,6 @@ pub fn sendme_send(
                         let _ = tx.send(TransferMsg::WaitingForReceiver);
                         waiting_for_new_connection = true;
                         waiting_seen_zero_connections = false;
-                        had_transfer = false;
                         sender_activity_emitted = false;
                         sender_progress_max = 0.0;
                         last_logged_done = 0;
@@ -2009,13 +1998,9 @@ pub fn sendme_send(
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     if opts.one_shot {
-                        if had_transfer {
-                            let _ = tx.send(TransferMsg::PeerDisconnected);
-                        } else {
-                            let _ = tx.send(TransferMsg::Error(
-                                "Send session ended before transfer started".to_string(),
-                            ));
-                        }
+                        let _ = tx.send(TransferMsg::Error(
+                            "Sender event stream ended before delivery was confirmed".to_string(),
+                        ));
                         break;
                     } else {
                         if waiting_for_new_connection {
@@ -2027,7 +2012,6 @@ pub fn sendme_send(
                         let _ = tx.send(TransferMsg::WaitingForReceiver);
                         waiting_for_new_connection = true;
                         waiting_seen_zero_connections = false;
-                        had_transfer = false;
                         sender_activity_emitted = false;
                         sender_progress_max = 0.0;
                         last_logged_done = 0;
@@ -2252,7 +2236,7 @@ pub fn sendme_receive(
                 let _ = tx.send(TransferMsg::Completed);
             }
             Ok(Err(e)) => {
-                let _ = tx.send(TransferMsg::Error(format!("{e}")));
+                let _ = tx.send(TransferMsg::Error(format!("{e:#}")));
             }
             Err(e) => {
                 let _ = tx.send(TransferMsg::Error(format!(

@@ -29,6 +29,169 @@ impl EventEmitter for Events {
 }
 
 #[tokio::test]
+async fn cli_collection_names_export_without_file_directory_collisions() -> anyhow::Result<()> {
+    use iroh_blobs::{format::collection::Collection, store::fs::FsStore, BlobsProtocol};
+    tokio::time::timeout(Duration::from_secs(30), async {
+        for (names, expected_wrapper) in [
+            (vec!["report copy.txt"], "report copy.txt_databeam"),
+            (vec!["top.txt", "sub/nested.txt"], "sub_and_more_databeam"),
+            (vec!["databeam_hash.txt"], "databeam_hash.txt_databeam"),
+        ] {
+            let dir = tempfile::tempdir()?;
+            let store = FsStore::load(dir.path().join("sender")).await?;
+            let mut entries = Vec::new();
+            for name in &names {
+                let tag = store
+                    .add_bytes(format!("synthetic payload: {name}").into_bytes())
+                    .await?;
+                entries.push((name.to_string(), tag.hash));
+            }
+            let root = entries
+                .into_iter()
+                .collect::<Collection>()
+                .store(&store)
+                .await?;
+            let endpoint = Endpoint::builder(presets::N0)
+                .alpns(vec![iroh_blobs::ALPN.to_vec()])
+                .relay_mode(RelayMode::Disabled)
+                .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>()?)?
+                .bind()
+                .await?;
+            let bound = endpoint
+                .bound_sockets()
+                .into_iter()
+                .find(|a| a.is_ipv4())
+                .unwrap();
+            let addr = EndpointAddr::new(endpoint.id()).with_ip_addr(bound);
+            let router = iroh::protocol::Router::builder(endpoint)
+                .accept(iroh_blobs::ALPN, BlobsProtocol::new(&store, None))
+                .spawn();
+            let ticket = BlobTicket::new(addr, root.hash(), BlobFormat::HashSeq);
+            let output = dir.path().join("received");
+            // Failed older receivers could leave a directory with the plain
+            // filename. Wrapping must avoid it and preserve anything inside.
+            let old_directory = output.join(names[0]);
+            std::fs::create_dir_all(&old_directory)?;
+            std::fs::write(old_directory.join("keep.txt"), b"existing data")?;
+            let result = download(
+                ticket.to_string(),
+                ReceiveOptions {
+                    output_dir: Some(output.clone()),
+                    relay_mode: RelayModeOption::Disabled,
+                    blob_dir: Some(dir.path().join("receiver")),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .context("receive CLI-style collection")?;
+            assert_eq!(result.file_path.parent(), Some(output.as_path()));
+            let wrapper = result.file_path.file_name().unwrap().to_owned();
+            assert_eq!(wrapper.to_string_lossy(), expected_wrapper);
+            assert_eq!(
+                std::fs::read(old_directory.join("keep.txt"))?,
+                b"existing data"
+            );
+            for name in &names {
+                assert_eq!(
+                    std::fs::read(result.file_path.join(name))?,
+                    format!("synthetic payload: {name}").as_bytes()
+                );
+            }
+            let cached_output = dir.path().join("cached-export");
+            assert!(
+                super::receive::check_and_export_local_in(
+                    &ticket.to_string(),
+                    Some(cached_output.clone()),
+                    None,
+                    Some(dir.path().join("receiver")),
+                    false,
+                    None,
+                )
+                .await?,
+                "complete CLI collection was not exported from cache"
+            );
+            for name in &names {
+                assert_eq!(
+                    std::fs::read(cached_output.join(&wrapper).join(name))?,
+                    format!("synthetic payload: {name}").as_bytes()
+                );
+            }
+            router.shutdown().await?;
+        }
+        anyhow::Ok(())
+    })
+    .await?
+}
+
+#[tokio::test]
+#[ignore = "requires network access to the public iroh relays"]
+async fn public_relay_only_download_preserves_payload() -> anyhow::Result<()> {
+    use super::sender_protocol::AcknowledgedBlobs;
+    use iroh_blobs::{
+        format::collection::Collection, provider::events::EventSender, store::fs::FsStore,
+    };
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let dir = tempfile::tempdir()?;
+        let store = FsStore::load(dir.path().join("sender")).await?;
+        let bytes: Vec<u8> = (0..262_144).map(|n| (n % 251) as u8).collect();
+        let data_tag = store.add_bytes(bytes.clone()).await?;
+        let collection: Collection = [("relay payload.txt".to_string(), data_tag.hash)]
+            .into_iter()
+            .collect();
+        let root = collection.store(&store).await?;
+        // No IP transport exists on the server: direct/loopback shortcuts
+        // cannot satisfy this transfer, even though both peers run locally.
+        let endpoint = Endpoint::builder(presets::N0)
+            .alpns(vec![iroh_blobs::ALPN.to_vec()])
+            .clear_ip_transports()
+            .bind()
+            .await?;
+        let router = iroh::protocol::Router::builder(endpoint)
+            .accept(
+                iroh_blobs::ALPN,
+                AcknowledgedBlobs::new(store.as_ref().clone(), EventSender::DEFAULT),
+            )
+            .spawn();
+        router.endpoint().online().await;
+        let addr = router.endpoint().addr();
+        assert_eq!(addr.ip_addrs().count(), 0);
+        assert!(
+            addr.relay_urls().count() > 0,
+            "sender has no public relay address"
+        );
+        let ticket = BlobTicket::new(addr, root.hash(), BlobFormat::HashSeq);
+        let events = Arc::new(Events::default());
+        let result = download(
+            ticket.to_string(),
+            ReceiveOptions {
+                output_dir: Some(dir.path().join("received")),
+                blob_dir: Some(dir.path().join("receiver")),
+                ..Default::default()
+            },
+            Some(events.clone()),
+        )
+        .await?;
+        assert_eq!(
+            std::fs::read(result.file_path.join("relay payload.txt"))?,
+            bytes
+        );
+        assert!(events
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(name, value)| name == "receive-route" && value == "relay"));
+        eprintln!(
+            "Verified 262144 payload bytes through a public relay; server IP transport disabled."
+        );
+        router.shutdown().await?;
+        anyhow::Ok(())
+    })
+    .await?
+}
+
+#[tokio::test]
 async fn delayed_payload_after_repeated_size_probes_does_not_complete_sender() -> anyhow::Result<()>
 {
     use iroh_blobs::{
@@ -220,6 +383,7 @@ async fn loopback_download_reports_direct_and_sender_rejects_push() -> anyhow::R
             Some(events.clone()),
         )
         .await.context("download and export")?;
+        assert_eq!(result.file_path, dir.path().join("received/payload"));
         assert_eq!(std::fs::read(result.file_path.join("payload.bin"))?, bytes);
         assert!(
             events

@@ -139,7 +139,7 @@ pub async fn download(
                         "With direct addrs: {:?}",
                         addr.ip_addrs().collect::<Vec<_>>()
                     );
-                    return Err(anyhow::anyhow!("Connection failed: {}", e));
+                    return Err(anyhow::Error::new(e).context("Connect to Sendme sender"));
                 }
             };
 
@@ -267,7 +267,9 @@ pub async fn download(
             (Stats::default(), total_files, payload_bytes)
         };
 
-        let collection = Collection::load(hash_and_format.hash, db.as_ref()).await?;
+        let collection = wrap_unwrapped_collection(
+            db.as_ref(), Collection::load(hash_and_format.hash, db.as_ref()).await?,
+        ).await?;
         
         // If we skipped download (blobs were already complete), calculate the real payload size now
         let mut final_payload_size = payload_size;
@@ -312,9 +314,9 @@ pub async fn download(
 
         // 2. Resolve destination with smart incrementing logic
         let mut final_output_dir = output_dir_base.to_path_buf();
-        if !collection.is_empty() {
-            let root_name = collection.iter().next().unwrap().0.clone();
-            let dir_component = root_name.split('/').next().unwrap_or(&root_name);
+        let use_signature = uses_export_signature(&collection);
+        if let Some(dir_component) = collection_root(&collection) {
+            validate_path_component(dir_component)?;
             
             let mut attempt = 1;
             loop {
@@ -348,11 +350,14 @@ pub async fn download(
         }
 
         emit_event(&app_handle, "receive-export-started");
-        export(&db, collection, &final_output_dir, &app_handle, &content_hash).await?;
+        let allow_overwrite = options.overwrite || collection_root(&collection).is_some();
+        export(&db, collection, &final_output_dir, &app_handle, &content_hash, allow_overwrite).await?;
 
         // Remove the smart-overwrite signature file now that export is finished
-        let signature_path = final_output_dir.join("databeam_hash.txt");
-        let _ = tokio::fs::remove_file(&signature_path).await;
+        if use_signature {
+            let signature_path = final_output_dir.join("databeam_hash.txt");
+            let _ = tokio::fs::remove_file(&signature_path).await;
+        }
 
         // Emit completion event AFTER everything is done
         emit_event(&app_handle, "receive-completed");
@@ -364,6 +369,7 @@ pub async fn download(
         x = fut => match x {
             Ok(x) => {
                 let _ = endpoint_close.close().await;
+                db2.shutdown().await?;
                 x
             }
             Err(e) => {
@@ -372,7 +378,7 @@ pub async fn download(
                 // make sure we shutdown the db before exiting
                 db2.shutdown().await?;
                 // WE DO NOT DELETE the cache here, so it can be resumed later!
-                anyhow::bail!("error: {e}");
+                return Err(e.context("Sendme receive failed"));
             }
         },
         _ = tokio::signal::ctrl_c() => {
@@ -390,47 +396,95 @@ pub async fn download(
     })
 }
 
+// GUI senders share a common wrapper directory; CLI collections can contain
+// plain filenames or a mixture of top-level files and nested directories.
+fn collection_root(collection: &Collection) -> Option<&str> {
+    let (first, _) = collection.iter().next()?;
+    let (root, _) = first.split_once('/')?;
+    collection.iter().all(|(name, _)| name.split_once('/').is_some_and(|(part, _)| part == root))
+        .then_some(root)
+}
+
+async fn wrap_unwrapped_collection(db: &Store, collection: Collection) -> anyhow::Result<Collection> {
+    if collection.is_empty() || collection_root(&collection).is_some() {
+        return Ok(collection);
+    }
+
+    // Match the GUI sender's wrapper naming: largest top-level item, then
+    // _and_more for multiple items and _databeam. Equal sizes keep their order.
+    let mut items: Vec<(&str, u64)> = Vec::new();
+    let mut indices = std::collections::HashMap::new();
+    for (name, hash) in collection.iter() {
+        let top = name.split('/').next().unwrap();
+        let size = match db.status(*hash).await? {
+            iroh_blobs::api::blobs::BlobStatus::Complete { size } => size,
+            _ => anyhow::bail!("Cannot wrap an incomplete received file: {name}"),
+        };
+        let index = *indices.entry(top).or_insert_with(|| {
+            items.push((top, 0));
+            items.len() - 1
+        });
+        items[index].1 = items[index].1.saturating_add(size);
+    }
+    let (mut largest, mut largest_size) = items[0];
+    for &(name, size) in &items[1..] {
+        if size > largest_size {
+            largest = name;
+            largest_size = size;
+        }
+    }
+    let mut wrapper: String = largest.chars().take(20).collect();
+    if items.len() > 1 {
+        wrapper.push_str("_and_more");
+    }
+    wrapper.push_str("_databeam");
+
+    // Change export names only, preserving the stored collection, verified
+    // blob hashes, ticket and cache identity supplied by the sender.
+    Ok(collection.iter().map(|(name, hash)| (format!("{wrapper}/{name}"), *hash)).collect())
+}
+
+fn uses_export_signature(collection: &Collection) -> bool {
+    let Some(root) = collection_root(collection) else { return false };
+    let reserved = format!("{root}/databeam_hash.txt");
+    !collection.iter().any(|(name, _)| name == &reserved)
+}
+
 async fn export(
     db: &Store,
     collection: Collection,
     output_dir: &Path,
     app_handle: &AppHandle,
     content_hash: &str,
+    overwrite: bool,
 ) -> anyhow::Result<()> {
     // Ensure the output directory exists
     tokio::fs::create_dir_all(output_dir).await?;
 
     // Write the signature hash BEFORE starting the export loop
     // This serves as the 'Smart Overwrite' fingerprint
+    let root = collection_root(&collection);
     let signature_path = output_dir.join("databeam_hash.txt");
-    if let Err(e) = tokio::fs::write(&signature_path, content_hash.as_bytes()).await {
-        tracing::error!("Failed to write smart-overwrite signature to {}: {}", signature_path.display(), e);
-    } else {
-        tracing::info!("Wrote smart-overwrite signature to {}", signature_path.display());
+    if uses_export_signature(&collection) {
+        if let Err(e) = tokio::fs::write(&signature_path, content_hash.as_bytes()).await {
+            tracing::error!("Failed to write smart-overwrite signature to {}: {}", signature_path.display(), e);
+        } else {
+            tracing::info!("Wrote smart-overwrite signature to {}", signature_path.display());
+        }
     }
 
     for (_i, (name, hash)) in collection.iter().enumerate() {
-        // The sender always wraps items in a 'databeam_' folder.
-        // We strip this first component to allow remapping into our resolved 'final_output_dir'.
-        let mut parts = name.split('/');
-        let _wrapper = parts.next(); // Skip the original 'databeam_XXX' name
-        
-        let mut target = output_dir.to_path_buf();
-        let mut has_subcomponents = false;
-        for part in parts {
-            validate_path_component(part)?;
-            target.push(part);
-            has_subcomponents = true;
+        let relative = if root.is_some() {
+            name.split_once('/').unwrap().1
+        } else {
+            name.as_str()
+        };
+        let target = get_export_path(output_dir, relative)?;
+        if target.is_dir() {
+            anyhow::bail!("Cannot export {name}: {} is a directory; choose a different receive folder", target.display());
         }
-
-        // Fallback: If for some reason there were no subcomponents, use the raw name joined to parent
-        if !has_subcomponents {
-             target = get_export_path(output_dir.parent().unwrap_or(output_dir), name)?;
-        }
-
-        #[cfg(windows)]
-        {
-            target = to_windows_extended_path(target);
+        if target.exists() && !overwrite {
+            anyhow::bail!("File already exists: {}", target.display());
         }
         let mut last_error: Option<String> = None;
         const MAX_ATTEMPTS: u32 = 5;
@@ -449,7 +503,7 @@ async fn export(
 
             let mut current_size = 0u64;
             let mut last_log_offset = 0u64;
-            let mut failed: Option<String> = None;
+            let mut failed: Option<anyhow::Error> = None;
 
             while let Some(item) = stream.next().await {
                 match item {
@@ -478,25 +532,26 @@ async fn export(
                         }
                     }
                     ExportProgressItem::Error(cause) => {
-                        failed = Some(cause.to_string());
+                        failed = Some(anyhow::Error::new(cause));
                         break;
                     }
                 }
             }
 
             if let Some(err) = failed {
+                let details = format!("{err:#}");
                 let retryable = attempt < MAX_ATTEMPTS
-                    && (err.to_lowercase().contains("os error 2")
-                        || err.to_lowercase().contains("os error 3")
-                        || err.to_lowercase().contains("os error 32"));
-                last_error = Some(err.clone());
+                    && (details.to_lowercase().contains("os error 2")
+                        || details.to_lowercase().contains("os error 3")
+                        || details.to_lowercase().contains("os error 32"));
+                last_error = Some(details.clone());
                 if retryable {
                     let _ = tokio::fs::remove_file(&target).await;
                     // Exponential backoff: 250ms, 500ms, 750ms, 1000ms
                     tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
                     continue;
                 }
-                anyhow::bail!("error exporting {}: {}", name, err);
+                return Err(err.context(format!("Export {name} to {}", target.display())));
             }
 
             last_error = None;
@@ -602,7 +657,7 @@ pub async fn check_and_export_local_in(
     output_dir: Option<PathBuf>,
     app_handle: AppHandle,
     blob_dir: Option<PathBuf>,
-    _overwrite: bool,
+    overwrite: bool,
     cancel_token: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> anyhow::Result<bool> {
     let ticket = match BlobTicket::from_str(ticket_str) {
@@ -637,6 +692,7 @@ pub async fn check_and_export_local_in(
     let local = db.remote().local(hash_and_format).await?;
 
     if !local.is_complete() {
+        db.shutdown().await?;
         return Ok(false); // partial download, need to reconnect to sender
     }
 
@@ -646,7 +702,9 @@ pub async fn check_and_export_local_in(
     });
 
     // Load collection from local store
-    let collection = Collection::load(hash_and_format.hash, db.as_ref()).await?;
+    let collection = wrap_unwrapped_collection(
+        db.as_ref(), Collection::load(hash_and_format.hash, db.as_ref()).await?,
+    ).await?;
 
     // Emit file names
     let mut file_names: Vec<String> = Vec::new();
@@ -662,9 +720,9 @@ pub async fn check_and_export_local_in(
     let content_hash = ticket.hash().to_hex().to_string();
     let mut final_output_dir = output_dir.to_path_buf();
     
-    if !collection.is_empty() {
-        let root_name = collection.iter().next().unwrap().0.clone();
-        let dir_component = root_name.split('/').next().unwrap_or(&root_name);
+    let use_signature = uses_export_signature(&collection);
+    if let Some(dir_component) = collection_root(&collection) {
+        validate_path_component(dir_component)?;
         
         let mut attempt = 1;
         loop {
@@ -695,7 +753,8 @@ pub async fn check_and_export_local_in(
 
     emit_event(&app_handle, "receive-started");
     emit_event(&app_handle, "receive-export-started");
-    let export_fut = export(&db, collection, &final_output_dir, &app_handle, &content_hash);
+    let allow_overwrite = overwrite || collection_root(&collection).is_some();
+    let export_fut = export(&db, collection, &final_output_dir, &app_handle, &content_hash, allow_overwrite);
 
     if let Some(mut cancel_rx) = cancel_token {
         tokio::select! {
@@ -711,11 +770,16 @@ pub async fn check_and_export_local_in(
         export_fut.await?;
     }
 
+    // Release Windows database handles before removing the completed cache.
+    db.shutdown().await?;
+
     emit_event(&app_handle, "receive-completed");
     
     // Remove the smart-overwrite signature file now that export is finished
-    let signature_path = final_output_dir.join("databeam_hash.txt");
-    let _ = tokio::fs::remove_file(&signature_path).await;
+    if use_signature {
+        let signature_path = final_output_dir.join("databeam_hash.txt");
+        let _ = tokio::fs::remove_file(&signature_path).await;
+    }
 
     // Clean up the temporary blob store after successful local export
     if let Ok(ticket) = BlobTicket::from_str(ticket_str) {

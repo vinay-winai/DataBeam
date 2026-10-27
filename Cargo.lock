@@ -6163,6 +6163,7 @@ name = "sendme"
 version = "0.37.1"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "console 0.15.11",
  "data-encoding",

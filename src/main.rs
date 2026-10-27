@@ -7465,6 +7465,28 @@ mod parse_tests {
     }
 
     #[test]
+    fn sendme_explicit_failure_at_full_queued_progress_is_not_success() {
+        for tool in [SelectedTool::Sendme, SelectedTool::EazySendme] {
+            let mut app = DataBeamApp::default();
+            app.selected_tool = tool;
+            app.view = AppView::Send;
+            app.transfer_state = TransferState::Running;
+            app.sendme_one_shot = true;
+            app.eazysendme_auto_retry = false;
+            app.sendme_had_transfer = true;
+            app.transfer_total_bytes = Some(4096);
+            app.transfer_done_bytes = Some(4096);
+            app.transfer_progress = 1.0;
+            app.sendme_sender_payload_complete = true;
+            let (tx, rx) = mpsc::channel();
+            app.transfer_rx = Some(rx);
+            tx.send(TransferMsg::Error("Sendme transfer failed on sender side".into())).unwrap();
+            app.poll_transfer();
+            assert!(matches!(app.transfer_state, TransferState::Failed(_)));
+        }
+    }
+
+    #[test]
     fn sendme_one_shot_completes_on_peer_disconnected_signal() {
         let mut app = DataBeamApp::default();
         app.selected_tool = SelectedTool::Sendme;

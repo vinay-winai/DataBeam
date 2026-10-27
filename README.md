@@ -24,6 +24,7 @@ You can:
 - support for custom code as short as 7 characters in croc and easysendme modes
 
 - support for transferring multiple files/folders at once
+- CLI Sendme collections without an enclosing folder are received inside a `_databeam` folder; existing sender folders are preserved
 - QR code generation for transfer codes/tickets
 - modern native desktop UI with no browser runtime
 - visible transfer logs inside the app

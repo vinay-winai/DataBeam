@@ -1,6 +1,7 @@
 use crate::core::types::{
     apply_options, get_or_create_secret, AddrInfoOptions, AppHandle, SendOptions, SendResult,
 };
+use super::sender_protocol::AcknowledgedBlobs;
 use anyhow::Context;
 use data_encoding::HEXLOWER;
 use iroh::{address_lookup::pkarr::PkarrPublisher, endpoint::presets, Endpoint, RelayMode};
@@ -13,7 +14,7 @@ use iroh_blobs::{
     provider::events::{ConnectMode, EventMask, EventSender, RequestMode},
     store::fs::FsStore,
     ticket::BlobTicket,
-    BlobFormat, BlobsProtocol,
+    BlobFormat,
 };
 use n0_future::StreamExt;
 use n0_future::{task::AbortOnDropHandle, BufferedStreamExt};
@@ -160,16 +161,16 @@ pub async fn start_share(
 
         let store = FsStore::load(&blobs_data_dir2).await?;
 
-        let blobs = BlobsProtocol::new(
-            &store,
-            Some(EventSender::new(
+        let blobs = AcknowledgedBlobs::new(
+            store.as_ref().clone(),
+            EventSender::new(
                 progress_tx,
                 EventMask {
                     connected: ConnectMode::Notify,
                     get: RequestMode::NotifyLog,
                     ..EventMask::DEFAULT
                 },
-            )),
+            ),
         );
 
         let import_result = import(paths2, payload_root2, blobs.store(), options.jobs).await?;

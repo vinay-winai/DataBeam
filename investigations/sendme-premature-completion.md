@@ -48,3 +48,36 @@ completion event after payload transfer. All 17 native Windows tests pass.
 The exact Mac-to-Windows VPN setup still requires a test with the fixed sender.
 The separate Croc relay-probe timeout observed during a later retry is outside
 this sender-completion correction.
+
+## Follow-up: queued bytes versus acknowledged delivery
+
+The rebuilt preview still failed with Proton VPN enabled. The user confirmed
+both devices had been updated and later reproduced the failure in both
+directions. The earlier apparent Mac-only behavior is therefore not a reliable
+distinction.
+
+Provider progress measures writes into QUIC's send buffer. The upstream QUIC
+adapter's `sync()` is a no-op, so its request-completion notification can precede
+network delivery. Stopping the one-shot runtime after a 500 ms grace interval
+can still abandon those buffered response bytes.
+
+The local delivery-ack test build registers a protocol adapter that finishes the
+response stream and awaits `SendStream::stopped()` with successful acknowledgment
+before the provider reports request completion. Explicit stream stops and
+connection failures remain errors. The existing read-only event mask, including
+rejection of uploads to the sender, is retained. Per-connection stream tasks are
+owned by a JoinSet and cancelled with the connection handler.
+
+A loopback UDP proxy test holds response packets for 1.2 seconds. Its control
+uses the original adapter and completes while packets are still held; the new
+adapter remains pending until delivery and acknowledgment. The test uses the
+same underlying QUIC streams without iroh multipath, which could otherwise
+bypass the intentionally delayed proxy. All 18 native tests pass, including
+the metadata-completion, payload-resume, exact-content and upload-rejection
+regressions.
+
+The local build also preserves the receiver's error chain and stops translating
+explicit sender failures or an unexpectedly closed event channel into a
+successful disconnect based only on queued-byte counters. This verifies the
+shutdown correction; the exact Proton VPN setup still needs a real-device test
+to establish whether another network-path problem remains.
