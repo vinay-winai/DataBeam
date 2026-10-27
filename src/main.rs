@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod backend;
+mod app_update;
 mod theme;
 mod troubleshoot;
 // Tray stack is Windows-only for now (macOS menu-bar / Linux indicator
@@ -339,6 +340,7 @@ struct DataBeamApp {
     launch_size_fixed: bool,
     troubleshoot_news: troubleshoot::GuideNews,
     troubleshoot_monitor: troubleshoot::GuideMonitor,
+    app_updater: app_update::AppUpdater,
 }
 
 impl Drop for DataBeamApp {
@@ -459,6 +461,7 @@ impl Default for DataBeamApp {
             launch_size_fixed: false,
             troubleshoot_news: troubleshoot::GuideNews::default(),
             troubleshoot_monitor: troubleshoot::GuideMonitor::default(),
+            app_updater: app_update::AppUpdater::default(),
         }
     }
 }
@@ -570,6 +573,11 @@ impl DataBeamApp {
             app.selected_tool = SelectedTool::Croc;
         }
 
+        if let Some(message) = app_update::restart_result() {
+            let color = if message.starts_with("Updated to") { SUCCESS } else { ERROR };
+            app.show_toast(message.clone(), color);
+            app.app_updater.status = Some(message);
+        }
         app
     }
 
@@ -1942,7 +1950,7 @@ impl DataBeamApp {
     /// done: a fresh idle app schedules no frames, so without an explicit
     /// wakeup the result would sit in the channel uncollected indefinitely.
     fn start_croc_update_check(&mut self, ctx: &egui::Context) {
-        if self.croc_update_phase != CrocUpdatePhase::Idle {
+        if self.app_updater.installing || self.croc_update_phase != CrocUpdatePhase::Idle {
             return;
         }
         if self.transfer_state == TransferState::Running {
@@ -1968,6 +1976,7 @@ impl DataBeamApp {
         binary: String,
         previous_version: Option<String>,
     ) {
+        if self.app_updater.installing { return; }
         let (tx, rx) = mpsc::channel();
         self.croc_update_apply_rx = Some(rx);
         self.croc_update_phase = CrocUpdatePhase::Updating;
@@ -1988,7 +1997,7 @@ impl DataBeamApp {
     /// re-detect so the home page version updates. Managed copy only — a
     /// legacy *system* croc is left alone (never overwrite foreign files).
     fn start_croc_legacy_migration(&mut self, ctx: &egui::Context, binary: &str) {
-        if self.croc_update_phase != CrocUpdatePhase::Idle {
+        if self.app_updater.installing || self.croc_update_phase != CrocUpdatePhase::Idle {
             return;
         }
         if self.transfer_state == TransferState::Running {
@@ -3070,6 +3079,10 @@ impl DataBeamApp {
     }
 
     fn start_send(&mut self, is_auto: bool) {
+        if self.app_updater.installing {
+            self.show_toast("DataBeam is updating. Transfers will be available after restart.".into(), WARNING);
+            return;
+        }
         // Never overlap a croc self-update: the binary file may be replaced
         // mid-transfer (fatal on Windows file locks, version skew elsewhere).
         // Sendme legs never touch the croc binary, so they are exempt.
@@ -3223,6 +3236,10 @@ impl DataBeamApp {
     }
 
     fn start_receive(&mut self, is_auto: bool) {
+        if self.app_updater.installing {
+            self.show_toast("DataBeam is updating. Transfers will be available after restart.".into(), WARNING);
+            return;
+        }
         // Same overlap guard as start_send (see above): never run a
         // croc-backed transfer while the croc binary may be replaced.
         if matches!(
@@ -3809,6 +3826,14 @@ impl eframe::App for DataBeamApp {
         if self.troubleshoot_monitor.poll(ctx, &mut self.troubleshoot_news) {
             self.persist_user_settings();
         }
+        if self.app_updater.poll(ctx) {
+            self.persist_user_settings();
+            self.tray_quit_requested = true;
+            self.tray_state.take();
+            self.tray_action_rx = None;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
         // Automatic checks are Windows-only; macOS/Linux remain manual-only.
         self.poll_tool_detection();
         self.poll_managed_install(ctx);
@@ -3975,6 +4000,34 @@ impl eframe::App for DataBeamApp {
                             SelectedTool::EazySendme => (EAZYSENDME_COLOR, "⚡ eazysendme"),
                         };
                         status_badge(ui, tn, tc);
+                    });
+                });
+            });
+
+        egui::TopBottomPanel::bottom("app_update_footer")
+            .frame(egui::Frame::NONE.fill(BG_PANEL).inner_margin(egui::Margin::symmetric(12, 5)))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("v{APP_VERSION}")).size(11.0).color(TEXT_MUTED));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let transfer_active = self.transfer_state == TransferState::Running
+                            || self.eazy_next_retry_time.is_some()
+                            || self.croc_update_phase != CrocUpdatePhase::Idle;
+                        let available = self.app_updater.available.is_some();
+                        let label = if self.app_updater.installing { "Updating…" }
+                            else if self.app_updater.busy() { "Checking…" }
+                            else if available { "Update ●" } else { "Update" };
+                        let tooltip = if transfer_active { "Finish or stop the transfer before updating DataBeam." }
+                            else { self.app_updater.status.as_deref().unwrap_or("Check for DataBeam updates") };
+                        if ui.add_enabled(!transfer_active && !self.app_updater.busy() && !self.app_updater.installing,
+                            egui::Button::new(RichText::new(label).size(12.0).color(if available { WARNING } else { TEXT_SECONDARY })))
+                            .on_hover_text(tooltip).clicked() {
+                            self.app_updater.install(ctx);
+                        }
+                        if let Some(status) = &self.app_updater.status {
+                            ui.add(egui::Label::new(RichText::new(status).size(11.0).color(TEXT_MUTED)).truncate())
+                                .on_hover_text(status);
+                        }
                     });
                 });
             });
@@ -6659,6 +6712,7 @@ fn enforce_single_instance_release() -> Option<single_instance::SingleInstance> 
 }
 
 fn main() -> eframe::Result {
+    if app_update::run_helper_if_requested() { return Ok(()); }
     #[cfg(all(
         feature = "release-single-instance",
         any(target_os = "windows", target_os = "linux")
@@ -6706,6 +6760,29 @@ mod parse_tests {
             &serde_json::to_string(&settings).unwrap(),
         ).unwrap();
         assert!(restored.troubleshoot_news.has_unread());
+    }
+
+    #[test]
+    fn app_update_blocks_new_transfers_until_restart() {
+        let mut app = DataBeamApp::default();
+        app.app_updater.installing = true;
+        app.start_send(false);
+        assert_eq!(app.transfer_state, TransferState::Idle);
+        assert!(app.transfer_handle.is_none());
+        assert!(app.toast_msg.as_ref().unwrap().0.contains("updating"));
+        let ctx = eframe::egui::Context::default();
+        app.start_croc_update_check(&ctx);
+        app.start_croc_update_apply(&ctx, "unused-croc".into(), None);
+        app.start_croc_legacy_migration(&ctx, "unused-croc");
+        assert_eq!(app.croc_update_phase, super::CrocUpdatePhase::Idle);
+        assert!(app.croc_update_check_rx.is_none());
+        assert!(app.croc_update_apply_rx.is_none());
+        assert!(app.croc_legacy_migration_rx.is_none());
+        app.toast_msg = None;
+        app.start_receive(false);
+        assert_eq!(app.transfer_state, TransferState::Idle);
+        assert!(app.transfer_handle.is_none());
+        assert!(app.toast_msg.as_ref().unwrap().0.contains("updating"));
     }
 
     #[test]
