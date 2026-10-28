@@ -1,5 +1,17 @@
 # News
 
+## v0.6.7 released
+
+- Add an Update button that checks for newer stable releases at startup and every three hours. A badge appears when an update is available; click it to download, verify, install, and restart DataBeam.
+- Add an unread badge to the Troubleshoot button when this guide changes. Opening the guide clears the badge, and read status survives restarts.
+- Fix the Mac updater architecture check that could report `lipo: unknown architecture`. The repaired update flow has now been tested on Windows and Mac.
+- Correct the Troubleshoot link and keep the old URL working for existing apps.
+- Serve the portable EXE directly from the website's Windows download links.
+
+Existing v0.6.6 users need to install v0.6.7 manually once to get the updater. Users of the repaired v0.6.7 preview already have the same tested packages.
+
+[DataBeam website](https://vinay-winai.github.io/DataBeam/) · [Download v0.6.7 and read the release notes](https://github.com/vinay-winai/DataBeam/releases/tag/v0.6.7)
+
 ## v0.6.6 released
 
 - Fix Sendme sender completion and delivery acknowledgment issues that could cause transfers to fail with VPN enabled or on slower relay connections. Transfers with VPN enabled have now succeeded from Windows to Mac and from Mac to Windows.
