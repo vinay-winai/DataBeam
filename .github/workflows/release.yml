@@ -1,9 +1,6 @@
-name: Release
+name: Updater Bootstrap Test
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       target:
@@ -33,7 +30,7 @@ on:
         default: false
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
@@ -42,7 +39,7 @@ env:
 jobs:
   build-windows-x64:
     name: Build Assets (windows-x64)
-    if: github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == 'windows-x64'
+    if: false
     runs-on: windows-2022
 
     steps:
@@ -165,7 +162,7 @@ jobs:
           # 1) Create the aarch64 DMG first (smaller size for Apple Silicon natively)
           codesign --force --deep --sign - "${app_path}"
           codesign --verify --deep --strict --verbose=2 "${app_path}"
-          dmg_path_aarch="dist/databeam_v${version}_macos-aarch64.dmg"
+          dmg_path_aarch="dist/databeam_updater-test_v${version}_macos-aarch64.dmg"
           hdiutil create -volname "DataBeam" -srcfolder "${app_path}" -ov -format UDZO "${dmg_path_aarch}"
 
           # 2) Now merge into Universal App Bundle!
@@ -178,19 +175,25 @@ jobs:
           codesign --force --deep --sign - "${app_path}"
           codesign --verify --deep --strict --verbose=2 "${app_path}"
 
-          dmg_path_univ="dist/databeam_v${version}_macos-universal.dmg"
+          dmg_path_univ="dist/databeam_updater-test_v${version}_macos-universal.dmg"
           hdiutil create -volname "DataBeam" -srcfolder "${app_path}" -ov -format UDZO "${dmg_path_univ}"
+
+      - name: Add updater test instructions and checksums
+        shell: bash
+        run: |
+          cp investigations/macos-updater-bootstrap.md dist/README-updater-test.md
+          (cd dist && shasum -a 256 *.dmg > SHA256SUMS.txt)
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v6
         with:
-          name: release-macos-universal
+          name: databeam-macos-updater-test
           path: dist/*
           if-no-files-found: error
 
   build-linux-x64:
     name: Build Assets (linux-x64)
-    if: github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == 'linux-x64' || github.event.inputs.target == 'macos-linux'
+    if: false
     runs-on: ubuntu-22.04
 
     steps:
@@ -283,92 +286,4 @@ jobs:
           name: release-linux-x64
           path: dist/*
           if-no-files-found: error
-
-  publish-release:
-    name: Publish GitHub Release
-    runs-on: ubuntu-22.04
-    needs:
-      - build-windows-x64
-      - build-macos-universal
-      - build-linux-x64
-    if: |
-      always() &&
-      !contains(needs.*.result, 'failure') &&
-      !contains(needs.*.result, 'cancelled')
-
-    steps:
-      - name: Checkout release notes
-        uses: actions/checkout@v6
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v6
-        with:
-          pattern: release-*
-          merge-multiple: true
-          path: dist
-
-      - name: Publish or update release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          REPLACE_EXISTING: ${{ github.event.inputs.replace_existing || 'false' }}
-          RELEASE_TARGET: ${{ github.event.inputs.target }}
-          RELEASE_PRERELEASE: ${{ github.event.inputs.prerelease || 'false' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ "${REPLACE_EXISTING}" = "true" ] && [ "${RELEASE_TARGET}" != "all" ]; then
-            echo "Replacing a release tag requires rebuilding all targets."
-            exit 1
-          fi
-
-          preview_flags=()
-          release_title="DataBeam ${RELEASE_TAG}"
-          if [ "${RELEASE_PRERELEASE}" = "true" ]; then
-            preview_flags=(--prerelease --latest=false)
-            release_title="${release_title} Preview"
-          fi
-
-          # Keep new releases in draft until assets and notes have been uploaded.
-          if ! gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            echo "Creating release ${RELEASE_TAG}..."
-            gh release create "${RELEASE_TAG}" --target "${GITHUB_SHA}" --title "${release_title}" --generate-notes --draft "${preview_flags[@]}"
-          fi
-
-          # Merge or generate SHA256SUMS.txt
-          mkdir -p /tmp/existing_release
-          if gh release download "${RELEASE_TAG}" --pattern "SHA256SUMS.txt" --dir /tmp/existing_release 2>/dev/null; then
-            echo "Existing SHA256SUMS.txt found on release. Merging checksums..."
-            cd dist
-            ls -1 > /tmp/new_files.txt
-            grep -v -F -f /tmp/new_files.txt /tmp/existing_release/SHA256SUMS.txt > /tmp/merged_sha.txt || true
-            sha256sum * >> /tmp/merged_sha.txt
-            sort -k2 -u /tmp/merged_sha.txt > SHA256SUMS.txt
-            cd ..
-          else
-            echo "Generating fresh SHA256SUMS.txt..."
-            (cd dist && sha256sum * > SHA256SUMS.txt)
-          fi
-
-          echo "Uploading release assets with --clobber..."
-          gh release upload "${RELEASE_TAG}" dist/* --clobber
-
-          if [ "${REPLACE_EXISTING}" = "true" ]; then
-            # Use the workflow token so updating the existing tag does not
-            # trigger a second release run. Retarget only after all uploads.
-            gh api --method PATCH "repos/${GH_REPO}/git/refs/tags/${RELEASE_TAG}" \
-              -f sha="${GITHUB_SHA}" -F force=true > /dev/null
-          fi
-
-          notes_path="release-notes/${RELEASE_TAG}.md"
-          if [ -f "${notes_path}" ]; then
-            gh release edit "${RELEASE_TAG}" --notes-file "${notes_path}"
-          fi
-
-          if [ "${RELEASE_PRERELEASE}" = "true" ]; then
-            gh release edit "${RELEASE_TAG}" --title "${release_title}" --draft=false --prerelease --latest=false
-          else
-            gh release edit "${RELEASE_TAG}" --draft=false
-          fi
 

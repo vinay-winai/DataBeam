@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-const API_URL: &str = "https://api.github.com/repos/vinay-winai/DataBeam/releases/latest";
+const API_URL: &str = "https://api.github.com/repos/vinay-winai/DataBeam/releases/tags/v0.6.7";
 const DOWNLOAD_ROOT: &str = "https://github.com/vinay-winai/DataBeam/releases/download/";
 const CHECK_INTERVAL: Duration = Duration::from_secs(3 * 60 * 60);
 const MAX_PACKAGE_SIZE: u64 = 512 * 1024 * 1024;
@@ -57,7 +57,7 @@ fn select_update(
     let version = Version::parse(release.tag_name.trim_start_matches('v'))
         .map_err(|error| format!("Invalid release version: {error}"))?;
     let current = Version::parse(current).map_err(|error| error.to_string())?;
-    if release.draft || release.prerelease || !version.pre.is_empty() || version <= current {
+    if release.draft || release.tag_name != "v0.6.7" || !version.pre.is_empty() || version <= current {
         return Ok(None);
     }
     let (suffix, kind) = match (os, arch, appimage) {
