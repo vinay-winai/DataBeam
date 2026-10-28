@@ -224,13 +224,16 @@ fn verify_mac_bundle(bundle: &Path, version: &str) -> Result<(), String> {
     } else {
         "x86_64"
     };
+    verify_mac_architecture(&bundle.join("Contents/MacOS/databeam"), arch)
+}
+
+#[cfg(target_os = "macos")]
+fn verify_mac_architecture(executable: &Path, arch: &str) -> Result<(), String> {
+    // Apple's lipo consumes everything after -verify_arch as architecture
+    // names. Its input file must come before that option.
     run(
         "/usr/bin/lipo",
-        &[
-            Path::new("-verify_arch"),
-            Path::new(arch),
-            &bundle.join("Contents/MacOS/databeam"),
-        ],
+        &[executable, Path::new("-verify_arch"), Path::new(arch)],
     )
 }
 
@@ -496,6 +499,22 @@ pub(super) fn acknowledge_restart(config: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_lipo_accepts_native_binary_and_rejects_missing_architecture() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("Data Beam's test executable");
+        fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        let native = if cfg!(target_arch = "aarch64") {
+            "arm64"
+        } else {
+            "x86_64"
+        };
+        verify_mac_architecture(&executable, native)
+            .expect("native Mach-O architecture must verify");
+        assert!(verify_mac_architecture(&executable, "i386").is_err());
+    }
 
     #[test]
     fn portable_replacement_preserves_backup_and_exact_new_bytes() {
