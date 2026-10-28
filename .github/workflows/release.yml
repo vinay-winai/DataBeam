@@ -141,6 +141,9 @@ jobs:
       - name: Verify non-Windows platform policy
         run: cargo test --locked --bin databeam non_windows_
 
+      - name: Verify macOS updater architecture checks
+        run: cargo test --locked --bin databeam macos_lipo_
+
       - name: Install cargo-bundle
         run: cargo install cargo-bundle --version 0.12.0 --locked
 

@@ -22,3 +22,19 @@ Checks and downloads run on background workers. Active transfers, pending transf
 - The updater modules were type-checked for `aarch64-apple-darwin` using a minimal UI-context harness. Actual macOS and Linux installation, authorization dialogs, and restart behavior still need device testing.
 
 Existing v0.6.6 release packages have not been rebuilt for this feature. Users must first install an updater-capable build; that build can then update to later stable versions. Replacing a release's assets without changing its version does not trigger an update badge.
+
+## Windows Update-button test — 2026-10-28
+
+A temporary v0.6.6 bootstrap build was made from the v0.6.7 source in an isolated directory. Only its package version and release lookup policy differed: it queried the exact v0.6.7 preview and allowed that pinned preview through the release filter. Its installer, UI, backend, and guide-monitoring source matched production after line-ending normalization.
+
+The app displayed `v0.6.7 is available` with the Update badge. The user clicked Update. The app downloaded the published Windows EXE, replaced itself, and restarted as v0.6.7. The badge cleared and its normal stable-release check reported it up to date rather than offering the older v0.6.6 stable release.
+
+The installed EXE matched the published asset SHA-256 `4e6becab879307b8ad607922b1821906e7d6aec75bf41686a621ec4fd55972a8`. The seeded receive folder, recent code, one-shot setting, and tray preference survived. Default user settings were unchanged, staging/backup directories were removed, the helper exited, and the restarted app remained running. Local evidence is in `target/updater-e2e-windows/verification.json`.
+
+The complete Windows button/download/install/restart flow has now passed on this PC. macOS and Linux installation still require real-device testing.
+
+## Mac architecture-check failure
+
+The first Mac device test failed during preparation with `lipo: unknown architecture`. The updater invoked `lipo -verify_arch arm64 /path/to/databeam` (or x86_64), but Apple's argument parser consumes the path as another architecture. The corrected call is `lipo /path/to/databeam -verify_arch arm64`. Validation still rejects missing architectures; it is not bypassed. Because the failure happened before helper handoff, the running app was not replaced.
+
+A macOS-only regression test copies the native test executable to a path containing spaces and an apostrophe, verifies its actual architecture using the system `lipo`, and checks that i386 is rejected. Both the normal Mac release workflow and the bootstrap artifact workflow run this test before packaging.
