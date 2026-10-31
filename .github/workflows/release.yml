@@ -102,7 +102,7 @@ jobs:
   build-macos-universal:
     name: Build Assets (macos-universal)
     if: github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == 'macos-universal' || github.event.inputs.target == 'macos-linux'
-    runs-on: macos-14
+    runs-on: macos-15
 
     steps:
       - name: Checkout
