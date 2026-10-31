@@ -3947,21 +3947,12 @@ impl eframe::App for DataBeamApp {
 
                         ui.add_space(8.0);
                         let unread_news = self.troubleshoot_news.has_unread();
-                        let mut troubleshoot_label = egui::text::LayoutJob::default();
-                        troubleshoot_label.append("❓ Troubleshoot", 0.0, egui::TextFormat {
-                            font_id: egui::FontId::proportional(12.0),
-                            color: TEXT_SECONDARY,
-                            ..Default::default()
-                        });
+                        let troubleshoot_button = ui.selectable_label(false,
+                            RichText::new("❓ Troubleshoot").size(12.0).color(TEXT_SECONDARY));
                         if unread_news {
-                            troubleshoot_label.append("  ●", 0.0, egui::TextFormat {
-                                font_id: egui::FontId::proportional(12.0),
-                                color: WARNING,
-                                ..Default::default()
-                            });
+                            notification_dot(ui, &troubleshoot_button, WARNING);
                         }
-                        if ui
-                            .selectable_label(false, troubleshoot_label)
+                        if troubleshoot_button
                             .on_hover_text(if unread_news {
                                 "New troubleshooting guide or release news"
                             } else {
@@ -4016,16 +4007,21 @@ impl eframe::App for DataBeamApp {
                         let available = self.app_updater.available.is_some();
                         let label = if self.app_updater.installing { "Updating…" }
                             else if self.app_updater.busy() { "Checking…" }
-                            else if available { "Update ●" } else { "Update" };
+                            else { "Update" };
                         let tooltip = if transfer_active { "Finish or stop the transfer before updating DataBeam." }
                             else { self.app_updater.status.as_deref().unwrap_or("Check for DataBeam updates") };
-                        if ui.add_enabled(!transfer_active && !self.app_updater.busy() && !self.app_updater.installing,
-                            egui::Button::new(RichText::new(label).size(12.0).color(if available { WARNING } else { TEXT_SECONDARY })))
+                        let update_button = ui.add_enabled(!transfer_active && !self.app_updater.busy() && !self.app_updater.installing,
+                            egui::Button::new(RichText::new(label).size(12.0).color(if available { Color32::YELLOW } else { TEXT_SECONDARY })));
+                        if available && !self.app_updater.busy() && !self.app_updater.installing {
+                            notification_dot(ui, &update_button, if update_button.enabled() { Color32::YELLOW } else { TEXT_MUTED });
+                        }
+                        if update_button
                             .on_hover_text(tooltip).clicked() {
                             self.app_updater.install(ctx);
                         }
                         if let Some(status) = &self.app_updater.status {
-                            ui.add(egui::Label::new(RichText::new(status).size(11.0).color(TEXT_MUTED)).truncate())
+                            ui.add(egui::Label::new(RichText::new(status).size(11.0)
+                                .color(if available { Color32::YELLOW } else { TEXT_MUTED })).truncate())
                                 .on_hover_text(status);
                         }
                     });

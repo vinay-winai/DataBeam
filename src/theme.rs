@@ -28,6 +28,12 @@ pub const SUCCESS: Color32 = Color32::from_rgb(87, 214, 36);
 pub const WARNING: Color32 = Color32::from_rgb(255, 190, 95);
 pub const ERROR: Color32 = Color32::from_rgb(255, 100, 100);
 
+/// Paint inside a button's right padding so badges never depend on font glyphs.
+pub fn notification_dot(ui: &egui::Ui, response: &egui::Response, color: Color32) {
+    let center = egui::pos2(response.rect.right() - 7.0, response.rect.center().y);
+    ui.painter().circle_filled(center, 3.0, color);
+}
+
 // ── Spacing & Sizing ───────────────────────────────────────────────
 pub const CARD_ROUNDING: CornerRadius = CornerRadius::same(10);
 pub const BUTTON_ROUNDING: CornerRadius = CornerRadius::same(8);

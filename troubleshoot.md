@@ -1,5 +1,13 @@
 # News
 
+## v0.6.8 released
+
+- Draw notification badges as circles so they do not appear as missing-character squares on Mac.
+- Make the update-available hint and Update button highlight yellow.
+- Add a short suggested command under UI issues for Linux Wayland drag-and-drop.
+
+[DataBeam website](https://vinay-winai.github.io/DataBeam/) · [Download v0.6.8 and read the release notes](https://github.com/vinay-winai/DataBeam/releases/tag/v0.6.8)
+
 ## v0.6.7 released
 
 - Add an Update button that checks for newer stable releases at startup and every three hours. A badge appears when an update is available; click it to download, verify, install, and restart DataBeam.
@@ -31,7 +39,8 @@ Existing v0.6.6 users need to install v0.6.7 manually once to get the updater. U
 - If transfer does not start and logs show any errors like (including not limited to) room not found or room unavailable/room full/peer left, sender should **retry with a different Code Phrase**. Avoid using simple codes like 1234567 or aaaaaaa.
 
 ## Common UI Issues
-- Drag/ Drop is currently not working on linux. So use file / folder buttons instead.
+
+- File drag-and-drop currently does not work on Linux Wayland. Use the file / folder buttons instead. In the meantime, you could try launching DataBeam with `env -u WAYLAND_DISPLAY databeam`.
 - If app width is small , UI persentation may not be desirable. In that case , please resize the app window.
 
 ## Suggestions
