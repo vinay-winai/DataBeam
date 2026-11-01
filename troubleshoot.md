@@ -18,7 +18,7 @@ v0.6.6 users: install v0.6.7 or newer manually once to enable app updates.
 
 ## v0.6.6 released
 
-- Fix Sendme VPN transfer failures and Croc relay connection issues; update security dependencies.
+- Fix Croc relay connection issues and update security dependencies.
 
 [Release notes](https://github.com/vinay-winai/DataBeam/releases/tag/v0.6.6)
 
