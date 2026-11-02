@@ -4140,9 +4140,6 @@ impl eframe::App for DataBeamApp {
                             else { self.app_updater.status.as_deref().unwrap_or("Check for DataBeam updates") };
                         let update_button = ui.add_enabled(!transfer_active && !self.app_updater.busy() && !self.app_updater.installing,
                             egui::Button::new(RichText::new(label).size(12.0).color(if available { Color32::YELLOW } else { TEXT_SECONDARY })));
-                        if available && !self.app_updater.busy() && !self.app_updater.installing {
-                            notification_dot(ui, &update_button, if update_button.enabled() { Color32::YELLOW } else { TEXT_MUTED });
-                        }
                         if update_button
                             .on_hover_text(tooltip).clicked() {
                             self.app_updater.install(ctx);
