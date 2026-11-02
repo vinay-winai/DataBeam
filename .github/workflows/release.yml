@@ -92,7 +92,7 @@ jobs:
           Copy-Item "target/release/databeam.exe" "$package/databeam.exe"
           Copy-Item "LICENSE", "THIRD_PARTY_NOTICES.md" $package
           Copy-Item "LICENSES/*.txt" "$package/LICENSES"
-          Compress-Archive -Path "$package/*" -DestinationPath "dist/databeam_v${version}_windows-x64.zip" -Force
+          Compress-Archive -Path "$package/*" -DestinationPath "dist/databeam_windows-x64.zip" -Force
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v6
@@ -171,7 +171,7 @@ jobs:
           # 1) Create the aarch64 DMG first (smaller size for Apple Silicon natively)
           codesign --force --deep --sign - "${app_path}"
           codesign --verify --deep --strict --verbose=2 "${app_path}"
-          dmg_path_aarch="dist/databeam_v${version}_macos-aarch64.dmg"
+          dmg_path_aarch="dist/databeam_macos-aarch64.dmg"
           hdiutil create -volname "DataBeam" -srcfolder "${app_path}" -ov -format UDZO "${dmg_path_aarch}"
 
           # 2) Now merge into Universal App Bundle!
@@ -184,7 +184,7 @@ jobs:
           codesign --force --deep --sign - "${app_path}"
           codesign --verify --deep --strict --verbose=2 "${app_path}"
 
-          dmg_path_univ="dist/databeam_v${version}_macos-universal.dmg"
+          dmg_path_univ="dist/databeam_macos-universal.dmg"
           hdiutil create -volname "DataBeam" -srcfolder "${app_path}" -ov -format UDZO "${dmg_path_univ}"
 
       - name: Upload build artifacts
@@ -274,7 +274,7 @@ jobs:
             find target/release -maxdepth 5 -type f | sort
             exit 1
           fi
-          cp "${deb_path}" "dist/databeam_v${version}_linux-x64.deb"
+          cp "${deb_path}" "dist/databeam_linux-x64.deb"
 
           cargo bundle --release --features release-single-instance --format appimage --binary-path target/release/databeam
           appimage_path="$(find target/release/bundle/appimage -maxdepth 1 -name '*.AppImage' -print -quit)"
@@ -283,7 +283,7 @@ jobs:
             find target/release -maxdepth 6 -type f | sort
             exit 1
           fi
-          cp "${appimage_path}" "dist/databeam_v${version}_linux-x64.AppImage"
+          cp "${appimage_path}" "dist/databeam_linux-x64.AppImage"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v6
