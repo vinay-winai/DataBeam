@@ -40,6 +40,8 @@ pub struct SendOptions {
     pub blob_dir: Option<PathBuf>,
     /// Number of parallel jobs to use while importing files.
     pub jobs: Option<usize>,
+    /// Cooperative GUI cancellation, including directory scanning and imports.
+    pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[derive(Debug, Default)]
@@ -51,6 +53,8 @@ pub struct ReceiveOptions {
     /// If set, iroh blob stores are created under this directory instead of std::env::temp_dir().
     pub blob_dir: Option<PathBuf>,
     pub overwrite: bool,
+    /// Stop network work cooperatively, then persist partial data before returning.
+    pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[derive(Clone, Debug)]

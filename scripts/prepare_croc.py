@@ -72,7 +72,7 @@ def main():
             # These upstream cases create symlinks and require Windows developer
             # mode/admin rights. Retain declined-symlink protection coverage.
             test_flags = ['-skip', '^TestReceiveStdinNamedFileCollision/symlink/(approved|overwrite|rename)$']
-        run('go', 'test', './src/croc', './src/tcp', *test_flags, '-run',
+        run('go', 'test', './src/croc', './src/tcp', './src/utils', *test_flags, '-run',
             'Test(DataBeam|ReceiveControlFrame|FormatTransferDirection|LocalRelay|RunWithListener|SendingTextOffer|ReceiveStdinNamedFileCollision)', '-count=1',
             '-timeout', '60s', cwd=source, env=test_env)
         for target in args.target:
@@ -92,6 +92,8 @@ def main():
                 gzip_sha256=hashlib.sha256(payload).hexdigest())
             # Publish metadata last; build.rs verifies both identity and bytes.
             (output / 'croc.gz').write_bytes(payload)
+            # Keep the runnable fixture in sync for local transfer regressions.
+            (output / ('croc.exe' if goos == 'windows' else 'croc')).write_bytes(data)
             (output / 'manifest.json').write_text(json.dumps(metadata, indent=2) + '\n')
             print('Prepared', target, RECIPE['engine_version'], flush=True)
 

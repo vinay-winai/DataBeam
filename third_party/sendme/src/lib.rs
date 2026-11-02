@@ -1,4 +1,5 @@
 pub mod core;
+pub use core::live_rate::LiveRate;
 
 pub use core::{
     receive::{

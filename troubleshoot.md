@@ -2,6 +2,13 @@
 
 [Download DataBeam](https://vinay-winai.github.io/DataBeam/)
 
+## v0.7.0 released
+
+- Improve preparation progress and smooth speed / ETA.
+- Fix Sendme Stop/resume and update iroh to 1.4.1.
+
+[Release notes](https://github.com/vinay-winai/DataBeam/releases/tag/v0.7.0)
+
 ## v0.6.8 released
 
 - Fix notification dots on Mac and highlight available updates in yellow.

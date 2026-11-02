@@ -154,8 +154,8 @@ fn native_sendme_version() -> Option<&'static str> {
 
 fn detect_native_sendme() -> ToolStatus {
     let version = native_sendme_version()
-        .map(|version| format!("iroh 1.0.0 (sendme {version})"))
-        .or_else(|| Some("iroh 1.0.0 (native)".to_string()));
+        .map(|version| format!("iroh 1.4.1 (sendme {version})"))
+        .or_else(|| Some("iroh 1.4.1 (native)".to_string()));
 
     ToolStatus {
         tool: Tool::Sendme,
@@ -897,6 +897,13 @@ pub fn resolve_tool_path(tool: &Tool, statuses: &[ToolStatus]) -> Option<String>
 
 #[derive(Debug, Clone)]
 pub enum TransferMsg {
+    PreparationProgress(PreparationProgress),
+    CrocRate(f64),
+    SendmeSenderProgress {
+        done: u64,
+        total: u64,
+        speed_bps: f64,
+    },
     Output(String),
     ReceivedText(String),
     Progress(f32),
@@ -909,6 +916,13 @@ pub enum TransferMsg {
     SenderTransferActivity,
     ActiveTransfers(usize),
     SendmeRoute(Option<SendmeRoute>),
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct PreparationProgress {
+    pub done: u64,
+    pub total: u64,
+    pub speed_bps: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -961,7 +975,7 @@ fn sender_blob_base_dir(base_dir: Option<&Path>) -> Option<PathBuf> {
     base_dir.map(|dir| dir.join("databeam_sender_stuff"))
 }
 
-fn derive_payload_root_name(paths: &[PathBuf]) -> Result<String, String> {
+fn derive_payload_root_name(paths: &[PathBuf], cancel: &AtomicBool) -> Result<String, String> {
     if paths.is_empty() {
         return Err("No paths provided".to_string());
     }
@@ -970,8 +984,11 @@ fn derive_payload_root_name(paths: &[PathBuf]) -> Result<String, String> {
     let mut largest_size = 0u64;
 
     for p in paths {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("Transfer cancelled".into());
+        }
         let size = if p.is_dir() {
-            get_dir_size(p)
+            get_dir_size(p, cancel)?
         } else {
             fs::metadata(p).map(|m| m.len()).unwrap_or(0)
         };
@@ -1019,6 +1036,7 @@ struct NativeSenderRequestCompleted {
 
 #[derive(Debug, Clone)]
 enum NativeSendmeEvent {
+    PreparationProgress(PreparationProgress),
     TransferStarted,
     TransferProgress {
         done: u64,
@@ -1074,6 +1092,16 @@ impl NativeSendmeEventEmitter for NativeSendmeEmitter {
 
     fn emit_event_with_payload(&self, event_name: &str, payload: &str) -> Result<(), String> {
         let evt = match event_name {
+            "preparation-progress" => {
+                let Some((done, total, speed_bps)) = parse_native_progress_payload(payload) else {
+                    return Ok(());
+                };
+                NativeSendmeEvent::PreparationProgress(PreparationProgress {
+                    done,
+                    total,
+                    speed_bps,
+                })
+            }
             "receive-route" => NativeSendmeEvent::ReceiveRoute(match payload {
                 "direct" => Some(SendmeRoute::Direct),
                 "relay" => Some(SendmeRoute::Relay),
@@ -1246,11 +1274,12 @@ fn format_sender_request_line(state: &SenderRequestRenderState) -> String {
 fn read_lines_cr_aware(
     reader: impl Read + Send + 'static,
     tx: mpsc::Sender<TransferMsg>,
-    parser: impl Fn(&str, &mpsc::Sender<TransferMsg>, &Arc<AtomicBool>),
+    parser: impl Fn(&str, bool, &mpsc::Sender<TransferMsg>, &Arc<AtomicBool>),
     cancel: Arc<AtomicBool>,
 ) {
     let mut reader = BufReader::new(reader);
     let mut buf = Vec::with_capacity(512);
+    let mut pending_cr = false;
 
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -1260,12 +1289,25 @@ fn read_lines_cr_aware(
         match reader.read(&mut byte) {
             Ok(0) => break,
             Ok(_) => {
-                if byte[0] == b'\n' || byte[0] == b'\r' {
+                // Preserve CRLF as a real newline while treating bare CR as
+                // a progress redraw. Otherwise Windows summaries look unfinished.
+                if pending_cr && byte[0] != b'\n' {
                     if !buf.is_empty() {
                         let line = String::from_utf8_lossy(&buf).to_string();
-                        parser(&line, &tx, &cancel);
+                        parser(&line, false, &tx, &cancel);
                         buf.clear();
                     }
+                    pending_cr = false;
+                }
+                if byte[0] == b'\r' {
+                    pending_cr = true;
+                } else if byte[0] == b'\n' {
+                    if !buf.is_empty() {
+                        let line = String::from_utf8_lossy(&buf).to_string();
+                        parser(&line, true, &tx, &cancel);
+                        buf.clear();
+                    }
+                    pending_cr = false;
                 } else {
                     buf.push(byte[0]);
                     // Check for prompts that don't end in newline (like "Overwrite? (y/N)")
@@ -1273,7 +1315,7 @@ fn read_lines_cr_aware(
                         let partial = String::from_utf8_lossy(&buf);
                         let lower = partial.to_lowercase();
                         if lower.contains("overwrite") || lower.contains("--overwrite") {
-                            parser(&partial, &tx, &cancel);
+                            parser(&partial, false, &tx, &cancel);
                             buf.clear();
                         }
                     }
@@ -1284,7 +1326,7 @@ fn read_lines_cr_aware(
     }
     if !buf.is_empty() {
         let line = String::from_utf8_lossy(&buf).to_string();
-        parser(&line, &tx, &cancel);
+        parser(&line, false, &tx, &cancel);
     }
 }
 
@@ -1293,6 +1335,7 @@ fn read_lines_cr_aware(
 #[derive(Default)]
 struct CrocAttemptOutput {
     code: Option<String>,
+    preparation_events: bool,
     error: Option<String>,
     error_from_stdout: bool,
     payload_started: bool,
@@ -1304,6 +1347,9 @@ impl CrocAttemptOutput {
     fn observe(&mut self, line: &str, is_stdout: bool) {
         let cleaned = strip_ansi(line);
         let line = cleaned.trim();
+        if line.starts_with("DATABEAM_PREPARE_V1 ") {
+            self.preparation_events = true;
+        }
         if let Some(code) = extract_croc_code(line) {
             self.code = Some(code);
         }
@@ -1337,6 +1383,11 @@ impl CrocAttemptOutput {
                 self.error_from_stdout = is_stdout;
             }
         }
+    }
+
+    fn preparation_ready(&self, line: &str, newline: bool) -> bool {
+        strip_ansi(line).trim() == "DATABEAM_PREPARED_V1"
+            || (!self.preparation_events && newline && croc_preparation_summary(line))
     }
 
     fn dns_relay(&self) -> Option<String> {
@@ -1439,6 +1490,7 @@ fn croc_transfer_command(binary: &str, code: Option<&str>, relay: Option<&str>) 
     // A GUI must not let croc treat an inherited pipe as the payload instead
     // of the selected files or --text. All these flags are global.
     cmd.args(["--yes", "--ignore-stdin"]);
+    cmd.env("DATABEAM_CROC_PROGRESS", "1");
     let custom_relay = ["CROC_RELAY", "CROC_RELAY6"]
         .iter()
         .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()));
@@ -1505,13 +1557,9 @@ fn spawn_croc_transfer(
                 }
             }
             track_child_pid(child.id());
-            // The sender already knows its secret. Publish it independently
-            // of croc's human-readable command/clipboard output.
-            if announce_code {
-                if let Some(code) = &code {
-                    let _ = tx.send(TransferMsg::Code(code.clone()));
-                }
-            }
+            // The secret is known immediately, but expose it only after the
+            // engine's preparation-ready event (or a legacy final summary).
+            let code_announced = Arc::new(AtomicBool::new(false));
             let output = Arc::new(std::sync::Mutex::new(CrocAttemptOutput::default()));
             let received_stdout = Arc::new(std::sync::Mutex::new(Vec::new()));
             let readers: Vec<_> = [
@@ -1531,6 +1579,8 @@ fn spawn_croc_transfer(
                 let cancel = cancel2.clone();
                 let output = output.clone();
                 let received_stdout = received_stdout.clone();
+                let sender_code = code.clone();
+                let code_announced = code_announced.clone();
                 thread::spawn(move || {
                     if is_stdout && !announce_code {
                         // Croc writes the exact text payload to stdout, while
@@ -1548,11 +1598,26 @@ fn spawn_croc_transfer(
                     read_lines_cr_aware(
                         reader,
                         tx,
-                        move |line, tx, cancel| {
-                            if let Ok(mut output) = output.lock() {
+                        move |line, newline, tx, cancel| {
+                            let prepared = if let Ok(mut output) = output.lock() {
                                 output.observe(line, is_stdout);
+                                output.preparation_ready(line, newline)
+                            } else {
+                                false
+                            };
+                            if announce_code
+                                && prepared
+                                && !cancel.load(Ordering::Relaxed)
+                                && !code_announced.swap(true, Ordering::Relaxed)
+                            {
+                                let prepared_code = sender_code.clone().or_else(|| {
+                                    output.lock().ok().and_then(|output| output.code.clone())
+                                });
+                                if let Some(code) = prepared_code {
+                                    let _ = tx.send(TransferMsg::Code(code));
+                                }
                             }
-                            parse_croc_output(line, tx, cancel);
+                            parse_croc_output(line, tx, cancel, !announce_code);
                         },
                         cancel,
                     )
@@ -1596,8 +1661,11 @@ fn spawn_croc_transfer(
                     // Returned CLI errors still need classification for the
                     // existing DNS recovery path, after the process finishes.
                     for line in String::from_utf8_lossy(&bytes).lines() {
-                        output.lock().unwrap_or_else(|e| e.into_inner()).observe(line, true);
-                        parse_croc_output(line, &tx, &cancel2);
+                        output
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .observe(line, true);
+                        parse_croc_output(line, &tx, &cancel2, true);
                     }
                 }
             }
@@ -1711,18 +1779,22 @@ pub fn sendme_send(
     let child_pid = Arc::new(std::sync::Mutex::new(None));
 
     let _worker = thread::spawn(move || {
+        let _ = tx.send(TransferMsg::Started);
         let sender_blob_dir = sender_blob_base_dir(opts.blob_dir.as_deref());
-        let payload_root_name = match derive_payload_root_name(&opts.paths) {
+        let payload_root_name = match derive_payload_root_name(&opts.paths, &cancel2) {
             Ok(name) => name,
             Err(e) => {
-                let _ = tx.send(TransferMsg::Error(format!("Failed to prepare payload: {}", e)));
+                let message = if cancel2.load(Ordering::Relaxed) {
+                    "Transfer cancelled".into()
+                } else {
+                    format!("Failed to prepare payload: {e}")
+                };
+                let _ = tx.send(TransferMsg::Error(message));
                 return;
             }
         };
 
         let paths = opts.paths.clone();
-
-        let _ = tx.send(TransferMsg::Started);
 
         let runtime = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -1740,7 +1812,7 @@ pub fn sendme_send(
 
         let (evt_tx, evt_rx) = mpsc::channel::<NativeSendmeEvent>();
         let app_handle: NativeSendmeAppHandle = Some(Arc::new(NativeSendmeEmitter::new(evt_tx)));
-        let share = runtime.block_on(native_sendme_start_share(
+        let preparation = runtime.spawn(native_sendme_start_share(
             paths,
             payload_root_name,
             NativeSendOptions {
@@ -1750,29 +1822,61 @@ pub fn sendme_send(
                 magic_ipv6_addr: None,
                 blob_dir: sender_blob_dir.clone(),
                 jobs: None,
+                cancel: Some(cancel2.clone()),
             },
             app_handle,
         ));
 
+        // Forward hashing events while start_share is running, not after it returns.
+        let mut early_events = std::collections::VecDeque::new();
+        while !preparation.is_finished() {
+            match evt_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(NativeSendmeEvent::PreparationProgress(progress)) => {
+                    let _ = tx.send(TransferMsg::PreparationProgress(progress));
+                }
+                Ok(event) => early_events.push_back(event),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        while let Ok(event) = evt_rx.try_recv() {
+            match event {
+                NativeSendmeEvent::PreparationProgress(progress) => {
+                    let _ = tx.send(TransferMsg::PreparationProgress(progress));
+                }
+                event => early_events.push_back(event),
+            }
+        }
+        let share = runtime
+            .block_on(preparation)
+            .map_err(|error| format!("Preparation task stopped: {error}"))
+            .and_then(|result| result.map_err(|error| format!("{error:#}")));
         let share = match share {
             Ok(result) => result,
             Err(e) => {
-                let _ = tx.send(TransferMsg::Error(format!("Failed to start sendme: {}", e)));
+                let message = if cancel2.load(Ordering::Relaxed) {
+                    "Transfer cancelled".into()
+                } else {
+                    format!("Failed to start sendme: {e}")
+                };
+                let _ = tx.send(TransferMsg::Error(message));
                 return;
             }
         };
 
-        let _ = tx.send(TransferMsg::Code(share.ticket.clone()));
-        let _ = tx.send(TransferMsg::Output(format!(
-            "imported {} native, {}",
-            share.entry_type,
-            format_size_unit(share.size)
-        )));
-        let _ = tx.send(TransferMsg::Output(format!(
-            "sendme receive {}",
-            share.ticket
-        )));
-        let _ = tx.send(TransferMsg::WaitingForReceiver);
+        if !cancel2.load(Ordering::Relaxed) {
+            let _ = tx.send(TransferMsg::Code(share.ticket.clone()));
+            let _ = tx.send(TransferMsg::Output(format!(
+                "imported {} native, {}",
+                share.entry_type,
+                format_size_unit(share.size)
+            )));
+            let _ = tx.send(TransferMsg::Output(format!(
+                "sendme receive {}",
+                share.ticket
+            )));
+            let _ = tx.send(TransferMsg::WaitingForReceiver);
+        }
         let mut sender_activity_emitted = false;
         let mut last_progress_emit = Instant::now();
         let mut last_request_emit = Instant::now();
@@ -1790,7 +1894,12 @@ pub fn sendme_send(
                 break;
             }
 
-            match evt_rx.recv_timeout(Duration::from_millis(150)) {
+            match early_events
+                .pop_front()
+                .map(Ok)
+                .unwrap_or_else(|| evt_rx.recv_timeout(Duration::from_millis(150)))
+            {
+                Ok(NativeSendmeEvent::PreparationProgress(_)) => {}
                 Ok(NativeSendmeEvent::TransferStarted) => {
                     if !opts.one_shot && waiting_for_new_connection {
                         continue;
@@ -1822,7 +1931,11 @@ pub fn sendme_send(
                     let progress = (aggregate_done as f32 / current_total as f32).clamp(0.0, 1.0);
                     if progress > sender_progress_max || progress >= 0.999 {
                         sender_progress_max = sender_progress_max.max(progress);
-                        let _ = tx.send(TransferMsg::Progress(sender_progress_max));
+                        let _ = tx.send(TransferMsg::SendmeSenderProgress {
+                            done: aggregate_done,
+                            total: current_total,
+                            speed_bps,
+                        });
                     }
 
                     let should_log = aggregate_done > last_logged_done || aggregate_done == 0;
@@ -2025,31 +2138,43 @@ pub fn sendme_send(
             }
         }
 
-        let _ = fs::remove_dir_all(&share.blobs_data_dir);
-        if let Some(blob_base) = sender_blob_dir.as_ref() {
-            cleanup_sendme_send_dirs(blob_base);
-            cleanup_sendme_temp_artifacts(blob_base);
+        // Join the endpoint and store before releasing the cache's file handles.
+        runtime.block_on(async {
+            let _ = share.router.shutdown().await;
+        });
+        let share_dir = share.blobs_data_dir.clone();
+        drop(share);
+        let _ = fs::remove_dir_all(&share_dir);
+        // A cancelled transfer must never clean a different sender's new cache.
+        if !cancel2.load(Ordering::Relaxed) {
+            if let Some(blob_base) = sender_blob_dir.as_ref() {
+                cleanup_sendme_send_dirs(blob_base);
+                cleanup_sendme_temp_artifacts(blob_base);
+            }
+            cleanup_sendme_send_dirs(&std::env::temp_dir());
+            cleanup_sendme_temp_artifacts(&std::env::temp_dir());
         }
-        cleanup_sendme_send_dirs(&std::env::temp_dir());
-        cleanup_sendme_temp_artifacts(&std::env::temp_dir());
     });
 
     (rx, ProcessHandle { cancel, child_pid })
 }
 /// Create a deterministic staging directory with all items copied/linked into it for sendme
-fn get_dir_size(path: &Path) -> u64 {
+fn get_dir_size(path: &Path, cancel: &AtomicBool) -> Result<u64, String> {
     let mut total = 0;
     if let Ok(entries) = fs::read_dir(path) {
         for entry in entries.flatten() {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("Transfer cancelled".into());
+            }
             let p = entry.path();
             if p.is_dir() {
-                total += get_dir_size(&p);
+                total += get_dir_size(&p, cancel)?;
             } else if let Ok(m) = entry.metadata() {
                 total += m.len();
             }
         }
     }
-    total
+    Ok(total)
 }
 
 fn cleanup_sendme_send_dirs(base_dir: &Path) {
@@ -2134,6 +2259,7 @@ pub fn sendme_receive(
                 magic_ipv6_addr: None,
                 blob_dir: opts.blob_dir.clone(),
                 overwrite: opts.overwrite,
+                cancel: Some(cancel2.clone()),
             },
             app_handle,
         ));
@@ -2141,9 +2267,9 @@ pub fn sendme_receive(
         let mut last_progress_log = Instant::now();
         loop {
             if cancel2.load(Ordering::Relaxed) {
-                task.abort();
-                let _ = tx.send(TransferMsg::Error("Transfer cancelled".to_string()));
-                return;
+                // The native task observes this flag and flushes the partial
+                // store. Aborting it would skip that persistence step.
+                break;
             }
 
             match evt_rx.recv_timeout(Duration::from_millis(100)) {
@@ -2198,7 +2324,8 @@ pub fn sendme_receive(
                         let _ = tx.send(TransferMsg::Progress(progress));
                     }
                 }
-                Ok(NativeSendmeEvent::TransferStarted)
+                Ok(NativeSendmeEvent::PreparationProgress(_))
+                | Ok(NativeSendmeEvent::TransferStarted)
                 | Ok(NativeSendmeEvent::TransferProgress { .. })
                 | Ok(NativeSendmeEvent::SenderRequestStarted(_))
                 | Ok(NativeSendmeEvent::SenderRequestProgress(_))
@@ -2229,6 +2356,16 @@ pub fn sendme_receive(
         }
 
         let result = runtime.block_on(async move { task.await });
+        if cancel2.load(Ordering::Relaxed) {
+            let message = match result {
+                Ok(Ok(_)) => "Transfer cancelled".to_string(),
+                Ok(Err(error)) if error.to_string() == "Operation cancelled" => "Transfer cancelled".to_string(),
+                Ok(Err(error)) => format!("Transfer cancelled; receiver shutdown failed: {error:#}"),
+                Err(error) => format!("Transfer cancelled; receiver task stopped unexpectedly: {error}"),
+            };
+            let _ = tx.send(TransferMsg::Error(message));
+            return;
+        }
         match result {
             Ok(Ok(receive)) => {
                 let _ = tx.send(TransferMsg::Output(receive.message.to_lowercase()));
@@ -2381,13 +2518,53 @@ pub fn get_sendme_blob_directory_size(ticket_str: &str, blob_dir: Option<&Path>)
     }
 }
 
+fn croc_preparation_summary(line: &str) -> bool {
+    let cleaned = strip_ansi(line);
+    let line = cleaned.trim();
+    if !line.starts_with("Sending ") || line.contains('|') {
+        return false;
+    }
+    let Some((_, size)) = line.rsplit_once('(') else {
+        return false;
+    };
+    let Some(size) = size.strip_suffix(')') else {
+        return false;
+    };
+    let mut parts = size.split_whitespace();
+    matches!((parts.next(), parts.next(), parts.next()), (Some(value), Some(unit), None)
+        if value.parse::<f64>().is_ok_and(|value| value.is_finite() && value >= 0.0)
+        && matches!(unit, "B" | "kB" | "KB" | "MB" | "GB" | "TB" | "PB" | "EB"))
+}
 
-
-
-fn parse_croc_output(line: &str, tx: &mpsc::Sender<TransferMsg>, cancel: &Arc<AtomicBool>) {
+fn parse_croc_output(
+    line: &str,
+    tx: &mpsc::Sender<TransferMsg>,
+    cancel: &Arc<AtomicBool>,
+    publish_code: bool,
+) {
     let cleaned = strip_ansi(line);
     let trimmed = cleaned.trim();
     if trimmed.is_empty() {
+        return;
+    }
+    if trimmed == "DATABEAM_PREPARED_V1" { return; }
+
+    if let Some(json) = trimmed.strip_prefix("DATABEAM_PREPARE_V1 ") {
+        if let Ok(progress) = serde_json::from_str::<PreparationProgress>(json) {
+            if progress.done <= progress.total && progress.speed_bps.is_finite() && progress.speed_bps >= 0.0 {
+                let _ = tx.send(TransferMsg::PreparationProgress(progress));
+            }
+        }
+        return;
+    }
+    if let Some(json) = trimmed.strip_prefix("DATABEAM_RATE_V1 ") {
+        #[derive(Deserialize)]
+        struct Rate { speed_bps: f64 }
+        if let Ok(rate) = serde_json::from_str::<Rate>(json) {
+            if rate.speed_bps.is_finite() && rate.speed_bps >= 0.0 {
+                let _ = tx.send(TransferMsg::CrocRate(rate.speed_bps));
+            }
+        }
         return;
     }
 
@@ -2399,7 +2576,14 @@ fn parse_croc_output(line: &str, tx: &mpsc::Sender<TransferMsg>, cancel: &Arc<At
     }
 
     if let Some(code) = extract_croc_code(trimmed) {
-        let _ = tx.send(TransferMsg::Code(code));
+        if publish_code {
+            let _ = tx.send(TransferMsg::Code(code));
+        } else {
+            return; // Do not expose the early command/clipboard secret in the log either.
+        }
+    }
+    if !publish_code && trimmed.starts_with("https://getcroc.com/?code=") {
+        return;
     }
 
     let _ = tx.send(TransferMsg::Output(trimmed.to_string()));
@@ -2813,7 +2997,7 @@ mod tests {
             let (rx, _) = super::spawn_croc_transfer(
                 Some(code.to_string()),
                 sender,
-                |_, _| fake_croc(&[], 0),
+                |_, _| fake_croc(&["Sending 1 files (1 kB)"], 0),
                 |_| panic!("successful child must not retry"),
             );
             let next = || rx.recv_timeout(std::time::Duration::from_secs(15)).unwrap();
@@ -2821,7 +3005,120 @@ mod tests {
             if sender {
                 assert!(matches!(next(), super::TransferMsg::Code(actual) if actual == code));
             }
+            assert!(
+                matches!(next(), super::TransferMsg::Output(line) if line == "Sending 1 files (1 kB)")
+            );
             assert!(matches!(next(), super::TransferMsg::Completed));
+        }
+    }
+
+    #[test]
+    fn croc_sender_hides_early_code_and_never_announces_failed_preparation() {
+        for prepared in [false, true] {
+            let (rx, _) = super::spawn_croc_transfer(
+                Some("supa677".into()),
+                true,
+                move |_, _| {
+                    let mut lines = vec![
+                        "croc supa677 (code copied to clipboard)",
+                        "https://getcroc.com/?code=supa677",
+                        "Hashing large.bin  50% |████    | (1/2 GB, 10 MB/s)",
+                    ];
+                    if prepared {
+                        lines.push("Sending 691 files and 15 folders (26.8 GB)");
+                    } else {
+                        lines.push("error: failed to read source file");
+                    }
+                    fake_croc(&lines, if prepared { 0 } else { 1 })
+                },
+                |_| panic!("source errors must not retry"),
+            );
+            let mut codes = Vec::new();
+            let mut saw_hashing = false;
+            loop {
+                match rx.recv_timeout(std::time::Duration::from_secs(15)).unwrap() {
+                    super::TransferMsg::Code(code) => {
+                        assert!(saw_hashing, "code was announced before preparation");
+                        codes.push(code);
+                    }
+                    super::TransferMsg::Output(line) => {
+                        assert!(!line.contains("supa677"), "early secret leaked to the log");
+                        saw_hashing |= line.starts_with("Hashing ");
+                    }
+                    super::TransferMsg::Completed | super::TransferMsg::Error(_) => break,
+                    _ => {}
+                }
+            }
+            assert_eq!(codes, if prepared { vec!["supa677"] } else { vec![] });
+        }
+    }
+
+    #[test]
+    fn croc_exact_preparation_and_current_rate_events_are_not_upload_progress() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        super::parse_croc_output("DATABEAM_PREPARE_V1 {\"done\":750000000,\"total\":4000000000,\"speed_bps\":25000000}", &tx, &cancel, false);
+        assert!(matches!(rx.try_recv().unwrap(), super::TransferMsg::PreparationProgress(progress) if progress.done == 750_000_000 && progress.total == 4_000_000_000));
+        super::parse_croc_output("DATABEAM_RATE_V1 {\"speed_bps\":1000}", &tx, &cancel, false);
+        assert!(matches!(rx.try_recv().unwrap(), super::TransferMsg::CrocRate(1000.0)));
+        for line in ["DATABEAM_PREPARE_V1 {\"done\":2,\"total\":1,\"speed_bps\":0}", "DATABEAM_RATE_V1 {\"speed_bps\":-1}", "DATABEAM_PREPARE_V1 invalid"] {
+            super::parse_croc_output(line, &tx, &cancel, false);
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn croc_structured_preparation_requires_explicit_ready_event() {
+        let mut output = super::CrocAttemptOutput::default();
+        output.observe("DATABEAM_PREPARE_V1 {\"done\":0,\"total\":524288,\"speed_bps\":0}", false);
+        for line in [
+            "Sending 0 files (0 B)",
+            "Sending 2 files (524 kB)",
+            "DATABEAM_PREPARE_V1 {\"done\":524288,\"total\":524288,\"speed_bps\":1000}",
+        ] {
+            output.observe(line, false);
+            assert!(!output.preparation_ready(line, true));
+        }
+        assert!(output.preparation_ready("DATABEAM_PREPARED_V1", true));
+        let legacy = super::CrocAttemptOutput::default();
+        assert!(legacy.preparation_ready("Sending 2 files (524 kB)", true));
+        assert!(!legacy.preparation_ready("Sending 2 files (524 kB)", false));
+    }
+
+    #[test]
+    fn croc_preparation_summary_requires_final_newline_not_count_redraws() {
+        use std::sync::{atomic::AtomicBool, Arc, Mutex};
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let summaries = Arc::new(Mutex::new(Vec::new()));
+        let captured = summaries.clone();
+        super::read_lines_cr_aware(
+            std::io::Cursor::new(b"Sending 688 files (26.8 GB)\rSending 690 files (26.8 GB)\rSending 691 files and 15 folders (26.8 GB)\r\nSending 'one file.bin' (42 B)\n".to_vec()),
+            tx, move |line, newline, _, _| {
+                if newline && super::croc_preparation_summary(line) {
+                    captured.lock().unwrap().push(line.to_string());
+                }
+            }, Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(
+            *summaries.lock().unwrap(),
+            [
+                "Sending 691 files and 15 folders (26.8 GB)",
+                "Sending 'one file.bin' (42 B)"
+            ]
+        );
+        for summary in [
+            "Sending 'one file.bin' (42 B)",
+            "Sending 0 files and 1 folders (0 B)",
+            "Sending text (1.0 kB)",
+        ] {
+            assert!(super::croc_preparation_summary(summary));
+        }
+        for status in [
+            "Sending (->192.168.1.1:9009)",
+            "Hashing big.bin 75% |████  | (3/4 GB)",
+            "Sending 1 files (NaN GB)",
+        ] {
+            assert!(!super::croc_preparation_summary(status));
         }
     }
 
@@ -2929,6 +3226,12 @@ mod tests {
     fn croc_real_text_and_file_round_trip() {
         use super::{croc_receive, CrocReceiveOptions, CrocSendOptions, TransferMsg};
         use std::time::{Duration, Instant};
+        struct CancelOnDrop(super::ProcessHandle);
+        impl Drop for CancelOnDrop {
+            fn drop(&mut self) {
+                self.0.request_cancel();
+            }
+        }
         let binary = std::env::var("DATABEAM_CROC_TEST_BINARY").expect("explicit test binary");
         let require_direct = std::env::var_os("DATABEAM_CROC_TEST_REQUIRE_DIRECT").is_some();
         let temp = tempfile::tempdir().unwrap();
@@ -2988,18 +3291,30 @@ mod tests {
                 )
             };
             let (receiver, receive_handle) = waiting_receiver.unwrap_or_else(start_receiver);
+            let send_handle = CancelOnDrop(send_handle);
+            let receive_handle = CancelOnDrop(receive_handle);
             let deadline = Instant::now() + Duration::from_secs(90);
             let mut sent = false;
             let mut received = false;
             let mut received_text = false;
             let mut announced_code = false;
+            let mut prepared = 0;
+            let expected_preparation = if text_mode { text.len() as u64 } else { (random.len() + repeated.len()) as u64 };
+            let mut saw_live_rate = false;
             let mut routes = [None; 2];
             let mut error = None;
             while Instant::now() < deadline && error.is_none() && !(sent && received) {
                 for (is_receiver, rx) in [(false, &sender), (true, &receiver)] {
                     while let Ok(msg) = rx.try_recv() {
                         match msg {
+                            TransferMsg::PreparationProgress(progress) if !is_receiver => {
+                                assert_eq!(progress.total, expected_preparation);
+                                assert!(progress.done >= prepared && progress.done <= progress.total);
+                                prepared = progress.done;
+                            }
+                            TransferMsg::CrocRate(_) => saw_live_rate = true,
                             TransferMsg::Code(value) if !is_receiver => {
+                                assert_eq!(prepared, expected_preparation, "code appeared before whole-selection preparation finished");
                                 assert_eq!(value, code);
                                 assert!(!sent, "code must reach the UI before completion");
                                 announced_code = true;
@@ -3028,8 +3343,9 @@ mod tests {
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
-            send_handle.request_cancel();
-            receive_handle.request_cancel();
+            assert!(saw_live_rate, "Croc did not report live-rate capability");
+            send_handle.0.request_cancel();
+            receive_handle.0.request_cancel();
             assert!(error.is_none(), "{error:?}");
             assert!(sent && received, "transfer timed out");
             assert!(announced_code, "sender did not publish the share code");
@@ -3072,9 +3388,25 @@ mod tests {
             blob_dir: Some(temp.path().join("sender-cache")),
         }, "");
         let _share_guard = CancelOnDrop(share_handle);
+        let mut prepared_bytes = None;
         let ticket = loop {
-            match share_rx.recv_timeout(Duration::from_secs(45)).expect("native share startup") {
-                TransferMsg::Code(ticket) => break ticket,
+            match share_rx
+                .recv_timeout(Duration::from_secs(45))
+                .expect("native share startup")
+            {
+                TransferMsg::PreparationProgress(progress) => {
+                    assert_eq!(progress.total, bytes.len() as u64);
+                    assert!(progress.done >= prepared_bytes.unwrap_or(0));
+                    prepared_bytes = Some(progress.done);
+                }
+                TransferMsg::Code(ticket) => {
+                    assert_eq!(
+                        prepared_bytes,
+                        Some(bytes.len() as u64),
+                        "preparation must finish before publishing the ticket"
+                    );
+                    break ticket;
+                }
                 TransferMsg::Error(error) => panic!("native share failed: {error}"),
                 _ => {}
             }
@@ -3132,13 +3464,106 @@ mod tests {
         while Instant::now() < deadline && !completed {
             match payload_rx.recv_timeout(Duration::from_secs(1)) {
                 Ok(TransferMsg::Completed) => completed = true,
-                Ok(TransferMsg::Error(error)) => panic!("native receive failed: {error}"),
+                Ok(TransferMsg::Error(error)) => {
+                    while let Ok(event) = share_rx.try_recv() { eprintln!("native sender: {event:?}"); }
+                    panic!("native receive failed: {error}");
+                }
                 Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
         assert!(completed, "native payload timed out");
         assert_eq!(fs::read(output.join("hybrid.bin_databeam/hybrid.bin")).unwrap(), bytes);
+    }
+
+    #[test]
+    #[ignore = "uses real native endpoints and a large temporary payload"]
+    fn sendme_stop_receiver_then_restart_sender_preserves_resume() {
+        use super::*;
+        struct StopOnDrop(ProcessHandle);
+        impl Drop for StopOnDrop { fn drop(&mut self) { self.0.request_cancel(); } }
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("resume.bin");
+        let chunk: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let mut file = fs::File::create(&source).unwrap();
+        for _ in 0..256 { file.write_all(&chunk).unwrap(); }
+        drop(file);
+        let sender_options = || SendmeSendOptions {
+            paths: vec![source.clone()], one_shot: true,
+            blob_dir: Some(temp.path().join("sender-cache")),
+        };
+        let receive_options = |ticket| SendmeReceiveOptions {
+            ticket, output_dir: Some(temp.path().join("received")),
+            blob_dir: Some(temp.path().join("receiver-cache")), overwrite: true,
+        };
+        let next_ticket = |rx: &mpsc::Receiver<TransferMsg>| loop {
+            match rx.recv_timeout(Duration::from_secs(45)).expect("sender startup") {
+                TransferMsg::Code(ticket) => break ticket,
+                TransferMsg::Error(error) => panic!("sender startup: {error}"), _ => {}
+            }
+        };
+        let (sender_rx, sender) = sendme_send(sender_options(), "");
+        let sender = StopOnDrop(sender);
+        let first_ticket = next_ticket(&sender_rx);
+        let (receiver_rx, receiver) = sendme_receive(receive_options(first_ticket.clone()), "");
+        let receiver = StopOnDrop(receiver);
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let stopped_at = loop {
+            assert!(Instant::now() < deadline, "no partial receive progress");
+            match receiver_rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(TransferMsg::Progress(progress)) if progress > 0.0 && progress < 1.0 => {
+                    receiver.0.request_cancel(); break progress;
+                }
+                Ok(TransferMsg::Error(error)) => panic!("first receive: {error}"),
+                Ok(TransferMsg::Completed) => panic!("test failed to interrupt a partial receive"),
+                _ => {}
+            }
+        };
+        loop {
+            match receiver_rx.recv_timeout(Duration::from_secs(5)) {
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(error) => panic!("receiver worker did not finish cancellation: {error}"),
+                _ => {}
+            }
+        }
+        sender.0.request_cancel();
+        loop {
+            match sender_rx.recv_timeout(Duration::from_secs(5)) {
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(error) => panic!("sender worker did not stop: {error}"), _ => {}
+            }
+        }
+        let cached = get_sendme_blob_directory_size(&first_ticket, Some(&temp.path().join("receiver-cache")));
+        eprintln!("Stopped receiver at {stopped_at:.3}; cache contains {cached} bytes");
+        assert!(cached > 0, "Stop discarded the partial receiver store");
+        let (sender_rx, second_sender) = sendme_send(sender_options(), "");
+        let _second_sender = StopOnDrop(second_sender);
+        let second_ticket = next_ticket(&sender_rx);
+        assert_eq!(native_ticket_to_hex_hash(&first_ticket), native_ticket_to_hex_hash(&second_ticket), "same payload must keep the collection hash");
+        let (receiver_rx, second_receiver) = sendme_receive(receive_options(second_ticket), "");
+        let _second_receiver = StopOnDrop(second_receiver);
+        let mut resumed = None;
+        let mut completed = false;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline && !completed {
+            match receiver_rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(TransferMsg::Progress(progress)) => { resumed.get_or_insert(progress); }
+                Ok(TransferMsg::Completed) => completed = true,
+                Ok(TransferMsg::Error(error)) => panic!("resumed receive: {error}"), _ => {}
+            }
+        }
+        assert!(completed, "resumed transfer did not finish");
+        assert!(resumed.unwrap_or(0.0) > 0.0, "receiver restarted at zero despite {cached} cached bytes");
+        let sender_baseline = sender_rx.try_iter().find_map(|event| match event {
+            TransferMsg::SendmeSenderProgress { done, total, speed_bps } if done > 0 => Some((done, total, speed_bps)),
+            _ => None,
+        }).expect("no resumed sender progress");
+        eprintln!("Resumed receiver at {:.6}; sender at {} / {} bytes, {} B/s", resumed.unwrap(), sender_baseline.0, sender_baseline.1, sender_baseline.2);
+        assert!(sender_baseline.0 > 0 && sender_baseline.0 < sender_baseline.1);
+        assert_eq!(sender_baseline.2, 0.0, "cached data must not count as new upload speed");
+        let received = fs::read(temp.path().join("received/resume.bin_databeam/resume.bin")).unwrap();
+        assert_eq!(received.len(), chunk.len() * 256);
+        assert!(received.chunks(chunk.len()).all(|part| part == chunk.as_slice()));
     }
 
     #[test]
@@ -3231,6 +3656,71 @@ mod tests {
         assert!(super::restore_bundled_croc_to(&binary, &[], &hash).is_err());
     }
     use std::fs;
+
+    #[test]
+    fn sender_preparation_cancel_does_not_publish_ticket() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("payload");
+        fs::create_dir(&source).unwrap();
+        for index in 0..100 {
+            fs::write(
+                source.join(format!("file-{index}")),
+                b"cancellation fixture",
+            )
+            .unwrap();
+        }
+        let cache = directory.path().join("cache");
+        let (rx, handle) = super::sendme_send(
+            super::SendmeSendOptions {
+                paths: vec![source],
+                one_shot: true,
+                blob_dir: Some(cache.clone()),
+            },
+            "",
+        );
+        assert!(matches!(
+            rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap(),
+            super::TransferMsg::Started
+        ));
+        handle.request_cancel();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut cancelled = false;
+        loop {
+            match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+                Ok(super::TransferMsg::Code(_)) => {
+                    panic!("cancelled preparation published a ticket")
+                }
+                Ok(super::TransferMsg::Error(message)) => {
+                    assert_eq!(message, "Transfer cancelled");
+                    cancelled = true;
+                }
+                Ok(_) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(error) => {
+                    handle.request_cancel();
+                    panic!("cancelled preparation worker did not stop: {error}");
+                }
+            }
+        }
+        assert!(cancelled);
+        let base = super::sender_blob_base_dir(Some(&cache)).unwrap();
+        if base.exists() {
+            assert_eq!(
+                fs::read_dir(base).unwrap().count(),
+                0,
+                "preparation cache leaked"
+            );
+        }
+    }
+
+    #[test]
+    fn sender_preparation_scan_checks_cancel_before_reading_paths() {
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let error =
+            super::derive_payload_root_name(&[std::path::PathBuf::from("missing")], &cancel)
+                .unwrap_err();
+        assert_eq!(error, "Transfer cancelled");
+    }
 
     #[test]
     fn cleanup_removes_only_sendme_send_dirs() {

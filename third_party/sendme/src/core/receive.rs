@@ -1,4 +1,5 @@
 use crate::core::types::{get_or_create_secret, AppHandle, ReceiveOptions, ReceiveResult};
+use anyhow::Context;
 use iroh::{address_lookup::dns::DnsAddressLookup, endpoint::presets, Endpoint};
 use iroh_blobs::{
     api::{
@@ -63,6 +64,11 @@ pub async fn download(
     options: ReceiveOptions,
     app_handle: AppHandle,
 ) -> anyhow::Result<ReceiveResult> {
+    let cancel = options.cancel.clone();
+    anyhow::ensure!(
+        !cancel.as_ref().is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)),
+        "Operation cancelled"
+    );
     let ticket = BlobTicket::from_str(&ticket_str)?;
 
     let addr = ticket.addr().clone();
@@ -116,6 +122,15 @@ pub async fn download(
     let db = FsStore::load(&_iroh_data_dir).await?;
     let db2 = db.clone();
     let endpoint_close = endpoint.clone();
+
+    let cancelled = async {
+        let Some(flag) = cancel.as_ref() else {
+            return std::future::pending().await;
+        };
+        while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    };
 
     let fut = async move {
         let hash_and_format = ticket.hash_and_format();
@@ -201,24 +216,19 @@ pub async fn download(
             let get = db.remote().execute_get(connection, local.missing());
             let mut stats = Stats::default();
             let mut stream = get.stream();
-            let mut last_log_offset = 0u64;
-            let transfer_start_time = Instant::now();
+            let mut last_progress_emit = Instant::now();
+            let mut current_offset = 0;
+            let mut rate = super::live_rate::LiveRate::new(0, Instant::now());
             let mut download_completed = false;
 
             while let Some(item) = stream.next().await {
                 match item {
                     GetProgressItem::Progress(offset) => {
-                        // Emit progress events every 1MB
-                        if offset - last_log_offset > 1_000_000 {
-                            last_log_offset = offset;
-
-                            // Calculate speed and emit progress event
-                            let elapsed = transfer_start_time.elapsed().as_secs_f64();
-                            let speed_bps = if elapsed > 0.0 {
-                                offset as f64 / elapsed
-                            } else {
-                                0.0
-                            };
+                        current_offset = offset;
+                        let now = Instant::now();
+                        let speed_bps = rate.observe(offset, now);
+                        if last_progress_emit.elapsed() >= Duration::from_millis(100) {
+                            last_progress_emit = now;
 
                             emit_progress_event(
                                 &app_handle,
@@ -233,12 +243,7 @@ pub async fn download(
                         download_completed = true;
 
                         // Emit final progress event
-                        let elapsed = transfer_start_time.elapsed().as_secs_f64();
-                        let speed_bps = if elapsed > 0.0 {
-                            payload_size as f64 / elapsed
-                        } else {
-                            0.0
-                        };
+                        let speed_bps = rate.observe(current_offset, Instant::now());
                         emit_progress_event(&app_handle, payload_size, payload_size, speed_bps);
 
                         break;
@@ -366,6 +371,14 @@ pub async fn download(
     };
 
     let (total_files, payload_size, _stats, output_dir) = select! {
+        biased;
+        _ = cancelled => {
+            // Dropping the download future stops its reads first. Keep the
+            // store alive long enough to save partial ranges and pending writes.
+            endpoint_close.close().await;
+            db2.shutdown().await.context("Save partial download before cancellation")?;
+            anyhow::bail!("Operation cancelled");
+        },
         x = fut => match x {
             Ok(x) => {
                 let _ = endpoint_close.close().await;

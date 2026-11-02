@@ -22,6 +22,7 @@ use rand::Rng;
 use serde::Serialize;
 use std::{
     path::{Component, Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 use tokio::{select, sync::mpsc};
@@ -109,6 +110,8 @@ pub async fn start_share(
     options: SendOptions,
     app_handle: AppHandle,
 ) -> anyhow::Result<SendResult> {
+    let cancel = options.cancel.clone();
+    check_cancelled(cancel.as_deref())?;
     let secret_key = get_or_create_secret()?;
 
     let relay_mode: RelayMode = options.relay_mode.clone().into();
@@ -153,72 +156,122 @@ pub async fn start_share(
     let paths2 = paths.clone();
     let payload_root2 = payload_root.clone();
 
-    let setup = async move {
+    // Retain cleanup handles outside the setup future. Cancelling drops its
+    // import streams first, then closes their workers before removing files.
+    let mut setup_endpoint = None;
+    let mut setup_store = None;
+    let mut setup_router = None;
+    let setup_result = async {
         let t0 = Instant::now();
+        // Finish initialization before observing cancellation so an abandoned
+        // filesystem task cannot create a store after its directory was removed.
         tokio::fs::create_dir_all(&blobs_data_dir2).await?;
+        check_cancelled(cancel.as_deref())?;
 
         let endpoint = builder.bind().await?;
+        setup_endpoint = Some(endpoint.clone());
+        check_cancelled(cancel.as_deref())?;
 
         let store = FsStore::load(&blobs_data_dir2).await?;
+        setup_store = Some(store.clone());
+        check_cancelled(cancel.as_deref())?;
 
-        let blobs = AcknowledgedBlobs::new(
-            store.as_ref().clone(),
-            EventSender::new(
-                progress_tx,
-                EventMask {
-                    connected: ConnectMode::Notify,
-                    get: RequestMode::NotifyLog,
-                    ..EventMask::DEFAULT
-                },
-            ),
-        );
+        let setup = async {
+            let blobs = AcknowledgedBlobs::new(
+                store.as_ref().clone(),
+                EventSender::new(
+                    progress_tx,
+                    EventMask {
+                        connected: ConnectMode::Notify,
+                        get: RequestMode::NotifyLog,
+                        ..EventMask::DEFAULT
+                    },
+                ),
+            );
 
-        let import_result = import(paths2, payload_root2, blobs.store(), options.jobs).await?;
-        let dt = t0.elapsed();
+            let import_result = import(
+                paths2,
+                payload_root2,
+                blobs.store(),
+                options.jobs,
+                cancel.as_deref(),
+                &app_handle,
+            )
+            .await?;
+            let dt = t0.elapsed();
 
-        let (ref _temp_tag, size, ref _collection) = import_result;
-        let progress_handle = n0_future::task::spawn(show_provide_progress_with_logging(
-            progress_rx,
-            app_handle_clone,
-            size,
-        ));
+            let (ref temp_tag, size, ref _collection, ref sizes) = import_result;
+            let progress_handle =
+                AbortOnDropHandle::new(n0_future::task::spawn(show_provide_progress_with_logging(
+                    progress_rx,
+                    app_handle_clone,
+                    size,
+                    temp_tag.hash(),
+                    sizes.clone(),
+                )));
 
-        let router = iroh::protocol::Router::builder(endpoint)
-            .accept(iroh_blobs::ALPN, blobs.clone())
-            .spawn();
+            let router = iroh::protocol::Router::builder(endpoint)
+                .accept(iroh_blobs::ALPN, blobs.clone())
+                .spawn();
+            setup_router = Some(router.clone());
 
-        let ep = router.endpoint();
-        tokio::time::timeout(Duration::from_secs(30), async move {
-            if !matches!(relay_mode, RelayMode::Disabled) {
-                let _ = ep.online().await;
+            let ep = router.endpoint();
+            tokio::time::timeout(Duration::from_secs(30), async move {
+                if !matches!(relay_mode, RelayMode::Disabled) {
+                    let _ = ep.online().await;
+                }
+            })
+            .await?;
+
+            anyhow::Ok((
+                router,
+                import_result,
+                dt,
+                blobs_data_dir2,
+                store,
+                progress_handle,
+            ))
+        };
+
+        select! {
+            biased;
+            _ = wait_for_cancel(cancel.as_deref()) => Err(anyhow::anyhow!("Operation cancelled")),
+            _ = tokio::signal::ctrl_c() => Err(anyhow::anyhow!("Operation cancelled")),
+            x = setup => x,
+        }
+    }
+    .await;
+    let (
+        router,
+        (temp_tag, size, _collection, _sizes),
+        _dt,
+        _blobs_data_dir,
+        store,
+        progress_handle,
+    ) = match setup_result {
+        Ok(v) => v,
+        Err(e) => {
+            if let Some(router) = setup_router {
+                let _ = router.shutdown().await;
+                // AcknowledgedBlobs::shutdown closes the store with the router.
+            } else {
+                if let Some(endpoint) = setup_endpoint {
+                    endpoint.close().await;
+                }
+                if let Some(store) = setup_store {
+                    if let Err(error) = store.shutdown().await {
+                        tracing::warn!("Failed to close cancelled Sendme store: {error:#}");
+                    }
+                }
             }
-        })
-        .await?;
-
-        anyhow::Ok((
-            router,
-            import_result,
-            dt,
-            blobs_data_dir2,
-            store,
-            progress_handle,
-        ))
-    };
-
-    let setup_result = select! {
-        x = setup => x,
-        _ = tokio::signal::ctrl_c() => {
-            anyhow::bail!("Operation cancelled");
+            if let Err(error) = tokio::fs::remove_dir_all(&blobs_data_dir).await {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(e.context(format!("remove Sendme preparation cache: {error}")));
+                }
+            }
+            return Err(e);
         }
     };
-    let (router, (temp_tag, size, _collection), _dt, _blobs_data_dir, store, progress_handle) =
-        match setup_result {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = tokio::fs::remove_dir_all(&blobs_data_dir).await;
-                return Err(e);
-            }
-        };
     let hash = temp_tag.hash();
 
     let mut addr = router.endpoint().addr();
@@ -235,9 +288,60 @@ pub async fn start_share(
         router,
         temp_tag,
         blobs_data_dir,
-        _progress_handle: AbortOnDropHandle::new(progress_handle),
+        _progress_handle: progress_handle,
         _store: store,
     })
+}
+
+fn check_cancelled(cancel: Option<&AtomicBool>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)),
+        "Operation cancelled"
+    );
+    Ok(())
+}
+
+async fn wait_for_cancel(cancel: Option<&AtomicBool>) {
+    let Some(cancel) = cancel else {
+        return std::future::pending().await;
+    };
+    while !cancel.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Hashing progress across parallel imports, separate from network progress.
+struct PreparationProgress {
+    done: u64,
+    total: u64,
+    rate: super::live_rate::LiveRate,
+    last_emit: Option<Instant>,
+}
+
+impl PreparationProgress {
+    fn emit(&mut self, app_handle: &AppHandle, force: bool) {
+        let now = Instant::now();
+        if !force
+            && self
+                .last_emit
+                .is_some_and(|last| now.duration_since(last) < Duration::from_millis(100))
+        {
+            return;
+        }
+        self.last_emit = Some(now);
+        if let Some(handle) = app_handle {
+            let speed = self.rate.observe(self.done, now);
+            let payload = format!("{}:{}:{}", self.done, self.total, (speed * 1000.0) as i64);
+            let _ = handle.emit_event_with_payload("preparation-progress", &payload);
+        }
+    }
+
+    fn advance(&mut self, offset: u64, previous: &mut u64, item_size: u64, app_handle: &AppHandle) {
+        let offset = offset.min(item_size).max(*previous);
+        self.done = self.done.saturating_add(offset - *previous).min(self.total);
+        *previous = offset;
+        self.emit(app_handle, false);
+    }
 }
 
 async fn import(
@@ -245,16 +349,35 @@ async fn import(
     payload_root: String,
     db: &Store,
     jobs: Option<usize>,
-) -> anyhow::Result<(TempTag, u64, Collection)> {
-    let data_sources = build_virtual_data_sources(paths, &payload_root)?;
+    cancel: Option<&AtomicBool>,
+    app_handle: &AppHandle,
+) -> anyhow::Result<(TempTag, u64, Collection, Vec<u64>)> {
+    let data_sources = build_virtual_data_sources(paths, &payload_root, cancel)?;
     anyhow::ensure!(!data_sources.is_empty(), "no valid files to share");
+    let mut sized_sources = Vec::with_capacity(data_sources.len());
+    let mut total = 0_u64;
+    for (name, path) in data_sources {
+        check_cancelled(cancel)?;
+        let size = std::fs::metadata(&path)?.len();
+        total = total.saturating_add(size);
+        sized_sources.push((name, path, size));
+    }
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(PreparationProgress {
+        done: 0,
+        total,
+        rate: super::live_rate::LiveRate::new(0, Instant::now()),
+        last_emit: None,
+    }));
+    progress.lock().unwrap().emit(app_handle, true);
 
     let parallelism = jobs.unwrap_or_else(num_cpus::get).max(1);
 
-    let mut names_and_tags = n0_future::stream::iter(data_sources)
-        .map(|(name, path)| {
+    let mut names_and_tags = n0_future::stream::iter(sized_sources)
+        .map(|(name, path, expected_size)| {
             let db = db.clone();
+            let progress = progress.clone();
             async move {
+                check_cancelled(cancel)?;
                 let import = db.add_path_with_opts(AddPathOptions {
                     path,
                     mode: ImportMode::TryReference,
@@ -262,6 +385,8 @@ async fn import(
                 });
                 let mut stream = import.stream().await;
                 let mut item_size = 0;
+                let mut item_done = 0;
+                let mut reported_import = false;
                 let temp_tag = loop {
                     let item = stream
                         .next()
@@ -271,17 +396,45 @@ async fn import(
                     match item {
                         iroh_blobs::api::blobs::AddProgressItem::Size(size) => {
                             item_size = size;
+                            let mut progress = progress.lock().unwrap();
+                            progress.total = progress
+                                .total
+                                .saturating_sub(expected_size)
+                                .saturating_add(size);
                         }
                         iroh_blobs::api::blobs::AddProgressItem::CopyProgress(_) => {}
                         iroh_blobs::api::blobs::AddProgressItem::CopyDone => {}
-                        iroh_blobs::api::blobs::AddProgressItem::OutboardProgress(_) => {}
+                        iroh_blobs::api::blobs::AddProgressItem::OutboardProgress(offset) => {
+                            progress.lock().unwrap().advance(
+                                offset,
+                                &mut item_done,
+                                item_size,
+                                app_handle,
+                            );
+                            // One event per file, after hashing has actually begun.
+                            if offset > 0 && !reported_import {
+                                emit_event_with_payload(
+                                    app_handle,
+                                    "sendme-import-progress",
+                                    &offset,
+                                );
+                                reported_import = true;
+                            }
+                        }
                         iroh_blobs::api::blobs::AddProgressItem::Error(cause) => {
                             anyhow::bail!("error importing {}: {}", name, cause);
                         }
                         iroh_blobs::api::blobs::AddProgressItem::Done(tt) => {
+                            progress.lock().unwrap().advance(
+                                item_size,
+                                &mut item_done,
+                                item_size,
+                                app_handle,
+                            );
                             break tt;
                         }
                     }
+                    check_cancelled(cancel)?;
                 };
                 anyhow::Ok((name, temp_tag, item_size))
             }
@@ -294,22 +447,27 @@ async fn import(
 
     names_and_tags.sort_by(|(a, _, _), (b, _, _)| a.cmp(b));
     let size = names_and_tags.iter().map(|(_, _, size)| *size).sum::<u64>();
+    let sizes = names_and_tags.iter().map(|(_, _, size)| *size).collect();
+    check_cancelled(cancel)?;
     let (collection, tags) = names_and_tags
         .into_iter()
         .map(|(name, tag, _)| ((name, tag.hash()), tag))
         .unzip::<_, _, Collection, Vec<_>>();
     let temp_tag = collection.clone().store(db).await?;
     drop(tags);
-    Ok((temp_tag, size, collection))
+    progress.lock().unwrap().emit(app_handle, true);
+    Ok((temp_tag, size, collection, sizes))
 }
 
 fn build_virtual_data_sources(
     paths: Vec<PathBuf>,
     payload_root: &str,
+    cancel: Option<&AtomicBool>,
 ) -> anyhow::Result<Vec<(String, PathBuf)>> {
     let mut data_sources = Vec::new();
 
     for source in paths {
+        check_cancelled(cancel)?;
         let canonical = source.canonicalize()?;
         anyhow::ensure!(
             canonical.exists(),
@@ -328,6 +486,7 @@ fn build_virtual_data_sources(
         }
 
         for entry in WalkDir::new(&canonical).into_iter() {
+            check_cancelled(cancel)?;
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
@@ -401,6 +560,243 @@ pub fn canonicalized_path_to_string(
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::sync::{atomic::AtomicU64, Arc};
+
+    #[tokio::test]
+    async fn aborted_size_probe_is_not_a_payload_failure() -> anyhow::Result<()> {
+        use iroh_blobs::{protocol::{GetRequest, ChunkRangesSeq}, provider::events::{Notify, ProviderProto, RequestReceived, RequestUpdate, TransferStarted, TransferAborted}};
+        #[derive(Default)]
+        struct Events(std::sync::Mutex<Vec<String>>);
+        impl crate::core::types::EventEmitter for Events {
+            fn emit_event(&self, name: &str) -> Result<(), String> {
+                self.0.lock().unwrap().push(name.into()); Ok(())
+            }
+            fn emit_event_with_payload(&self, _: &str, _: &str) -> Result<(), String> { Ok(()) }
+        }
+        for probe in [true, false] {
+            let hash = iroh_blobs::Hash::new(b"payload");
+            let events = Arc::new(Events::default());
+            let (tx, rx) = tokio::sync::mpsc::channel(16);
+            let task = tokio::spawn(show_provide_progress_with_logging(rx, Some(events.clone()), 4096, hash, vec![4096]));
+            // Notify's constructor is private; its public serde representation
+            // lets the test exercise the real provider-event stream.
+            let request: Notify<RequestReceived<GetRequest>> = serde_json::from_value(serde_json::to_value(RequestReceived {
+                connection_id: 1, request_id: 1,
+                request: GetRequest { hash, ranges: if probe { ChunkRangesSeq::verified_child_sizes() } else { ChunkRangesSeq::all() } },
+            })?)?;
+            let (updates, requests) = irpc::channel::mpsc::channel(16);
+            let request: irpc::WithChannels<_, ProviderProto> = (request, irpc::channel::none::NoSender, requests).into();
+            tx.send(request.into()).await?;
+            // Size probes include a child index, but that does not make them
+            // payload requests. A deliberate early reset must leave sharing alive.
+            updates.send(RequestUpdate::Started(TransferStarted { index: 2, hash, size: 4096 })).await?;
+            updates.send(RequestUpdate::Aborted(TransferAborted { stats: Box::new(iroh_blobs::provider::TransferStats {
+                payload_bytes_sent: 1024, other_bytes_sent: 8, other_bytes_read: 0, duration: Duration::ZERO,
+            }) })).await?;
+            drop(updates);
+            drop(tx);
+            tokio::time::timeout(Duration::from_secs(5), task).await???;
+            let events = events.0.lock().unwrap();
+            assert_eq!(events.iter().filter(|name| *name == "transfer-failed").count(), usize::from(!probe));
+            assert!(!events.iter().any(|name| name == "transfer-completed"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preparation_progress_counts_parallel_files_once() -> anyhow::Result<()> {
+        #[derive(Default)]
+        struct Events(std::sync::Mutex<Vec<String>>);
+        impl crate::core::types::EventEmitter for Events {
+            fn emit_event(&self, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn emit_event_with_payload(&self, event: &str, payload: &str) -> Result<(), String> {
+                if event == "preparation-progress" {
+                    self.0.lock().unwrap().push(payload.into());
+                }
+                Ok(())
+            }
+        }
+        let directory = tempfile::tempdir()?;
+        let mut paths = Vec::new();
+        let mut total = 0;
+        for (name, size) in [
+            ("a.bin", 8 * 1024 * 1024),
+            ("b.bin", 4 * 1024 * 1024),
+            ("empty", 0),
+        ] {
+            let path = directory.path().join(name);
+            std::fs::File::create(&path)?.set_len(size)?;
+            paths.push(path);
+            total += size;
+        }
+        let events = Arc::new(Events::default());
+        let share = start_share(
+            paths,
+            "payload".into(),
+            SendOptions {
+                relay_mode: crate::core::types::RelayModeOption::Disabled,
+                blob_dir: Some(directory.path().join("cache")),
+                jobs: Some(2),
+                ..Default::default()
+            },
+            Some(events.clone()),
+        )
+        .await?;
+        let events = events.0.lock().unwrap().clone();
+        let mut previous = 0;
+        for (index, event) in events.iter().enumerate() {
+            let values: Vec<u64> = event.split(':').map(|n| n.parse().unwrap()).collect();
+            assert_eq!(values[1], total);
+            assert!(values[0] >= previous && values[0] <= total);
+            if index == 0 {
+                assert_eq!(values[0], 0);
+            }
+            previous = values[0];
+        }
+        assert!(events.len() >= 2);
+        assert_eq!(previous, total);
+        assert_eq!(share.size, total);
+        share.router.shutdown().await?;
+        let cache = share.blobs_data_dir.clone();
+        drop(share);
+        std::fs::remove_dir_all(cache)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_preparation_does_not_create_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = directory.path().join("cache");
+        let result = start_share(
+            vec![directory.path().join("does-not-exist")],
+            "payload".into(),
+            SendOptions {
+                cancel: Some(Arc::new(AtomicBool::new(true))),
+                blob_dir: Some(cache.clone()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("cancelled share succeeded"),
+        };
+        assert!(error.to_string().contains("Operation cancelled"));
+        assert!(!cache.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_preparation_stops_import_and_releases_resources() -> anyhow::Result<()> {
+        struct CancelAfterRead {
+            cancel: Arc<AtomicBool>,
+            offset: AtomicU64,
+        }
+        impl crate::core::types::EventEmitter for CancelAfterRead {
+            fn emit_event(&self, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn emit_event_with_payload(&self, event: &str, payload: &str) -> Result<(), String> {
+                if event == "sendme-import-progress" {
+                    self.offset
+                        .store(payload.parse().unwrap(), Ordering::SeqCst);
+                    self.cancel.store(true, Ordering::Relaxed);
+                }
+                Ok(())
+            }
+        }
+
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("large.bin");
+        const SIZE: u64 = 64 * 1024 * 1024;
+        std::fs::File::create(&source)?.set_len(SIZE)?;
+        let cache = directory.path().join("cache");
+        let other_share = cache.join(".sendme-send-other");
+        std::fs::create_dir_all(&other_share)?;
+        std::fs::write(other_share.join("keep.txt"), b"other active share")?;
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let bind_addr = socket.local_addr()?;
+        drop(socket);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let events = Arc::new(CancelAfterRead {
+            cancel: cancel.clone(),
+            offset: AtomicU64::new(0),
+        });
+        let options = || SendOptions {
+            relay_mode: crate::core::types::RelayModeOption::Disabled,
+            magic_ipv4_addr: Some(match bind_addr {
+                std::net::SocketAddr::V4(a) => a,
+                _ => unreachable!(),
+            }),
+            blob_dir: Some(cache.clone()),
+            jobs: Some(1),
+            ..Default::default()
+        };
+        let mut first_options = options();
+        first_options.cancel = Some(cancel);
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            start_share(
+                vec![source.clone()],
+                "payload".into(),
+                first_options,
+                Some(events.clone()),
+            ),
+        )
+        .await?;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("cancelled import succeeded"),
+        };
+        assert!(error.to_string().contains("Operation cancelled"));
+        let offset = events.offset.load(Ordering::SeqCst);
+        assert!(
+            offset > 0 && offset < SIZE,
+            "must cancel after reading starts, before EOF"
+        );
+        let remaining: Vec<_> = std::fs::read_dir(&cache)?
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(
+            remaining,
+            vec![other_share.clone()],
+            "only this share's cache should be removed"
+        );
+        assert_eq!(
+            std::fs::read(other_share.join("keep.txt"))?,
+            b"other active share"
+        );
+
+        // Windows refuses this open if the cancelled reader still owns the file.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            drop(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .share_mode(0)
+                    .open(&source)?,
+            );
+        }
+        std::fs::write(&source, b"a fresh share after cancellation")?;
+        let share = tokio::time::timeout(
+            Duration::from_secs(5),
+            start_share(vec![source], "payload".into(), options(), None),
+        )
+        .await??;
+        assert!(
+            !share.ticket.is_empty(),
+            "fresh share should reuse the released UDP port"
+        );
+        share.router.shutdown().await?;
+        let share_dir = share.blobs_data_dir.clone();
+        drop(share);
+        std::fs::remove_dir_all(share_dir)?;
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]
@@ -462,6 +858,8 @@ async fn show_provide_progress_with_logging(
     mut recv: mpsc::Receiver<iroh_blobs::provider::events::ProviderMessage>,
     app_handle: AppHandle,
     total_file_size: u64,
+    collection_hash: iroh_blobs::Hash,
+    file_sizes: Vec<u64>,
 ) -> anyhow::Result<()> {
     use n0_future::FuturesUnordered;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -479,16 +877,20 @@ async fn show_provide_progress_with_logging(
         count_toward_payload: bool,
         total_size: u64,
         last_offset: u64,
+        item_index: u64,
     }
 
-    #[derive(Default)]
     struct ProgressTracker {
         transfers: std::collections::HashMap<(u64, u64), TransferState>,
         completed_bytes: u64,
         started_at: Option<Instant>,
+        resume: super::sender_progress::SenderProgress,
     }
 
     fn snapshot_progress(tracker: &ProgressTracker, total_bytes: u64) -> (u64, f64) {
+        if let Some((done, speed)) = tracker.resume.snapshot() {
+            return (done.min(total_bytes), speed);
+        }
         let active_done = tracker
             .transfers
             .values()
@@ -509,7 +911,12 @@ async fn show_provide_progress_with_logging(
         (done_bytes, speed_bps)
     }
 
-    let progress_tracker = Arc::new(Mutex::new(ProgressTracker::default()));
+    let progress_tracker = Arc::new(Mutex::new(ProgressTracker {
+        transfers: Default::default(),
+        completed_bytes: 0,
+        started_at: None,
+        resume: super::sender_progress::SenderProgress::new(file_sizes),
+    }));
     let active_requests = Arc::new(AtomicUsize::new(0));
     let completed_requests = Arc::new(AtomicUsize::new(0));
     let has_emitted_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -535,6 +942,7 @@ async fn show_provide_progress_with_logging(
                     }
                     iroh_blobs::provider::events::ProviderMessage::ConnectionClosed(msg) => {
                         connections.lock().await.remove(&msg.connection_id);
+                        progress_tracker.lock().await.resume.close(msg.connection_id);
                     }
                     iroh_blobs::provider::events::ProviderMessage::GetRequestReceivedNotify(msg) => {
                         let connection_id = msg.connection_id;
@@ -559,6 +967,9 @@ async fn show_provide_progress_with_logging(
                         // retries and other peers can issue more size probes.
                         let is_size_probe = msg.request.ranges
                             == iroh_blobs::protocol::ChunkRangesSeq::verified_child_sizes();
+                        if !is_size_probe && msg.request.hash == collection_hash {
+                            progress_tracker.lock().await.resume.begin(connection_id, request_id, &msg.request.ranges);
+                        }
 
                         let mut rx = msg.rx;
                         tasks.push(async move {
@@ -591,6 +1002,7 @@ async fn show_provide_progress_with_logging(
                                             match tracker.transfers.remove(&key) {
                                                 Some(state) if state.started => {
                                                     if state.count_toward_payload {
+                                                        tracker.resume.complete_blob(connection_id, request_id, state.item_index);
                                                         tracker.completed_bytes = tracker
                                                             .completed_bytes
                                                             .saturating_add(state.total_size);
@@ -602,12 +1014,14 @@ async fn show_provide_progress_with_logging(
                                                             count_toward_payload,
                                                             total_size,
                                                             last_offset: 0,
+                                                            item_index: msg.index,
                                                         },
                                                     );
                                                 }
                                                 Some(mut state) => {
                                                     state.started = true;
                                                     state.count_toward_payload = count_toward_payload;
+                                                    state.item_index = msg.index;
                                                     state.total_size = total_size.max(state.last_offset).max(1);
                                                     tracker.transfers.insert(key, state);
                                                 }
@@ -619,6 +1033,7 @@ async fn show_provide_progress_with_logging(
                                                             count_toward_payload,
                                                             total_size,
                                                             last_offset: 0,
+                                                            item_index: msg.index,
                                                         },
                                                     );
                                                 }
@@ -682,6 +1097,7 @@ async fn show_provide_progress_with_logging(
                                                     count_toward_payload: false,
                                                     total_size: msg.end_offset.max(1),
                                                     last_offset: 0,
+                                                    item_index: 0,
                                                 });
                                             state.total_size = state.total_size.max(msg.end_offset).max(1);
                                             state.last_offset = state
@@ -692,6 +1108,9 @@ async fn show_provide_progress_with_logging(
                                                 request_id,
                                                 done_bytes: state.last_offset,
                                             };
+                                            let index = state.item_index;
+                                            let offset = state.last_offset;
+                                            tracker.resume.advance(connection_id, request_id, index, offset);
                                             let (done_bytes, speed_bps) =
                                                 snapshot_progress(&tracker, total_bytes);
                                             (payload, done_bytes, speed_bps)
@@ -710,11 +1129,13 @@ async fn show_provide_progress_with_logging(
                                                 let mut tracker = progress_tracker_task.lock().await;
                                                 if let Some(state) = tracker.transfers.remove(&(connection_id, request_id)) {
                                                     if state.count_toward_payload {
+                                                        tracker.resume.complete_blob(connection_id, request_id, state.item_index);
                                                         tracker.completed_bytes = tracker
                                                             .completed_bytes
                                                             .saturating_add(state.total_size);
                                                     }
                                                 }
+                                                tracker.resume.finish_request(connection_id, request_id);
                                                 let (done_bytes, speed_bps) =
                                                     snapshot_progress(&tracker, total_bytes);
                                                 (tracker.transfers.len(), done_bytes, speed_bps)
@@ -783,6 +1204,7 @@ async fn show_provide_progress_with_logging(
                                             let (active_count, done_bytes, speed_bps) = {
                                                 let mut tracker = progress_tracker_task.lock().await;
                                                 tracker.transfers.remove(&(connection_id, request_id));
+                                                tracker.resume.finish_request(connection_id, request_id);
                                                 let (done_bytes, speed_bps) = snapshot_progress(&tracker, total_bytes);
                                                 (tracker.transfers.len(), done_bytes, speed_bps)
                                             };
@@ -794,7 +1216,9 @@ async fn show_provide_progress_with_logging(
                                             let completed = completed_requests_task.fetch_add(1, Ordering::SeqCst) + 1;
                                             let active = active_requests_task.load(Ordering::SeqCst);
 
-                                            if completed >= active {
+                                            // Size discovery deliberately stops reading once
+                                            // it has the sizes. Its reset is not payload loss.
+                                            if payload_started && completed >= active {
                                                 emit_event(&app_handle_task, "transfer-failed");
                                                 has_emitted_started_task.store(false, Ordering::SeqCst);
 
@@ -811,6 +1235,7 @@ async fn show_provide_progress_with_logging(
                                 let (done_bytes, speed_bps) = {
                                     let mut tracker = progress_tracker_task.lock().await;
                                     tracker.transfers.remove(&(connection_id, request_id));
+                                    tracker.resume.finish_request(connection_id, request_id);
                                     snapshot_progress(&tracker, total_bytes)
                                 };
 
@@ -823,6 +1248,9 @@ async fn show_provide_progress_with_logging(
                                     emit_event(&app_handle_task, "transfer-failed");
                                 }
                             }
+                            // Also release display state when a request failed
+                            // before its first Started update.
+                            progress_tracker_task.lock().await.resume.finish_request(connection_id, request_id);
                         });
                     }
                     _ => {}

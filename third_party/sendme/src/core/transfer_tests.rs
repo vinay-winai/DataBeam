@@ -192,6 +192,151 @@ async fn public_relay_only_download_preserves_payload() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn restarted_sender_reports_cached_files_and_partial_file_progress() -> anyhow::Result<()> {
+    use iroh_blobs::{
+        api::remote::GetProgressItem,
+        protocol::{ChunkRanges, ChunkRangesExt, GetRequest},
+        store::fs::FsStore,
+    };
+    use n0_future::StreamExt;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir()?;
+        let source = dir.path().join("source");
+        std::fs::create_dir(&source)?;
+        let a = vec![0x51; 2 * 1024 * 1024];
+        let b = vec![0x92; 2 * 1024 * 1024];
+        std::fs::write(source.join("a.bin"), &a)?;
+        std::fs::write(source.join("b.bin"), &b)?;
+        let options = || SendOptions {
+            relay_mode: RelayModeOption::Disabled,
+            magic_ipv4_addr: Some("127.0.0.1:0".parse().unwrap()),
+            blob_dir: Some(dir.path().join("sender")),
+            ..Default::default()
+        };
+        let first = start_share(vec![source.clone()], "payload".into(), options(), None).await?;
+        let root = first.temp_tag.hash();
+        let peer = Endpoint::builder(presets::N0)
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await?;
+        let address = EndpointAddr::new(first.router.endpoint().id()).with_ip_addr(
+            first
+                .router
+                .endpoint()
+                .bound_sockets()
+                .into_iter()
+                .find(|a| a.is_ipv4())
+                .unwrap(),
+        );
+        let connection = peer.connect(address, iroh_blobs::ALPN).await?;
+        let receiver_base = dir.path().join("receiver");
+        let cache = receiver_base.join(format!(".sendme-recv-{}", root.to_hex()));
+        let db = FsStore::load(&cache).await?;
+        // Receive all of a.bin and the first half of b.bin, then stop both
+        // engines and reopen their stores, as with a real sender restart.
+        let request = GetRequest {
+            hash: root,
+            ranges: ChunkRangesSeq::from_ranges([
+                ChunkRanges::all(),
+                ChunkRanges::all(),
+                ChunkRanges::all(),
+                ChunkRanges::bytes(..1024 * 1024),
+            ]),
+        };
+        let get = db.remote().execute_get(connection, request);
+        let mut stream = get.stream();
+        let mut completed = false;
+        while let Some(item) = stream.next().await {
+            match item {
+                GetProgressItem::Done(_) => {
+                    completed = true;
+                    break;
+                }
+                GetProgressItem::Error(error) => anyhow::bail!("partial get: {error}"),
+                _ => {}
+            }
+        }
+        assert!(completed);
+        let content = iroh_blobs::HashAndFormat::hash_seq(root);
+        assert!(!db.remote().local(content).await?.is_complete());
+        drop(stream);
+        peer.close().await;
+        db.shutdown().await?;
+        drop(db);
+        first.router.shutdown().await?;
+        let old_cache = first.blobs_data_dir.clone();
+        drop(first);
+        std::fs::remove_dir_all(old_cache)?;
+
+        let events = Arc::new(Events::default());
+        let second = start_share(
+            vec![source],
+            "payload".into(),
+            options(),
+            Some(events.clone()),
+        )
+        .await?;
+        assert_eq!(second.temp_tag.hash(), root);
+        let address = EndpointAddr::new(second.router.endpoint().id()).with_ip_addr(
+            second
+                .router
+                .endpoint()
+                .bound_sockets()
+                .into_iter()
+                .find(|a| a.is_ipv4())
+                .unwrap(),
+        );
+        let ticket = BlobTicket::new(address, root, BlobFormat::HashSeq);
+        let received = download(
+            ticket.to_string(),
+            ReceiveOptions {
+                relay_mode: RelayModeOption::Disabled,
+                blob_dir: Some(receiver_base),
+                output_dir: Some(dir.path().join("received")),
+                ..Default::default()
+            },
+            None,
+        )
+        .await?;
+        assert_eq!(std::fs::read(received.file_path.join("source/a.bin"))?, a);
+        assert_eq!(std::fs::read(received.file_path.join("source/b.bin"))?, b);
+        let events = events.0.lock().unwrap().clone();
+        let first_progress = events
+            .iter()
+            .filter(|(name, _)| name == "transfer-progress")
+            .map(|(_, payload)| {
+                payload
+                    .split(':')
+                    .map(|n| n.parse::<u64>().unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .find(|values| values[0] > 0)
+            .context("no resumed sender progress")?;
+        assert_eq!(
+            first_progress,
+            [3 * 1024 * 1024, 4 * 1024 * 1024, 0],
+            "resumed sender must start at 75%, without counting cached bytes as upload speed"
+        );
+        // Size discovery still probes the last chunk of every child, including
+        // cached files. Only that probe should touch a.bin on the second run.
+        let cached_file_requests = events
+            .iter()
+            .filter(|(name, _)| name == "sender-request-started")
+            .filter(|(_, payload)| {
+                serde_json::from_str::<serde_json::Value>(payload).unwrap()["item_index"] == 2
+            })
+            .count();
+        assert_eq!(
+            cached_file_requests, 1,
+            "cached a.bin should only receive its size probe"
+        );
+        second.router.shutdown().await?;
+        Ok(())
+    })
+    .await?
+}
+
+#[tokio::test]
 async fn delayed_payload_after_repeated_size_probes_does_not_complete_sender() -> anyhow::Result<()>
 {
     use iroh_blobs::{

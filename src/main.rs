@@ -20,6 +20,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
+use std::time::Instant;
 
 use backend::*;
 use theme::*;
@@ -233,6 +234,8 @@ struct DataBeamApp {
     transfer_total_bytes: Option<u64>,
     transfer_done_bytes: Option<u64>,
     transfer_speed_bps: Option<f64>,
+    transfer_rate_updated_at: Option<Instant>,
+    croc_has_live_rate: bool,
     transfer_speed_samples: Vec<f64>,
     latest_cli_progress_line: Option<String>,
     croc_file_progress: Option<(u64, u64)>,
@@ -255,6 +258,8 @@ struct DataBeamApp {
     sendme_route: Option<SendmeRoute>,
     transfer_phase: TransferPhase,
     preparing_progress: f32,
+    preparation_progress: Option<PreparationProgress>,
+    preparation_updated_at: Option<Instant>,
     transfer_payload_start_time: Option<f64>,
     transfer_end_time: Option<f64>,
     eazysendme_auto_retry: bool,
@@ -384,6 +389,8 @@ impl Default for DataBeamApp {
             transfer_total_bytes: None,
             transfer_done_bytes: None,
             transfer_speed_bps: None,
+            transfer_rate_updated_at: None,
+            croc_has_live_rate: false,
             transfer_speed_samples: Vec::new(),
             latest_cli_progress_line: None,
             croc_file_progress: None,
@@ -398,6 +405,8 @@ impl Default for DataBeamApp {
             sendme_route: None,
             transfer_phase: TransferPhase::Preparing,
             preparing_progress: 0.0,
+            preparation_progress: None,
+            preparation_updated_at: None,
             transfer_payload_start_time: None,
             transfer_end_time: None,
             eazysendme_auto_retry: true,
@@ -492,11 +501,12 @@ impl DataBeamApp {
     }
 
     fn push_speed_sample(&mut self, speed_bps: f64) {
-        if speed_bps < 1024.0 {
+        if !speed_bps.is_finite() || speed_bps < 0.0 || (self.selected_tool == SelectedTool::Croc && self.croc_has_live_rate) {
             return;
         }
-        // Show current transfer speed, not averaged speed.
+        // Native engine rates already use a one-second rolling window.
         self.transfer_speed_bps = Some(speed_bps);
+        self.transfer_rate_updated_at = Some(Instant::now());
     }
 
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -768,8 +778,10 @@ impl DataBeamApp {
     }
 
     fn update_derived_speed_from_done_bytes(&mut self) {
-        if self.selected_tool == SelectedTool::Sendme && self.view == AppView::Receive {
-            // Receive path should use parsed CLI speed directly.
+        if self.selected_tool == SelectedTool::Croc && self.croc_has_live_rate { return; }
+        if matches!(self.selected_tool, SelectedTool::Sendme | SelectedTool::EazySendme) {
+            // Native engine rates use the one-second window and exclude cached
+            // bytes. Byte-counter fallbacks must not overwrite those rates.
             return;
         }
         let Some(done) = self.transfer_done_bytes else {
@@ -856,6 +868,7 @@ impl DataBeamApp {
                 .max((frame.done_bytes as f32 / frame.total_bytes.max(1) as f32).clamp(0.0, 1.0));
         }
 
+        if self.croc_has_live_rate { return; }
         match frame.speed_bps {
             Some(speed) if speed > 0.0 => {
                 self.transfer_speed_bps = Some(speed);
@@ -874,20 +887,20 @@ impl DataBeamApp {
         total: u64,
     ) -> CrocPanelData {
         let _ = accent;
-        // croc emits no bars for unchanged/skipped files and goes quiet while
-        // hashing + writing; after a few seconds of frame silence we are in
-        // the finalize phase, not stalled mid-transfer.
-        let finalizing = self
+        // Silence does not identify a phase: Croc may be hashing existing files,
+        // waiting for a peer, or doing disk/network work. Only hide stale rates.
+        let progress_stale = self
             .croc_last_frame_at
-            .is_some_and(|t| self.animation_time - t > 4.0);
+            .is_some_and(|t| self.animation_time - t > 4.0)
+            && !self.transfer_rate_updated_at.is_some_and(|at| at.elapsed().as_secs_f64() < 1.0);
         let verb = if self.view == AppView::Send {
             "Sending"
         } else {
             "Receiving"
         };
         let current_file = self.croc_bar_file.clone().unwrap_or_default();
-        let title = if finalizing {
-            "Finalizing\u{2026} (verifying files)".to_string()
+        let title = if progress_stale {
+            format!("{verb}\u{2026} (waiting for progress)")
         } else if current_file.is_empty() {
             format!("{verb}\u{2026}")
         } else {
@@ -912,7 +925,7 @@ impl DataBeamApp {
             _ => None,
         };
 
-        let (rate_value, eta_value) = self.panel_rate_eta(done, total, finalizing);
+        let (rate_value, eta_value) = self.panel_rate_eta(done, total, progress_stale);
 
         CrocPanelData {
             title,
@@ -925,19 +938,66 @@ impl DataBeamApp {
         }
     }
 
-    /// Live rate + overall ETA shared by the croc and sendme panels.
-    fn panel_rate_eta(&self, done: u64, total: u64, finalizing: bool) -> (String, String) {
-        if finalizing {
+    fn build_preparation_panel_data(&self) -> Option<CrocPanelData> {
+        if self.transfer_phase != TransferPhase::Preparing
+            || self.view != AppView::Send
+            || !matches!(
+                self.selected_tool,
+                SelectedTool::Croc | SelectedTool::Sendme | SelectedTool::EazySendme
+            )
+        {
+            return None;
+        }
+        let PreparationProgress {
+            done,
+            total,
+            speed_bps,
+        } = self.preparation_progress?;
+        let speed_bps = if self.preparation_updated_at.is_some_and(|at| at.elapsed().as_secs_f64() > 1.0) { 0.0 } else { speed_bps };
+        if total == 0 {
+            return None;
+        }
+        let progress = (done as f64 / total as f64).clamp(0.0, 1.0) as f32;
+        Some(CrocPanelData {
+            title: if done >= total {
+                "Finalizing preparation…"
+            } else {
+                "Preparing files…"
+            }
+            .into(),
+            transferred_label: format!("{} / {}", format_file_size(done), format_file_size(total)),
+            progress,
+            percent_label: format!("{:.1}%", progress * 100.0),
+            detail_left: Some("Hashing files".into()),
+            rate_value: if speed_bps > 0.0 {
+                format!("{}/s", format_file_size(speed_bps.round() as u64))
+            } else {
+                "--".into()
+            },
+            eta_value: if done >= total {
+                "0s".into()
+            } else if speed_bps > 0.0 {
+                format_eta_compact((total - done) as f64 / speed_bps)
+            } else {
+                "--".into()
+            },
+        })
+    }
+
+    /// Windowed rate + overall ETA shared by the croc and sendme panels.
+    fn panel_rate_eta(&self, done: u64, total: u64, progress_stale: bool) -> (String, String) {
+        if progress_stale {
             return ("--".to_string(), "--".to_string());
         }
-        let rate_value = match self.transfer_speed_bps {
-            Some(speed) if speed > 0.0 => {
+        let current_speed = if self.transfer_rate_updated_at.is_some_and(|at| at.elapsed().as_secs_f64() > 1.0) { Some(0.0) } else { self.transfer_speed_bps };
+        let rate_value = match current_speed {
+            Some(speed) if speed >= 0.0 => {
                 format!("{}/s", format_file_size(speed.round() as u64))
             }
             _ => "--".to_string(),
         };
         let eta_value = if total > done {
-            match self.transfer_speed_bps {
+            match current_speed {
                 Some(speed) if speed > 0.0 => {
                     format_eta_compact((total - done) as f64 / speed)
                 }
@@ -1148,6 +1208,8 @@ impl DataBeamApp {
         self.transfer_total_bytes = None;
         self.transfer_done_bytes = None;
         self.transfer_speed_bps = None;
+        self.transfer_rate_updated_at = None;
+        self.croc_has_live_rate = false;
         self.transfer_speed_samples.clear();
         self.latest_cli_progress_line = None;
         self.croc_file_progress = None;
@@ -1162,6 +1224,8 @@ impl DataBeamApp {
         self.sendme_route = None;
         self.transfer_phase = TransferPhase::Preparing;
         self.preparing_progress = 0.0;
+        self.preparation_progress = None;
+        self.preparation_updated_at = None;
         self.transfer_payload_start_time = None;
         self.transfer_end_time = None;
         self.croc_qr_popup_open = false;
@@ -1527,6 +1591,14 @@ impl DataBeamApp {
         }
         if self.selected_tool == SelectedTool::Croc {
             if let Some(frame) = parse_croc_bar_frame(line) {
+                // Hashing uses the same bar format as payload transfers. It is
+                // local disk work, including checks of files from a prior run.
+                if frame.file_name.starts_with("Hashing ") {
+                    if self.transfer_phase != TransferPhase::Transferring {
+                        self.transfer_phase = TransferPhase::Preparing;
+                    }
+                    return;
+                }
                 self.apply_croc_bar_frame(frame);
                 return;
             }
@@ -1575,7 +1647,7 @@ impl DataBeamApp {
             }
         }
 
-        if self.selected_tool == SelectedTool::Croc {
+        if self.selected_tool == SelectedTool::Croc && self.preparation_progress.is_none() {
             if let Some(total) = parse_croc_total_size_hint(line) {
                 let update = match self.transfer_total_bytes {
                     Some(existing) => total > existing,
@@ -2370,12 +2442,6 @@ impl DataBeamApp {
                                         }
                                     }
                                     if self.selected_tool == SelectedTool::Croc
-                                        && lower.contains("code copied to clipboard")
-                                        && self.transfer_phase == TransferPhase::Preparing
-                                    {
-                                        self.transfer_phase = TransferPhase::WaitingForReceiver;
-                                    }
-                                    if self.selected_tool == SelectedTool::Croc
                                         && self.transfer_phase == TransferPhase::WaitingForReceiver
                                         && parse_croc_direction(&line).is_some()
                                     {
@@ -2485,6 +2551,59 @@ impl DataBeamApp {
                                     }
                                 }
                             }
+                            TransferMsg::CrocRate(speed) => {
+                                if self.selected_tool == SelectedTool::Croc && self.transfer_state == TransferState::Running {
+                                    self.croc_has_live_rate = true;
+                                    if self.transfer_phase == TransferPhase::Transferring {
+                                        self.transfer_speed_bps = Some(speed);
+                                        self.transfer_rate_updated_at = Some(Instant::now());
+                                    }
+                                }
+                            }
+                            TransferMsg::SendmeSenderProgress {
+                                done,
+                                total,
+                                speed_bps,
+                            } => {
+                                if self.transfer_state == TransferState::Running
+                                    && self.view == AppView::Send
+                                    && matches!(
+                                        self.selected_tool,
+                                        SelectedTool::Sendme | SelectedTool::EazySendme
+                                    )
+                                    && !(self.sendme_waiting_after_cycle
+                                        && !self.sendme_peer_connected)
+                                {
+                                    let done = done.min(total);
+                                    self.transfer_total_bytes = Some(total);
+                                    self.transfer_done_bytes = Some(done);
+                                    if total > 0 {
+                                        self.transfer_progress =
+                                            self.transfer_progress.max(done as f32 / total as f32);
+                                    }
+                                    // The baseline includes cached data. Use the native
+                                    // wire rate rather than deriving speed from that jump.
+                                    self.transfer_speed_bps =
+                                        (speed_bps > 0.0).then_some(speed_bps);
+                                    self.transfer_rate_updated_at = Some(Instant::now());
+                                    self.last_done_speed_sample = Some((self.animation_time, done));
+                                }
+                            }
+                            TransferMsg::PreparationProgress(progress) => {
+                                if self.transfer_state == TransferState::Running
+                                    && self.transfer_phase == TransferPhase::Preparing
+                                    && self.view == AppView::Send
+                                    && matches!(
+                                        self.selected_tool,
+                                        SelectedTool::Croc | SelectedTool::Sendme | SelectedTool::EazySendme
+                                    )
+                                {
+                                    self.preparation_progress = Some(progress);
+                                    self.preparation_updated_at = Some(Instant::now());
+                                    self.preparing_progress = (progress.done as f64 / progress.total.max(1) as f64).clamp(0.0, 1.0) as f32;
+                                    if self.selected_tool == SelectedTool::Croc { self.transfer_total_bytes = Some(progress.total); }
+                                }
+                            }
                             TransferMsg::Progress(p) => {
                                 if self.eazy_local_check_started_at.is_some() && p > 0.0 {
                                     self.eazy_local_check_started_at = None;
@@ -2569,8 +2688,10 @@ impl DataBeamApp {
                                     }
                                 }
 
-                                if self.selected_tool == SelectedTool::Sendme
-                                    && self.view == AppView::Send
+                                if matches!(
+                                    self.selected_tool,
+                                    SelectedTool::Sendme | SelectedTool::Croc
+                                ) && self.view == AppView::Send
                                     && self.transfer_phase == TransferPhase::Preparing
                                 {
                                     self.transfer_phase = TransferPhase::WaitingForReceiver;
@@ -2884,6 +3005,15 @@ impl DataBeamApp {
                                 }
                             }
                             TransferMsg::Started => {
+                                self.preparation_progress = None;
+                                self.preparation_updated_at = None;
+                                self.transfer_rate_updated_at = None;
+                                self.croc_has_live_rate = false;
+                                if self.selected_tool == SelectedTool::Croc
+                                    && self.view == AppView::Send
+                                {
+                                    self.transfer_code = None;
+                                }
                                 self.transfer_state = TransferState::Running;
                                 self.transfer_start_time = Some(self.animation_time);
                                 self.transfer_phase = if self.selected_tool == SelectedTool::Sendme
@@ -3161,8 +3291,6 @@ impl DataBeamApp {
                         self.croc_use_custom_code = true;
                         return;
                     }
-                    self.transfer_code = Some(code.clone());
-
                     let clean = code.trim().to_string();
                     self.croc_recent_codes.retain(|c| c != &clean);
                     self.croc_recent_codes.insert(0, clean);
@@ -5344,7 +5472,11 @@ impl DataBeamApp {
                     });
                     ui.add_space(4.0);
 
-                    if !sendme_serve_mode {
+                    let preparation_panel = self.build_preparation_panel_data();
+                    if let Some(panel) = &preparation_panel {
+                        croc_progress_panel(ui, panel, accent);
+                    }
+                    if !sendme_serve_mode && preparation_panel.is_none() {
                         let panel_active = self.transfer_phase == TransferPhase::Transferring
                             && matches!(
                                 self.selected_tool,
@@ -5496,7 +5628,7 @@ impl DataBeamApp {
                             }
                         });
                         }
-                    } else {
+                    } else if sendme_serve_mode {
                         let active = self.sendme_active_transfers;
                         let transfer_word = if active == 1 { "transfer" } else { "transfers" };
                         let status_line = match self.transfer_phase {
@@ -7199,22 +7331,170 @@ mod parse_tests {
     }
 
     #[test]
-    fn croc_panel_shows_finalizing_after_frame_silence() {
+    fn croc_preparation_keeps_code_hidden_and_payload_metrics_empty_until_ready() {
         let mut app = DataBeamApp::default();
         app.selected_tool = SelectedTool::Croc;
-        app.view = AppView::Receive;
+        app.view = AppView::Send;
+        let (tx, rx) = mpsc::channel();
+        app.transfer_rx = Some(rx);
+        tx.send(TransferMsg::Started).unwrap();
+        tx.send(TransferMsg::Output(
+            "croc supa677 (code copied to clipboard)".into(),
+        ))
+        .unwrap();
+        tx.send(TransferMsg::Output(
+            "Hashing X:\\Games\\large.bin  75% |██████  | (750/1000 MB, 100 MB/s) [7s:2s]".into(),
+        ))
+        .unwrap();
+        tx.send(TransferMsg::PreparationProgress(crate::backend::PreparationProgress {
+            done: 750_000_000, total: 4_000_000_000, speed_bps: 25_000_000.0,
+        })).unwrap();
+        app.poll_transfer();
+        assert_eq!(app.transfer_phase, TransferPhase::Preparing);
+        assert_eq!(app.transfer_code, None);
+        assert_eq!(app.transfer_progress, 0.0);
+        assert_eq!(app.transfer_done_bytes, None);
+        assert_eq!(app.transfer_payload_start_time, None);
+        let panel = app.build_preparation_panel_data().unwrap();
+        assert!(panel.title.starts_with("Preparing files"));
+        assert_eq!(panel.progress, 0.1875);
+        assert_eq!(panel.eta_value, "2m 10s");
+        assert!(panel.transferred_label.ends_with("3.7 GB"));
+        assert_eq!(
+            panel.detail_left.as_deref(),
+            Some("Hashing files")
+        );
+
+        tx.send(TransferMsg::Code("supa677".into())).unwrap();
+        app.poll_transfer();
+        assert_eq!(app.transfer_code.as_deref(), Some("supa677"));
+        assert_eq!(app.transfer_phase, TransferPhase::WaitingForReceiver);
+        assert!(app.build_preparation_panel_data().is_none());
+        assert_eq!(app.transfer_payload_start_time, None);
+        app.animation_time = 20.0;
+        tx.send(TransferMsg::Output("Sending (->203.0.113.1:9009)".into()))
+            .unwrap();
+        tx.send(TransferMsg::Output(
+            "large.bin  10% |██      | (100/1000 MB, 10 MB/s) [10s:1m30s]".into(),
+        ))
+        .unwrap();
+        app.poll_transfer();
+        assert_eq!(app.transfer_phase, TransferPhase::Transferring);
+        assert_eq!(app.transfer_progress, 0.025);
+        assert_eq!(app.transfer_done_bytes, Some(100_000_000));
+        assert_eq!(app.croc_completed_bytes, 0);
+        app.reset_transfer();
+        assert!(app.preparation_progress.is_none());
+    }
+
+    #[test]
+    fn croc_rate_and_eta_use_engine_window_without_cli_average() {
+        let mut app = DataBeamApp::default();
+        app.selected_tool = SelectedTool::Croc;
+        app.transfer_state = TransferState::Running;
+        app.transfer_phase = TransferPhase::Transferring;
+        let (tx, rx) = mpsc::channel();
+        app.transfer_rx = Some(rx);
+        tx.send(TransferMsg::CrocRate(100_000.0)).unwrap();
+        app.poll_transfer();
+        assert_eq!(app.panel_rate_eta(100_000, 1_000_000, false).1, "9s");
+        tx.send(TransferMsg::CrocRate(10_000.0)).unwrap();
+        app.poll_transfer();
+        assert_eq!(app.panel_rate_eta(100_000, 1_000_000, false).1, "1m 30s");
+        app.update_transfer_metrics_from_log("big.bin  10% |██   | (100/1000 kB, 100 kB/s) [1s:9s]");
+        assert_eq!(app.transfer_speed_bps, Some(10_000.0));
+        tx.send(TransferMsg::CrocRate(0.0)).unwrap();
+        app.poll_transfer();
+        assert_eq!(app.panel_rate_eta(100_000, 1_000_000, false), ("0 B/s".into(), "--".into()));
+        app.transfer_speed_bps = Some(100_000.0);
+        app.transfer_rate_updated_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        assert_eq!(app.panel_rate_eta(100_000, 1_000_000, false), ("0 B/s".into(), "--".into()));
+    }
+
+    #[test]
+    fn native_windowed_rate_is_not_overwritten_by_byte_counter_jumps() {
+        for tool in [SelectedTool::Sendme, SelectedTool::EazySendme] {
+            for view in [AppView::Send, AppView::Receive] {
+                let mut app = DataBeamApp::default();
+                app.selected_tool = tool;
+                app.view = view;
+                app.transfer_speed_bps = Some(50_000.0);
+                app.last_done_speed_sample = Some((1.0, 0));
+                app.animation_time = 1.5;
+                app.transfer_done_bytes = Some(1_000_000_000);
+                app.update_derived_speed_from_done_bytes();
+                assert_eq!(app.transfer_speed_bps, Some(50_000.0));
+                assert_eq!(app.panel_rate_eta(950_000, 1_000_000, false).1, "1s");
+            }
+        }
+    }
+
+    #[test]
+    fn croc_panel_silence_does_not_claim_finalization_or_verification() {
+        let mut app = DataBeamApp::default();
+        app.selected_tool = SelectedTool::Croc;
         app.croc_bar_file = Some("big.bin".to_string());
         app.croc_last_frame_at = Some(10.0);
 
-        app.animation_time = 11.0;
-        let panel = app.build_croc_panel_data(Color32::BLUE, 0.5, 50, 100);
-        assert!(!panel.title.contains("Finalizing"));
+        for view in [AppView::Send, AppView::Receive] {
+            app.view = view;
+            app.animation_time = 11.0;
+            let panel = app.build_croc_panel_data(Color32::BLUE, 0.75, 75, 100);
+            assert!(!panel.title.contains("waiting for progress"));
 
-        app.animation_time = 20.0;
-        let panel = app.build_croc_panel_data(Color32::BLUE, 0.5, 50, 100);
-        assert!(panel.title.contains("Finalizing"));
-        assert_eq!(panel.eta_value, "--");
-        assert_eq!(panel.rate_value, "--");
+            app.animation_time = 20.0;
+            for (progress, done) in [(0.75, 75), (1.0, 100)] {
+                let panel = app.build_croc_panel_data(Color32::BLUE, progress, done, 100);
+                assert!(panel.title.contains("waiting for progress"));
+                assert!(!panel.title.contains("Finalizing"));
+                assert!(!panel.title.contains("verifying"));
+                assert_eq!(panel.progress, progress);
+                assert_eq!(panel.eta_value, "--");
+                assert_eq!(panel.rate_value, "--");
+            }
+        }
+    }
+
+    #[test]
+    fn croc_hashing_and_file_inventory_do_not_advance_payload_progress() {
+        for view in [AppView::Send, AppView::Receive] {
+            let mut app = DataBeamApp::default();
+            app.selected_tool = SelectedTool::Croc;
+            app.view = view;
+            app.transfer_state = TransferState::Running;
+            app.update_transfer_metrics_from_log(
+                "Hashing X:\\Games\\large.bin  75% |██████  | (750/1000 MB, 100 MB/s) [7s:2s]",
+            );
+            assert_eq!(app.transfer_phase, TransferPhase::Preparing);
+            assert_eq!(app.preparing_progress, 0.0);
+            assert_eq!(app.transfer_done_bytes, None);
+            assert_eq!(app.transfer_payload_start_time, None);
+
+            app.transfer_phase = TransferPhase::Transferring;
+            app.transfer_total_bytes = Some(26_800_000_000);
+            app.transfer_done_bytes = Some(20_100_000_000);
+            app.transfer_progress = 0.75;
+            app.croc_bar_file = Some("payload.bin".into());
+            app.croc_bar_done = 100_000;
+            app.croc_completed_bytes = 20_099_900_000;
+            for line in [
+                "Sending 688 files (26.8 GB)",
+                "Sending 689 files (26.8 GB)",
+                "Sending 690 files (26.8 GB)",
+                "Sending 691 files and 15 folders (26.8 GB)",
+                "Hashing X:\\Games\\large.bin 100% |████████| (1000/1000 MB, 100 MB/s)",
+            ] {
+                app.update_transfer_metrics_from_log(line);
+                assert_eq!(app.transfer_done_bytes, Some(20_100_000_000));
+                assert_eq!(app.transfer_progress, 0.75);
+                assert_eq!(app.croc_bar_file.as_deref(), Some("payload.bin"));
+                assert_eq!(app.croc_completed_bytes, 20_099_900_000);
+            }
+            app.update_transfer_metrics_from_log(
+                "payload.bin 100% |████████| (200/200 kB, 10 MB/s)",
+            );
+            assert_eq!(app.transfer_done_bytes, Some(20_100_100_000));
+        }
     }
 
     #[test]
@@ -7534,6 +7814,116 @@ mod parse_tests {
         app.poll_transfer();
 
         assert_eq!(app.transfer_phase, TransferPhase::Transferring);
+    }
+
+    #[test]
+    fn sendme_preparation_is_separate_from_payload_progress() {
+        use crate::backend::PreparationProgress;
+        for tool in [SelectedTool::Sendme, SelectedTool::EazySendme] {
+            for one_shot in [true, false] {
+                let mut app = DataBeamApp::default();
+                app.selected_tool = tool;
+                app.view = AppView::Send;
+                app.sendme_one_shot = one_shot;
+                app.animation_time = 5.0;
+                let (tx, rx) = mpsc::channel();
+                app.transfer_rx = Some(rx);
+                tx.send(TransferMsg::Started).unwrap();
+                tx.send(TransferMsg::PreparationProgress(PreparationProgress {
+                    done: 500,
+                    total: 1000,
+                    speed_bps: 100.0,
+                }))
+                .unwrap();
+                app.poll_transfer();
+                let panel = app.build_preparation_panel_data().unwrap();
+                assert_eq!(panel.progress, 0.5);
+                assert_eq!(panel.eta_value, "5s");
+                assert_eq!(app.transfer_progress, 0.0);
+                assert_eq!(app.transfer_done_bytes, None);
+                assert_eq!(app.transfer_speed_bps, None);
+                assert_eq!(app.transfer_payload_start_time, None);
+
+                tx.send(TransferMsg::PreparationProgress(PreparationProgress {
+                    done: 1000,
+                    total: 1000,
+                    speed_bps: 100.0,
+                }))
+                .unwrap();
+                app.poll_transfer();
+                assert_eq!(app.build_preparation_panel_data().unwrap().eta_value, "0s");
+                tx.send(TransferMsg::WaitingForReceiver).unwrap();
+                app.poll_transfer();
+                assert_eq!(app.transfer_phase, TransferPhase::WaitingForReceiver);
+                assert!(app.build_preparation_panel_data().is_none());
+                assert_eq!(app.transfer_progress, 0.0);
+                app.transfer_total_bytes = Some(1000);
+                app.animation_time = 10.0;
+                tx.send(TransferMsg::SenderTransferActivity).unwrap();
+                tx.send(TransferMsg::Progress(0.25)).unwrap();
+                // A delayed preparation event must never regress the phase or payload.
+                tx.send(TransferMsg::PreparationProgress(PreparationProgress {
+                    done: 1000,
+                    total: 1000,
+                    speed_bps: 99999.0,
+                }))
+                .unwrap();
+                app.poll_transfer();
+                assert_eq!(app.transfer_phase, TransferPhase::Transferring);
+                assert_eq!(app.transfer_progress, 0.25);
+                assert_eq!(app.transfer_done_bytes, Some(250));
+                assert_eq!(app.transfer_payload_start_time, Some(10.0));
+                assert!(app.build_preparation_panel_data().is_none());
+                assert_ne!(app.transfer_speed_bps, Some(99999.0));
+                app.reset_transfer();
+                assert!(app.preparation_progress.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn sendme_resumed_sender_uses_cached_baseline_without_a_speed_spike() {
+        for tool in [SelectedTool::Sendme, SelectedTool::EazySendme] {
+            let mut app = DataBeamApp::default();
+            app.selected_tool = tool;
+            app.view = AppView::Send;
+            app.sendme_one_shot = true;
+            let (tx, rx) = mpsc::channel();
+            app.transfer_rx = Some(rx);
+            tx.send(TransferMsg::Started).unwrap();
+            tx.send(TransferMsg::SenderTransferActivity).unwrap();
+            tx.send(TransferMsg::Progress(0.0)).unwrap();
+            app.poll_transfer();
+            app.animation_time = 10.0;
+            tx.send(TransferMsg::SendmeSenderProgress {
+                done: 750_000,
+                total: 1_000_000,
+                speed_bps: 0.0,
+            })
+            .unwrap();
+            app.poll_transfer();
+            assert_eq!(app.transfer_progress, 0.75);
+            assert_eq!(app.transfer_done_bytes, Some(750_000));
+            assert_eq!(app.transfer_speed_bps, None);
+            let panel = app.build_sendme_panel_data(
+                Color32::BLUE,
+                app.transfer_progress,
+                750_000,
+                1_000_000,
+            );
+            assert_eq!(panel.rate_value, "--");
+            assert_eq!(panel.eta_value, "--");
+            app.animation_time = 11.0;
+            tx.send(TransferMsg::SendmeSenderProgress {
+                done: 800_000,
+                total: 1_000_000,
+                speed_bps: 50_000.0,
+            })
+            .unwrap();
+            app.poll_transfer();
+            assert_eq!(app.transfer_progress, 0.8);
+            assert_eq!(app.transfer_speed_bps, Some(50_000.0));
+        }
     }
 
     #[test]
