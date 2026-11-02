@@ -68,7 +68,14 @@ fn select_update(
         ("linux", "x86_64", false) => ("linux-x64.deb", PackageKind::LinuxDeb),
         _ => return Err("Automatic updates are unavailable for this platform.".into()),
     };
-    let name = format!("databeam_{}_{suffix}", release.tag_name);
+    let stable_name = format!("databeam_{suffix}");
+    let name = if release.assets.iter().any(|asset| asset.name == stable_name) {
+        stable_name
+    } else {
+        // Older releases used versioned names. Keep support when updating
+        // from a preview or consuming a release produced by an older workflow.
+        format!("databeam_{}_{suffix}", release.tag_name)
+    };
     let find = |name: &str| -> Result<Asset, String> {
         let asset = release
             .assets
@@ -404,14 +411,25 @@ mod tests {
             ("linux", "x86_64", true, "linux-x64.AppImage"),
             ("linux", "x86_64", false, "linux-x64.deb"),
         ] {
-            assert!(
-                select_update(release("v0.7.0"), "0.6.6", os, arch, appimage)
+            for versioned in [true, false] {
+                let mut available = release("v0.7.0");
+                if !versioned {
+                    for asset in &mut available.assets {
+                        asset.name = asset.name.replace("databeam_v0.7.0_", "databeam_");
+                        asset.browser_download_url = format!("{DOWNLOAD_ROOT}v0.7.0/{}", asset.name);
+                    }
+                }
+                let selected = select_update(available, "0.6.6", os, arch, appimage)
                     .unwrap()
                     .unwrap()
-                    .package
-                    .name
-                    .ends_with(suffix)
-            );
+                    .package;
+                let expected = if versioned {
+                    format!("databeam_v0.7.0_{suffix}")
+                } else {
+                    format!("databeam_{suffix}")
+                };
+                assert_eq!(selected.name, expected);
+            }
         }
     }
 

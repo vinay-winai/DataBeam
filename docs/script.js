@@ -58,17 +58,17 @@ function updateDownloadLinks() {
         const name = asset.name.toLowerCase();
         // Matching rules for DataBeam binaries
         if (name.endsWith(".exe")) {
-            windowsAsset = asset.browser_download_url;
+            if (!windowsAsset || name === "databeam_windows-x64.exe") windowsAsset = asset.browser_download_url;
         } else if (name.includes("macos-universal")) {
-            macUnivAsset = asset.browser_download_url;
+            if (!macUnivAsset || name === "databeam_macos-universal.dmg") macUnivAsset = asset.browser_download_url;
         } else if (name.includes("macos-aarch64")) {
-            macAarchAsset = asset.browser_download_url;
+            if (!macAarchAsset || name === "databeam_macos-aarch64.dmg") macAarchAsset = asset.browser_download_url;
         } else if (name.includes("mac") || name.includes("darwin")) {
             if (!macUnivAsset) macUnivAsset = asset.browser_download_url;
         } else if (name.endsWith(".appimage")) {
-            linuxAppAsset = asset.browser_download_url;
+            if (!linuxAppAsset || name === "databeam_linux-x64.appimage") linuxAppAsset = asset.browser_download_url;
         } else if (name.endsWith(".deb")) {
-            linuxDebAsset = asset.browser_download_url;
+            if (!linuxDebAsset || name === "databeam_linux-x64.deb") linuxDebAsset = asset.browser_download_url;
         } else if (name.includes("linux")) {
              if (!linuxAppAsset) linuxAppAsset = asset.browser_download_url;
         }

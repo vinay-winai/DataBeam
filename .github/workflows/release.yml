@@ -87,6 +87,8 @@ jobs:
           $version = "${env:RELEASE_TAG}".TrimStart('v')
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item "target/release/databeam.exe" "dist/databeam_windows-x64.exe"
+          # Older installed updaters require this exact versioned asset name.
+          Copy-Item "dist/databeam_windows-x64.exe" "dist/databeam_v${version}_windows-x64.exe"
           $package = "target/windows-release-package"
           New-Item -ItemType Directory -Force -Path "$package/LICENSES" | Out-Null
           Copy-Item "target/release/databeam.exe" "$package/databeam.exe"
@@ -186,6 +188,9 @@ jobs:
 
           dmg_path_univ="dist/databeam_macos-universal.dmg"
           hdiutil create -volname "DataBeam" -srcfolder "${app_path}" -ov -format UDZO "${dmg_path_univ}"
+          # Compatibility copies for updaters shipped before v0.7.0.
+          cp "${dmg_path_aarch}" "dist/databeam_v${version}_macos-aarch64.dmg"
+          cp "${dmg_path_univ}" "dist/databeam_v${version}_macos-universal.dmg"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v6
@@ -284,6 +289,9 @@ jobs:
             exit 1
           fi
           cp "${appimage_path}" "dist/databeam_linux-x64.AppImage"
+          # Compatibility copies for updaters shipped before v0.7.0.
+          cp "dist/databeam_linux-x64.deb" "dist/databeam_v${version}_linux-x64.deb"
+          cp "dist/databeam_linux-x64.AppImage" "dist/databeam_v${version}_linux-x64.AppImage"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v6
