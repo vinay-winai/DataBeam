@@ -342,6 +342,8 @@ struct DataBeamApp {
     // and menu ids live in tray:: statics (shared with handler thread).
     minimize_to_tray: bool,
     window_in_tray: bool,
+    #[cfg(any(target_os = "macos", test))]
+    macos_hide_pending: bool,
     tray_quit_requested: bool,
     tray_state: Option<tray::TrayState>,
     tray_startup_pending: bool,
@@ -477,6 +479,8 @@ impl Default for DataBeamApp {
             cleanup_prompt_open: false,
             minimize_to_tray: cfg!(target_os = "windows"),
             window_in_tray: false,
+            #[cfg(any(target_os = "macos", test))]
+            macos_hide_pending: false,
             tray_quit_requested: false,
             tray_state: None,
             tray_startup_pending: true,
@@ -1337,6 +1341,8 @@ impl DataBeamApp {
     /// race), force the last-known-good size instead.
     fn show_main_window(&mut self, ctx: &egui::Context) {
         self.window_in_tray = false;
+        #[cfg(any(target_os = "macos", test))]
+        { self.macos_hide_pending = false; }
         tray::debug_log("tray action applied: Show");
         tray::restore_window_now(ctx, Self::pick_restore_hwnd(self.startup_hwnd, tray::tray_hwnd()));
         let current = ctx.screen_rect();
@@ -1362,6 +1368,8 @@ impl DataBeamApp {
     /// with taskbar suppression; macOS keeps its existing minimize behavior.
     fn hide_to_tray(&mut self, ctx: &egui::Context) {
         self.window_in_tray = true;
+        #[cfg(any(target_os = "macos", test))]
+        { self.macos_hide_pending = true; }
         tray::debug_log("window hidden to tray");
         #[cfg(target_os = "linux")]
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -1408,7 +1416,14 @@ impl DataBeamApp {
     #[cfg(any(target_os = "macos", test))]
     fn sync_native_minimized_state(&mut self, ctx: &egui::Context, minimized: Option<bool>) {
         // Read actual AppKit state, not egui-winit's stale minimized flag.
-        // Dock/Finder restores must also clear that cache and resume painting.
+        // A close command may not have been applied yet (including a second
+        // egui pass in the same frame). That is not a Dock restore. Wait for
+        // Cocoa to confirm minimization before accepting a restore transition.
+        if self.macos_hide_pending && minimized == Some(false) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            return;
+        }
+        self.macos_hide_pending = false;
         if self.window_in_tray && minimized == Some(false) {
             self.show_main_window(ctx);
             ctx.request_repaint();
@@ -1416,6 +1431,12 @@ impl DataBeamApp {
             // Unknown state must never suppress a potentially visible UI.
             self.window_in_tray = minimized == Some(true);
         }
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    fn macos_tray_is_hidden(&self) -> bool {
+        // Continue drawing while Cocoa is still applying the close command.
+        self.window_in_tray && !self.macos_hide_pending
     }
 
     /// Toggle close-to-tray from the settings popup (persisted).
@@ -4071,7 +4092,11 @@ impl eframe::App for DataBeamApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
-        if self.window_in_tray {
+        #[cfg(not(target_os = "macos"))]
+        let tray_ui_hidden = self.window_in_tray;
+        #[cfg(target_os = "macos")]
+        let tray_ui_hidden = self.macos_tray_is_hidden();
+        if tray_ui_hidden {
             // Poll background work above; hidden UI widgets must not animate.
             return;
         }
@@ -7074,7 +7099,58 @@ mod parse_tests {
     }
 
     #[test]
+    fn non_windows_macos_close_waits_for_minimization_before_dock_restore() {
+        let _guard = crate::tray::TRAY_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let mut app = DataBeamApp::default();
+        let ctx = egui::Context::default();
+        app.transfer_state = super::TransferState::Running;
+        app.transfer_progress = 0.5;
+        for _ in 0..3 {
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                app.hide_to_tray(ctx);
+                // A second egui pass, or Cocoa's animation, can leave the
+                // native window unminimized before our command takes effect.
+                app.sync_native_minimized_state(ctx, Some(false));
+                app.sync_native_minimized_state(ctx, Some(false));
+            });
+            assert!(app.window_in_tray, "pending close must not be treated as a Dock restore");
+            assert!(app.macos_hide_pending);
+            assert!(!app.macos_tray_is_hidden(), "visible window must still be drawn during minimization");
+            assert!(!output.viewport_output[&egui::ViewportId::ROOT].commands.iter()
+                .any(|command| matches!(command, egui::ViewportCommand::Minimized(false))));
+            app.sync_native_minimized_state(&ctx, Some(true));
+            assert!(app.window_in_tray);
+            assert!(!app.macos_hide_pending);
+            assert!(app.macos_tray_is_hidden());
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                app.sync_native_minimized_state(ctx, Some(false));
+            });
+            assert!(!app.window_in_tray);
+            assert!(output.viewport_output[&egui::ViewportId::ROOT].commands.iter()
+                .any(|command| matches!(command, egui::ViewportCommand::Minimized(false))));
+            assert_eq!(app.transfer_state, super::TransferState::Running);
+            assert_eq!(app.transfer_progress, 0.5);
+        }
+    }
+
+    #[test]
+    fn non_windows_macos_explicit_tray_show_can_cancel_a_pending_close() {
+        let _guard = crate::tray::TRAY_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let mut app = DataBeamApp::default();
+        let ctx = egui::Context::default();
+        app.hide_to_tray(&ctx);
+        app.sync_native_minimized_state(&ctx, Some(false));
+        assert!(app.macos_hide_pending);
+        app.apply_tray_action(&ctx, crate::tray::TrayAction::Show);
+        assert!(!app.window_in_tray);
+        assert!(!app.macos_hide_pending);
+        app.sync_native_minimized_state(&ctx, Some(false));
+        assert!(!app.window_in_tray);
+    }
+
+    #[test]
     fn non_windows_macos_dock_restore_clears_stale_minimized_cache_and_keeps_transfer() {
+        let _guard = crate::tray::TRAY_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let mut app = DataBeamApp::default();
         let ctx = egui::Context::default();
         app.transfer_state = super::TransferState::Running;

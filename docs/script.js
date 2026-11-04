@@ -63,7 +63,7 @@ function updateDownloadLinks() {
     let windowsAsset = null;
     let macUnivAsset = null;
     let macAarchAsset = null;
-    const linuxAssets = { x64: { app: null, deb: null }, arm64: { app: null, deb: null } };
+    const linuxAssets = { x64: { app: null, flatpak: null }, arm64: { app: null, flatpak: null } };
 
     gReleaseData.assets.forEach(asset => {
         const name = asset.name.toLowerCase();
@@ -78,10 +78,10 @@ function updateDownloadLinks() {
             if (!macUnivAsset) macUnivAsset = asset.browser_download_url;
         } else {
             const arch = name.includes("linux-arm64") ? "arm64" : name.includes("linux-x64") ? "x64" : null;
-            const kind = name.endsWith(".appimage") ? "app" : name.endsWith(".deb") ? "deb" : null;
+            const kind = name.endsWith(".appimage") ? "app" : name.endsWith(".flatpak") ? "flatpak" : null;
             if (arch && kind) {
-                const extension = kind === "app" ? "appimage" : "deb";
-                if (!linuxAssets[arch][kind] || name === `databeam_linux-${arch}.${extension}`) {
+                const stableName = kind === "app" ? `databeam_linux-${arch}.appimage` : `databeam_linux-${arch}_no-auto-update.flatpak`;
+                if (!linuxAssets[arch][kind] || name === stableName) {
                     linuxAssets[arch][kind] = asset.browser_download_url;
                 }
             }
@@ -93,10 +93,10 @@ function updateDownloadLinks() {
 
     document.getElementById("link-windows").href = windowsAsset || releaseUrl;
     document.getElementById("link-mac").href = macUnivAsset || macAarchAsset || releaseUrl;
-    document.getElementById("link-linux").href = linuxAssets.x64.app || linuxAssets.x64.deb || releaseUrl;
-    document.getElementById("link-linux-arm64").href = linuxAssets.arm64.app || linuxAssets.arm64.deb || releaseUrl;
+    document.getElementById("link-linux").href = linuxAssets.x64.app || releaseUrl;
+    document.getElementById("link-linux-arm64").href = linuxAssets.arm64.app || releaseUrl;
     const linuxAppAsset = linuxAssets[gUserArch].app;
-    const linuxDebAsset = linuxAssets[gUserArch].deb;
+    const linuxFlatpakAsset = linuxAssets[gUserArch].flatpak;
 
     const mainBtn = document.getElementById("download-btn");
     const statusText = document.getElementById("download-status");
@@ -121,17 +121,14 @@ function updateDownloadLinks() {
             secStatus.style.display = "block";
             secStatus.innerHTML = `On Apple Silicon? <a href="${macAarchAsset}" style="color: #ff8c00; text-decoration: underline;">Get aarch64 build for smaller app size</a>`;
         }
-    } else if (gUserOS === "linux" && (linuxAppAsset || linuxDebAsset)) {
-        autoUrl = linuxAppAsset || linuxDebAsset;
+    } else if (gUserOS === "linux" && linuxAppAsset) {
+        autoUrl = linuxAppAsset;
         const archLabel = gUserArch === "arm64" ? "ARM64" : "x64";
         statusText.textContent = `Latest Release: ${gReleaseData.tag_name} (Linux ${archLabel})`;
-        btnText.textContent = autoUrl === linuxAppAsset ? `Download Linux ${archLabel} AppImage` : `Download Linux ${archLabel} .deb`;
-        if (secStatus && linuxDebAsset && autoUrl !== linuxDebAsset) {
+        btnText.textContent = `Download Linux ${archLabel} AppImage`;
+        if (secStatus && linuxFlatpakAsset) {
             secStatus.style.display = "block";
-            secStatus.innerHTML = `Also available: <a href="${linuxDebAsset}" style="color: #ff8c00; text-decoration: underline;">Download .deb package</a>`;
-        } else if (secStatus && linuxAppAsset && autoUrl !== linuxAppAsset) {
-            secStatus.style.display = "block";
-            secStatus.innerHTML = `Also available: <a href="${linuxAppAsset}" style="color: #ff8c00; text-decoration: underline;">Download AppImage</a>`;
+            secStatus.innerHTML = `Also available: <a href="${linuxFlatpakAsset}" style="color: #ff8c00; text-decoration: underline;">Flatpak (no automatic updates)</a>`;
         }
     } else {
         autoUrl = releaseUrl; // fallback

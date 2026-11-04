@@ -70,9 +70,8 @@ fn select_update(
         ("macos", "aarch64", _) => ("macos-aarch64.dmg", PackageKind::MacDmg),
         ("macos", "x86_64", _) => ("macos-universal.dmg", PackageKind::MacDmg),
         ("linux", "x86_64", true) => ("linux-x64.AppImage", PackageKind::LinuxAppImage),
-        ("linux", "x86_64", false) => ("linux-x64.deb", PackageKind::LinuxDeb),
         ("linux", "aarch64", true) => ("linux-arm64.AppImage", PackageKind::LinuxAppImage),
-        ("linux", "aarch64", false) => ("linux-arm64.deb", PackageKind::LinuxDeb),
+        ("linux", _, false) => return Err("DEB updates are no longer published. Download the AppImage from https://vinay-winai.github.io/DataBeam/ and switch to it manually.".into()),
         _ => return Err("Automatic updates are unavailable for this platform.".into()),
     };
     let stable_name = format!("databeam_{suffix}");
@@ -397,9 +396,7 @@ mod tests {
                 "macos-aarch64.dmg",
                 "macos-universal.dmg",
                 "linux-x64.AppImage",
-                "linux-x64.deb",
                 "linux-arm64.AppImage",
-                "linux-arm64.deb",
             ]
             .into_iter()
             .map(|suffix| format!("databeam_{tag}_{suffix}"))
@@ -443,9 +440,7 @@ mod tests {
             ("macos", "aarch64", false, "macos-aarch64.dmg"),
             ("macos", "x86_64", false, "macos-universal.dmg"),
             ("linux", "x86_64", true, "linux-x64.AppImage"),
-            ("linux", "x86_64", false, "linux-x64.deb"),
             ("linux", "aarch64", true, "linux-arm64.AppImage"),
-            ("linux", "aarch64", false, "linux-arm64.deb"),
         ] {
             for versioned in [true, false] {
                 let mut available = release("v0.7.0");
@@ -467,6 +462,13 @@ mod tests {
                 assert_eq!(selected.name, expected);
             }
         }
+    }
+
+    #[test]
+    fn non_windows_linux_native_installation_explains_appimage_migration() {
+        let error = select_update(release("v0.7.3"), "0.7.2", "linux", "x86_64", false).unwrap_err();
+        assert!(error.contains("DEB updates are no longer published"));
+        assert!(error.contains("AppImage"));
     }
 
     #[test]

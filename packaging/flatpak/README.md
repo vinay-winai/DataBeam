@@ -1,16 +1,18 @@
-# DataBeam Linux Flatpak test
+# DataBeam Linux Flatpak
+
+Standalone bundles have **no automatic app updates**. Install a newer downloaded bundle with the same `flatpak install --user` command to update while retaining settings.
 
 Native bundles are built separately for x86-64 and ARM64. DroidDeck uses the
-ARM64 bundle. This is a test distribution through GitHub, not a Flathub listing.
+ARM64 bundle. These bundles are distributed through GitHub, not Flathub. Stable releases use the `stable` branch; prerelease test bundles use `testing`.
 
 Install the matching downloaded bundle from the Linux desktop terminal:
 
 ```sh
-flatpak install --user ./databeam_linux-arm64.flatpak
-flatpak run com.vinaywinai.databeam//testing
+flatpak install --user ./databeam_linux-arm64_no-auto-update.flatpak
+flatpak run com.vinaywinai.databeam//stable
 ```
 
-For x86-64 PCs, use `databeam_linux-x64.flatpak` instead. Flatpak downloads the
+For x86-64 PCs, use `databeam_linux-x64_no-auto-update.flatpak` instead. Flatpak downloads the
 Freedesktop runtime from Flathub when needed. Future test bundles are installed
 the same way; this standalone bundle does not create a DataBeam update repository.
 The app's executable replacement updater is disabled inside Flatpak.

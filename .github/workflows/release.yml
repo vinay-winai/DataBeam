@@ -146,7 +146,7 @@ jobs:
           cargo build --locked --release --features release-single-instance --target x86_64-apple-darwin
 
       - name: Verify non-Windows platform policy
-        run: cargo test --locked --bin databeam non_windows_
+        run: cargo test --locked --features release-single-instance --bin databeam non_windows_
 
       - name: Verify macOS updater architecture checks
         run: cargo test --locked --bin databeam macos_lipo_
@@ -245,9 +245,12 @@ jobs:
             libxdo-dev \
             libxi-dev \
             libxkbcommon-dev \
+            libxkbcommon-x11-0 \
             libxrandr-dev \
             mesa-common-dev \
-            patchelf
+            patchelf \
+            squashfs-tools \
+            flatpak flatpak-builder desktop-file-utils appstream-util dbus
 
       - name: Update Cargo.toml version
         shell: bash
@@ -262,22 +265,15 @@ jobs:
         run: cargo install cargo-bundle --version 0.12.0 --locked
 
       - name: Verify non-Windows platform policy
-        run: cargo test --locked --bin databeam non_windows_
+        run: |
+          cargo test --locked --features release-single-instance --bin databeam non_windows_
+          cargo test --locked --features release-single-instance --bin databeam app_update::install::tests
 
-      - name: Package Linux ${{ matrix.arch }} deb and AppImage
+      - name: Package Linux ${{ matrix.arch }} AppImage
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
-
-          cargo bundle --release --features release-single-instance --format deb --binary-path target/release/databeam
-          deb_path="$(find target/release/bundle/deb -maxdepth 1 -name '*.deb' -print -quit)"
-          if [ -z "${deb_path}" ]; then
-            echo "No .deb produced under target/release/bundle/deb"
-            find target/release -maxdepth 5 -type f | sort
-            exit 1
-          fi
-          cp "${deb_path}" "dist/databeam_linux-${{ matrix.arch }}.deb"
 
           cargo bundle --release --features release-single-instance --format appimage --binary-path target/release/databeam
           appimage_path="$(find target/release/bundle/appimage -maxdepth 1 -name '*.AppImage' -print -quit)"
@@ -286,13 +282,14 @@ jobs:
             find target/release -maxdepth 6 -type f | sort
             exit 1
           fi
+          python scripts/bundle_appimage_runtime.py "${appimage_path}"
           cp "${appimage_path}" "dist/databeam_linux-${{ matrix.arch }}.AppImage"
 
-      - name: Verify Linux package architecture
-        shell: bash
+      - name: Package standalone Flatpak without automatic updates
         run: |
-          expected="${{ matrix.arch == 'arm64' && 'arm64' || 'amd64' }}"
-          test "$(dpkg-deb --field 'dist/databeam_linux-${{ matrix.arch }}.deb' Architecture)" = "$expected"
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y --noninteractive flathub org.freedesktop.Platform//25.08 org.freedesktop.Sdk//25.08
+          dbus-run-session -- python scripts/package_flatpak.py --arch '${{ matrix.arch == 'arm64' && 'aarch64' || 'x86_64' }}' --branch stable
 
       - name: Verify updater asset selection
         run: cargo test --locked --bin databeam correct_assets_are_selected_on_all_shipping_platforms

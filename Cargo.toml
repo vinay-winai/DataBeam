@@ -1,6 +1,6 @@
 [package]
 name = "databeam"
-version = "0.7.3-macos-test.1"
+version = "0.7.3"
 edition = "2021"
 description = "A beautiful GUI wrapper for croc and sendme file transfer tools"
 authors = ["DataBeam <databeam@users.noreply.github.com>"]
@@ -75,22 +75,6 @@ icon = [
   "assets/icons/icon.icns",
 ]
 copyright = "Copyright (c) DataBeam"
-deb_depends = [
-  "curl",
-  "libasound2",
-  "libglib2.0-0",
-  "libglib2.0-bin",
-  "libgtk-3-0",
-  "libx11-6",
-  "libxcursor1",
-  "libxi6",
-  "libxkbcommon0",
-  "libxkbcommon-x11-0",
-  "libxrandr2",
-  "libwayland-client0",
-  "libwayland-cursor0",
-  "libwayland-egl1",
-]
 
 [package.metadata.bundle.linux]
 use_terminal = false

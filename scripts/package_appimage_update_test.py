@@ -26,6 +26,8 @@ try:
                    cwd=root, check=True)
     packages = list((root / 'target/release/bundle/appimage').glob('*0.7.1*.AppImage'))
     assert len(packages) == 1, f'Expected one v0.7.1 AppImage, found {packages}'
+    subprocess.run(['python3', str(root / 'scripts/bundle_appimage_runtime.py'),
+                    str(packages[0])], cwd=root, check=True)
     label = {'x86_64': 'x64', 'aarch64': 'arm64'}[args.arch]
     destination = root / 'dist' / f'databeam_update-test-v0.7.1_linux-{label}.AppImage'
     destination.parent.mkdir(exist_ok=True)

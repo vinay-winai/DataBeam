@@ -46,7 +46,7 @@ jobs:
             flatpak flatpak-builder desktop-file-utils appstream-util dbus \
             libasound2-dev libglib2.0-dev libgtk-3-dev libssl-dev libudev-dev \
             libwayland-dev libx11-dev libxcursor-dev libxi-dev libxkbcommon-dev \
-            libxkbcommon-x11-0 libxrandr-dev mesa-common-dev libfuse2 libxdo-dev patchelf
+            libxkbcommon-x11-0 libxrandr-dev mesa-common-dev libfuse2 libxdo-dev patchelf squashfs-tools
       - name: Prepare patched Croc engine
         run: python scripts/prepare_croc.py --target '${{ matrix.arch }}-unknown-linux-gnu'
       - name: Build native test application
@@ -64,7 +64,7 @@ jobs:
         run: dbus-run-session -- python scripts/package_flatpak.py --arch '${{ matrix.arch }}'
       - name: Check actual sandbox permissions and runtime tools
         run: |
-          bundle="dist/databeam_linux-${{ matrix.arch == 'aarch64' && 'arm64' || 'x64' }}.flatpak"
+          bundle="dist/databeam_linux-${{ matrix.arch == 'aarch64' && 'arm64' || 'x64' }}_no-auto-update.flatpak"
           flatpak install --user -y --noninteractive "$bundle"
           flatpak info --user --show-permissions com.vinaywinai.databeam//testing
           dbus-run-session -- flatpak run --command=sh com.vinaywinai.databeam//testing -ec '
