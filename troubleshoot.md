@@ -2,12 +2,12 @@
 
 [Download DataBeam](https://vinay-winai.github.io/DataBeam/)
 
-## v0.7.1 released
+## v0.7.2 - test released
 
-- Add Linux ARM64 downloads and automatic update support.
-- Use version-free download filenames and remove the Update button dot.
+- Restore macOS/Linux system tray controls and fix Windows EXE reopening from the tray.
+- Improve tray startup and Dock/taskbar restoration.
 
-[Release notes](https://github.com/vinay-winai/DataBeam/releases/tag/v0.7.1)
+[Release notes](https://github.com/vinay-winai/DataBeam/releases/tag/v0.7.2)
 
 # Troubleshooting DataBeam
 
@@ -24,6 +24,7 @@
 
 ## Common UI Issues
 
+- Linux system tray support requires a desktop AppIndicator/StatusNotifier host. Enable the relevant desktop extension if the tray setting reports it is unavailable.
 - On Linux Wayland, if file drag-and-drop does not work, launch DataBeam with `env -u WAYLAND_DISPLAY databeam` to use XWayland. This workaround has been confirmed working. You can also use the file / folder buttons.
 - If app width is small , UI persentation may not be desirable. In that case , please resize the app window.
 
@@ -31,6 +32,13 @@
 - Use Standalone Sendme mode for sensitive data transfers.
 
 # Previous releases
+
+## v0.7.1 released
+
+- Add Linux ARM64 downloads and automatic update support.
+- Use version-free download filenames and remove the Update button dot.
+
+[Release notes](https://github.com/vinay-winai/DataBeam/releases/tag/v0.7.1)
 
 ## v0.7.0 released
 

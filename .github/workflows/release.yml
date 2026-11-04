@@ -32,6 +32,11 @@ on:
         type: boolean
         required: false
         default: false
+      release_name:
+        description: "Optional release display name"
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -87,12 +92,6 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item "target/release/databeam.exe" "dist/databeam_windows-x64.exe"
-          $package = "target/windows-release-package"
-          New-Item -ItemType Directory -Force -Path "$package/LICENSES" | Out-Null
-          Copy-Item "target/release/databeam.exe" "$package/databeam.exe"
-          Copy-Item "LICENSE", "THIRD_PARTY_NOTICES.md" $package
-          Copy-Item "LICENSES/*.txt" "$package/LICENSES"
-          Compress-Archive -Path "$package/*" -DestinationPath "dist/databeam_windows-x64.zip" -Force
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v6
@@ -333,6 +332,7 @@ jobs:
           REPLACE_EXISTING: ${{ github.event.inputs.replace_existing || 'false' }}
           RELEASE_TARGET: ${{ github.event.inputs.target }}
           RELEASE_PRERELEASE: ${{ github.event.inputs.prerelease || 'false' }}
+          RELEASE_NAME: ${{ github.event.inputs.release_name }}
         shell: bash
         run: |
           set -euo pipefail
@@ -344,6 +344,9 @@ jobs:
 
           preview_flags=()
           release_title="DataBeam ${RELEASE_TAG}"
+          if [ -n "${RELEASE_NAME}" ]; then
+            release_title="${RELEASE_NAME}"
+          fi
           if [ "${RELEASE_PRERELEASE}" = "true" ]; then
             preview_flags=(--prerelease --latest=false)
             release_title="${release_title} Preview"
@@ -388,6 +391,6 @@ jobs:
           if [ "${RELEASE_PRERELEASE}" = "true" ]; then
             gh release edit "${RELEASE_TAG}" --title "${release_title}" --draft=false --prerelease --latest=false
           else
-            gh release edit "${RELEASE_TAG}" --draft=false
+            gh release edit "${RELEASE_TAG}" --title "${release_title}" --draft=false --prerelease=false --latest
           fi
 

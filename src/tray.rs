@@ -20,12 +20,8 @@
 //! available (headless CI); callers then fall back to normal quit-on-close
 //! behaviour.
 //!
-//! NOTE: the tray stack is currently Windows-only — all call sites in
-//! `main.rs` (init, close-intercept, settings toggle) are
-//! `#[cfg(target_os = "windows")]`-gated and this module carries
-//! `allow(dead_code)` off-Windows. macOS menu-bar / Linux indicator support
-//! is deferred, not removed: the builder diffs and pure mapping helpers are
-//! kept portable and unit-tested on every OS.
+//! Linux uses the KSNI D-Bus backend, without a second GTK event loop.
+//! macOS tray objects must be created on the running main event loop.
 
 use std::sync::{mpsc, Mutex, OnceLock};
 
@@ -40,6 +36,40 @@ use tray_icon::{
 
 pub const TRAY_SHOW_ID: &str = "databeam_show";
 pub const TRAY_QUIT_ID: &str = "databeam_quit";
+
+pub fn supported() -> bool {
+    cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux"))
+}
+
+/// KSNI can register successfully even without a panel displaying its icon.
+/// Probe the host before allowing close-to-tray, so closing stays safe on
+/// desktops without an indicator extension. Bound the external call.
+#[cfg(target_os = "linux")]
+fn linux_has_tray_host() -> bool {
+    use std::{process::{Command, Stdio}, time::{Duration, Instant}};
+    let Ok(mut child) = Command::new("gdbus").args([
+        "call", "--session", "--timeout", "1",
+        "--dest", "org.kde.StatusNotifierWatcher",
+        "--object-path", "/StatusNotifierWatcher",
+        "--method", "org.freedesktop.DBus.Properties.Get",
+        "org.kde.StatusNotifierWatcher", "IsStatusNotifierHostRegistered",
+    ]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else {
+        return false;
+    };
+    let deadline = Instant::now() + Duration::from_millis(750);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success() && child.wait_with_output()
+                .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "(<true>,)"),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
 
 /// Owned tray handles. Keep inside `DataBeamApp` for the app lifetime.
 pub struct TrayState {
@@ -256,9 +286,15 @@ pub fn init_tray(
     ctx: eframe::egui::Context,
     hwnd: Option<isize>,
 ) -> Option<(TrayState, mpsc::Receiver<TrayRawEvent>)> {
-    // Guard the factory too: no caller or saved setting may create a tray
-    // or construct native menu objects on macOS/Linux.
-    if !cfg!(target_os = "windows") {
+    if !supported() {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    if unsafe { libc::pthread_main_np() } == 0 {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    if !linux_has_tray_host() {
         return None;
     }
     let menu = Menu::new();
@@ -289,14 +325,17 @@ pub fn init_tray(
         // (macOS: left-click then delivers Click; right/Ctrl-click pops
         // the menu — same split as Windows.)
         .with_menu_on_left_click(false)
-        .with_tooltip("DataBeam — Secure & Fast Transfer")
-        .with_icon(icon);
+        .with_tooltip("DataBeam — Secure & Fast Transfer");
     // macOS menu-bar diff: template silhouette (native tint in dark/light
     // mode) instead of the full-color icon; the 64px asset's alpha channel
     // becomes the mask. A dedicated monochrome asset can replace it later.
     #[cfg(target_os = "macos")]
     {
-        builder = builder.with_icon_as_template(true);
+        builder = builder.with_icon_templated(icon);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        builder = builder.with_icon(icon);
     }
     // Title text beside the icon is Windows/Linux convention only.
     if let Some(title) = tray_title_text() {
@@ -339,6 +378,7 @@ pub fn init_tray(
 }
 
 /// True when a tray icon is currently owned.
+#[cfg(test)]
 pub fn is_active() -> bool {
     forward_entry()
         .lock()
@@ -474,9 +514,9 @@ mod tests {
     use super::*;
     use tray_icon::{MouseButtonState, Rect, TrayIconId, dpi};
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     #[test]
-    fn non_windows_tray_factory_stays_disabled() {
+    fn macos_tray_factory_rejects_non_main_threads() {
         assert!(init_tray(eframe::egui::Context::default(), None).is_none());
         set_debug_enabled(true);
         assert!(!DEBUG_ENABLED.load(std::sync::atomic::Ordering::SeqCst));

@@ -1,11 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod backend;
 mod app_update;
+#[cfg(all(windows, feature = "release-single-instance"))]
+mod activation;
 mod theme;
 mod troubleshoot;
-// Tray stack is Windows-only for now (macOS menu-bar / Linux indicator
-// support deferred): silence dead code off-Windows. The pure mapping
-// helpers stay unit-tested on every OS.
+// Native Windows/macOS tray menus and the Linux KSNI indicator backend.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod tray;
 mod widgets;
@@ -334,7 +334,10 @@ struct DataBeamApp {
     window_in_tray: bool,
     tray_quit_requested: bool,
     tray_state: Option<tray::TrayState>,
+    tray_startup_pending: bool,
     tray_action_rx: Option<mpsc::Receiver<tray::TrayRawEvent>>,
+    #[cfg(all(windows, feature = "release-single-instance"))]
+    activation_listener: Option<activation::Listener>,
     /// Win32 HWND captured at startup, independent of the tray toggle, so a
     /// later toggle-time init still restores via direct Win32 wake.
     startup_hwnd: Option<isize>,
@@ -464,7 +467,10 @@ impl Default for DataBeamApp {
             window_in_tray: false,
             tray_quit_requested: false,
             tray_state: None,
+            tray_startup_pending: true,
             tray_action_rx: None,
+            #[cfg(all(windows, feature = "release-single-instance"))]
+            activation_listener: None,
             startup_hwnd: None,
             last_good_inner: [WINDOW_DEFAULT_W, WINDOW_DEFAULT_H],
             launch_size_fixed: false,
@@ -552,17 +558,12 @@ impl DataBeamApp {
             .ok()
             .and_then(|handle| tray::hwnd_from_raw(handle.as_raw()));
 
-        // System tray is Windows-only for now; init after settings load so
-        // the toggle is honoured. Other platforms quit on close (default
-        // eframe behaviour) and never create tray objects.
-        #[cfg(target_os = "windows")]
-        if app.minimize_to_tray && !tray::is_active() {
-            if let Some((state, rx)) =
-                tray::init_tray(cc.egui_ctx.clone(), Self::pick_restore_hwnd(app.startup_hwnd, tray::tray_hwnd()))
-            {
-                app.tray_state = Some(state);
-                app.tray_action_rx = Some(rx);
-            }
+        // Tray initialization is deferred until the native event loop is running.
+
+        #[cfg(all(windows, feature = "release-single-instance"))]
+        {
+            app.activation_listener = activation::Listener::start(cc.egui_ctx.clone(), app.startup_hwnd)
+                .map_err(|error| eprintln!("Could not enable window activation: {error}")).ok();
         }
 
         // Always start with EazySendme; fall back if tools are unavailable.
@@ -654,7 +655,7 @@ impl DataBeamApp {
         self.eazysendme_auto_retry = true; // Always true on launch
         self.croc_custom_code = settings.croc_custom_code;
         self.croc_use_custom_code = settings.croc_use_custom_code;
-        self.minimize_to_tray = cfg!(target_os = "windows") && settings.minimize_to_tray;
+        self.minimize_to_tray = tray::supported() && settings.minimize_to_tray;
         self.tray_debug_log = cfg!(target_os = "windows") && settings.tray_debug_log;
         tray::set_debug_enabled(self.tray_debug_log);
         // Limit map size to 20 entries (keep newest)
@@ -1306,8 +1307,6 @@ impl DataBeamApp {
     /// always taken, while the shared cached one only exists when a prior
     /// tray init ran. Toggle-time init with no prior init used to pass
     /// `None`, silently disabling the direct Win32 wake on every restore.
-    /// Windows-only tray path (see mod tray).
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     fn pick_restore_hwnd(startup: Option<isize>, cached: Option<isize>) -> Option<isize> {
         startup.or(cached)
     }
@@ -1330,6 +1329,13 @@ impl DataBeamApp {
                 size[0] as u32, size[1] as u32
             ));
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(size[0], size[1])));
+        }
+    }
+
+    #[cfg(all(windows, feature = "release-single-instance"))]
+    fn poll_activation(&mut self, ctx: &egui::Context) {
+        if self.activation_listener.as_ref().is_some_and(|listener| listener.take_request()) {
+            self.show_main_window(ctx);
         }
     }
 
@@ -1366,11 +1372,29 @@ impl DataBeamApp {
         }
     }
 
+    fn poll_tray_startup(&mut self, ctx: &egui::Context) {
+        if !self.tray_startup_pending {
+            return;
+        }
+        self.tray_startup_pending = false;
+        if self.minimize_to_tray {
+            // Reuse the toggle path on the app thread, after winit startup.
+            self.minimize_to_tray = false;
+            self.set_minimize_to_tray(ctx, true);
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn sync_native_minimized_state(&mut self, minimized: Option<bool>) {
+        // macOS/Linux keep their Dock/taskbar entry. Restoring there must
+        // resume drawing too, without requiring a separate tray-menu click.
+        // Unknown/unsupported minimization must never blank a visible UI.
+        self.window_in_tray = minimized == Some(true);
+    }
+
     /// Toggle close-to-tray from the settings popup (persisted).
-    /// Windows-only tray path (see mod tray).
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     fn set_minimize_to_tray(&mut self, ctx: &egui::Context, enabled: bool) {
-        let enabled = cfg!(target_os = "windows") && enabled;
+        let enabled = tray::supported() && enabled;
         if self.minimize_to_tray == enabled {
             return;
         }
@@ -1386,6 +1410,14 @@ impl DataBeamApp {
             if let Some((state, rx)) = tray::init_tray(ctx.clone(), hwnd) {
                 self.tray_state = Some(state);
                 self.tray_action_rx = Some(rx);
+            } else {
+                self.minimize_to_tray = false;
+                let message = if cfg!(target_os = "linux") {
+                    "System tray unavailable. Enable your desktop's AppIndicator/StatusNotifier support."
+                } else {
+                    "System tray unavailable. Closing the window will quit DataBeam."
+                };
+                self.show_toast(message.to_string(), WARNING);
             }
         } else if !enabled {
             // Drop the icon immediately so it never lingers.
@@ -3601,13 +3633,11 @@ impl DataBeamApp {
         if self.cleanup_prompt_open {
             self.render_cleanup_popup(ctx);
         }
-        #[cfg(target_os = "windows")]
         if self.settings_popup_open {
             self.render_settings_popup(ctx);
         }
     }
 
-    #[cfg(target_os = "windows")]
     fn render_settings_popup(&mut self, ctx: &egui::Context) {
         let mut open = self.settings_popup_open;
         egui::Window::new("Settings")
@@ -3617,9 +3647,7 @@ impl DataBeamApp {
             .anchor(egui::Align2::RIGHT_BOTTOM, [-12.0, -12.0])
             .show(ctx, |ui| {
                 ui.set_min_width(260.0);
-                // Windows-only tray rows (see mod tray): other platforms
-                // quit on close, so no tray toggle is shown there.
-                #[cfg(target_os = "windows")]
+                // Only an owned tray icon may intercept window close.
                 {
                     // NOTE: checkbox edits a LOCAL copy on purpose. Binding `&mut
                     // self.minimize_to_tray` directly would flip the field before
@@ -3627,13 +3655,13 @@ impl DataBeamApp {
                     // true and silently skipping init/drop/persist.
                     let mut tray_toggle = self.minimize_to_tray;
                     if ui
-                        .checkbox(&mut tray_toggle, "Live in system tray (close hides to tray)")
+                        .checkbox(&mut tray_toggle, "Keep running in system tray when closed")
                         .changed()
                     {
                         let ctx = ui.ctx().clone();
                         self.set_minimize_to_tray(&ctx, tray_toggle);
                     }
-                    #[cfg(debug_assertions)]
+                    #[cfg(all(windows, debug_assertions))]
                     {
                         let mut debug_toggle = self.tray_debug_log;
                         if ui
@@ -3819,6 +3847,11 @@ impl eframe::App for DataBeamApp {
             self.last_good_inner = [screen.width(), screen.height()];
         }
         // ── System tray: close-to-tray + menu actions ──
+        #[cfg(not(windows))]
+        self.sync_native_minimized_state(ctx.input(|i| i.viewport().minimized));
+        self.poll_tray_startup(ctx);
+        #[cfg(all(windows, feature = "release-single-instance"))]
+        self.poll_activation(ctx);
         // Handlers wake the native window; apply each queued action here.
         let tray_actions = match self.tray_action_rx.as_ref() {
             Some(rx) => tray::drain_actions_global(rx),
@@ -3831,11 +3864,9 @@ impl eframe::App for DataBeamApp {
             return;
         }
         if ctx.input(|i| i.viewport().close_requested()) {
-            // Windows-only tray: X hides to tray while the toggle is on and
-            // the icon exists. Tray Exit bypasses this via the quit flag.
-            // Other platforms quit on close (default eframe behaviour).
-            #[cfg(target_os = "windows")]
-            if self.minimize_to_tray && tray::is_active() {
+            // Exit bypasses this via the quit flag. Failed tray creation
+            // leaves normal close behavior available.
+            if self.minimize_to_tray && self.tray_state.is_some() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.hide_to_tray(ctx);
             }
@@ -4004,7 +4035,9 @@ impl eframe::App for DataBeamApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
-        if self.window_in_tray {
+        if self.window_in_tray
+            && (cfg!(windows) || ctx.input(|i| i.viewport().minimized) == Some(true))
+        {
             // Poll background work above; hidden UI widgets must not animate.
             return;
         }
@@ -4104,8 +4137,6 @@ impl eframe::App for DataBeamApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Settings cog: lives in the always-visible top bar
                         // (the bottom status bar only renders mid-transfer).
-                        // Its controls (tray and Croc updater) are Windows-only.
-                        #[cfg(target_os = "windows")]
                         if ui
                             .add(egui::Button::new(RichText::new("⚙").size(14.0)).frame(false))
                             .on_hover_text("Settings")
@@ -6824,6 +6855,8 @@ fn enforce_single_instance_release() -> Option<single_instance::SingleInstance> 
     match single_instance::SingleInstance::new("com.vinaywinai.databeam.release") {
         Ok(instance) => {
             if !instance.is_single() {
+                #[cfg(windows)]
+                activation::notify_existing();
                 eprintln!("DataBeam is already running; exiting duplicate release instance.");
                 std::process::exit(0);
             }
@@ -6983,7 +7016,7 @@ mod parse_tests {
 
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn non_windows_saved_settings_cannot_enable_tray() {
+    fn non_windows_settings_allow_tray_without_creating_native_objects() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.json");
         std::fs::write(&path, r#"{"minimize_to_tray":true,"tray_debug_log":true}"#).unwrap();
@@ -6991,12 +7024,26 @@ mod parse_tests {
         let mut app = DataBeamApp::default();
         assert!(!app.minimize_to_tray);
         app.load_user_settings();
-        assert!(!app.minimize_to_tray);
+        assert!(app.minimize_to_tray);
         assert!(!app.tray_debug_log);
-        app.set_minimize_to_tray(&eframe::egui::Context::default(), true);
-        assert!(!app.minimize_to_tray);
         assert!(app.tray_state.is_none());
         assert!(app.tray_action_rx.is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn non_windows_dock_or_taskbar_restore_resumes_ui_and_keeps_transfer() {
+        let mut app = DataBeamApp::default();
+        app.transfer_state = super::TransferState::Running;
+        app.transfer_progress = 0.5;
+        app.sync_native_minimized_state(Some(true));
+        assert!(app.window_in_tray);
+        app.sync_native_minimized_state(Some(false));
+        assert!(!app.window_in_tray);
+        assert_eq!(app.transfer_state, super::TransferState::Running);
+        assert_eq!(app.transfer_progress, 0.5);
+        app.sync_native_minimized_state(None);
+        assert!(!app.window_in_tray);
     }
 
     #[test]

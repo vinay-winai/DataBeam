@@ -1,6 +1,6 @@
 [package]
 name = "databeam"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2021"
 description = "A beautiful GUI wrapper for croc and sendme file transfer tools"
 authors = ["DataBeam <databeam@users.noreply.github.com>"]
@@ -26,7 +26,6 @@ qrcode = "0.14"
 rand = "0.9"
 sha2 = "0.11"
 portable-pty = "0.8"
-tray-icon = { version = "0.21", features = [] }
 raw-window-handle = "0.6"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 sendme_native = { package = "sendme", path = "third_party/sendme", default-features = false }
@@ -41,8 +40,12 @@ sha2 = "0.11"
 
 [target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
 single-instance = { version = "0.3", optional = true }
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+tray-icon = { version = "=0.26.1", default-features = false }
+[target.'cfg(target_os = "linux")'.dependencies]
+tray-icon = { version = "=0.26.1", default-features = false, features = ["ksni"] }
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
 
@@ -71,6 +74,7 @@ copyright = "Copyright (c) DataBeam"
 deb_depends = [
   "libasound2",
   "libglib2.0-0",
+  "libglib2.0-bin",
   "libgtk-3-0",
   "libx11-6",
   "libxcursor1",
