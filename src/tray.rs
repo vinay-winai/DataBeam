@@ -257,8 +257,26 @@ fn install_handlers_once() {
 fn load_tray_icon() -> Option<Icon> {
     let png = include_bytes!("../assets/icons/icon-64.png");
     let image = image::load_from_memory(png).ok()?.into_rgba8();
+    #[cfg(target_os = "macos")]
+    let image = macos_template_mask(image);
     let (width, height) = image.dimensions();
     Icon::from_rgba(image.into_raw(), width, height).ok()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_template_mask(mut image: image::RgbaImage) -> image::RgbaImage {
+    // The app icon includes an opaque dark disk. AppKit templates discard
+    // RGB and use only alpha, turning that disk into a solid white circle.
+    // Keep the existing orange ring/arrow as the mask, including antialiasing.
+    let coverage = |pixel: &image::Rgba<u8>| {
+        pixel[0].saturating_sub(pixel[1].max(pixel[2])).saturating_sub(8)
+    };
+    let peak = image.pixels().map(coverage).max().unwrap_or(0).max(1) as u16;
+    for pixel in image.pixels_mut() {
+        let alpha = (pixel[3] as u16 * coverage(pixel) as u16 / peak) as u8;
+        *pixel = image::Rgba([0, 0, 0, alpha]);
+    }
+    image
 }
 
 /// Status-item title text. macOS menu-bar convention is icon-only — text
@@ -324,9 +342,8 @@ pub fn init_tray(
         // the menu on single-click and sends activation on double-click.
         .with_menu_on_left_click(false)
         .with_tooltip("DataBeam — Secure & Fast Transfer");
-    // macOS menu-bar diff: template silhouette (native tint in dark/light
-    // mode) instead of the full-color icon; the 64px asset's alpha channel
-    // becomes the mask. A dedicated monochrome asset can replace it later.
+    // macOS uses the ring/arrow mask above, tinted by the system for either
+    // menu-bar appearance. Other platforms retain the full-color app icon.
     #[cfg(target_os = "macos")]
     {
         builder = builder.with_icon_templated(icon);
@@ -511,6 +528,20 @@ pub fn hwnd_from_raw(handle: raw_window_handle::RawWindowHandle) -> Option<isize
 mod tests {
     use super::*;
     use tray_icon::{MouseButtonState, Rect, TrayIconId, dpi};
+
+    #[test]
+    fn non_windows_macos_template_keeps_logo_and_removes_opaque_background() {
+        let original = image::load_from_memory(include_bytes!("../assets/icons/icon-64.png"))
+            .unwrap().into_rgba8();
+        let mask = macos_template_mask(original.clone());
+        assert_eq!(mask.dimensions(), original.dimensions());
+        assert_eq!(mask.get_pixel(0, 0)[3], 0, "outside the logo must stay transparent");
+        assert_eq!(mask.get_pixel(32, 7)[3], 0, "dark disk must not become a solid template");
+        assert!(mask.get_pixel(32, 32)[3] > 200, "arrow must remain visible");
+        let opaque = mask.pixels().filter(|pixel| pixel[3] > 128).count();
+        assert!(opaque > 500 && opaque < 2000, "expected ring/arrow rather than a full disk: {opaque}");
+        assert!(mask.pixels().all(|pixel| pixel.0[..3] == [0, 0, 0]));
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

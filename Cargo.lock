@@ -1335,7 +1335,7 @@ dependencies = [
 
 [[package]]
 name = "databeam"
-version = "0.7.3-linux-test.2"
+version = "0.7.3-macos-test.1"
 dependencies = [
  "dirs",
  "eframe",
@@ -1344,6 +1344,8 @@ dependencies = [
  "flate2",
  "image",
  "libc",
+ "objc2 0.6.3",
+ "objc2-app-kit 0.3.2",
  "open",
  "portable-pty",
  "qrcode",

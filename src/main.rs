@@ -10,6 +10,8 @@ mod theme;
 mod troubleshoot;
 #[cfg(target_os = "linux")]
 mod linux_desktop;
+#[cfg(target_os = "macos")]
+mod macos_desktop;
 #[cfg(all(target_os = "linux", any(test, feature = "release-single-instance")))]
 #[path = "linux_instance.rs"]
 mod single_instance;
@@ -1403,12 +1405,17 @@ impl DataBeamApp {
         }
     }
 
-    #[cfg(target_os = "macos")]
-    fn sync_native_minimized_state(&mut self, minimized: Option<bool>) {
-        // macOS keeps its Dock entry. Restoring there must
-        // resume drawing too, without requiring a separate tray-menu click.
-        // Unknown/unsupported minimization must never blank a visible UI.
-        self.window_in_tray = minimized == Some(true);
+    #[cfg(any(target_os = "macos", test))]
+    fn sync_native_minimized_state(&mut self, ctx: &egui::Context, minimized: Option<bool>) {
+        // Read actual AppKit state, not egui-winit's stale minimized flag.
+        // Dock/Finder restores must also clear that cache and resume painting.
+        if self.window_in_tray && minimized == Some(false) {
+            self.show_main_window(ctx);
+            ctx.request_repaint();
+        } else {
+            // Unknown state must never suppress a potentially visible UI.
+            self.window_in_tray = minimized == Some(true);
+        }
     }
 
     /// Toggle close-to-tray from the settings popup (persisted).
@@ -3874,7 +3881,10 @@ impl eframe::App for DataBeamApp {
         }
         // ── System tray: close-to-tray + menu actions ──
         #[cfg(target_os = "macos")]
-        self.sync_native_minimized_state(ctx.input(|i| i.viewport().minimized));
+        {
+            let minimized = macos_desktop::is_minimized(_frame);
+            self.sync_native_minimized_state(ctx, minimized);
+        }
         self.poll_tray_startup(ctx);
         #[cfg(all(any(windows, target_os = "linux"), feature = "release-single-instance"))]
         self.poll_activation(ctx);
@@ -4061,9 +4071,7 @@ impl eframe::App for DataBeamApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
-        if self.window_in_tray
-            && (!cfg!(target_os = "macos") || ctx.input(|i| i.viewport().minimized) == Some(true))
-        {
+        if self.window_in_tray {
             // Poll background work above; hidden UI widgets must not animate.
             return;
         }
@@ -7065,19 +7073,27 @@ mod parse_tests {
         assert!(app.tray_action_rx.is_none());
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn non_windows_dock_or_taskbar_restore_resumes_ui_and_keeps_transfer() {
+    fn non_windows_macos_dock_restore_clears_stale_minimized_cache_and_keeps_transfer() {
         let mut app = DataBeamApp::default();
+        let ctx = egui::Context::default();
         app.transfer_state = super::TransferState::Running;
         app.transfer_progress = 0.5;
-        app.sync_native_minimized_state(Some(true));
+        app.sync_native_minimized_state(&ctx, Some(true));
         assert!(app.window_in_tray);
-        app.sync_native_minimized_state(Some(false));
+        let mut input = egui::RawInput::default();
+        input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().minimized = Some(true);
+        let output = ctx.run(input, |ctx| {
+            // Cocoa has restored the window while egui still says minimized.
+            assert_eq!(ctx.input(|i| i.viewport().minimized), Some(true));
+            app.sync_native_minimized_state(ctx, Some(false));
+        });
         assert!(!app.window_in_tray);
+        assert!(output.viewport_output[&egui::ViewportId::ROOT].commands.iter()
+            .any(|command| matches!(command, egui::ViewportCommand::Minimized(false))));
         assert_eq!(app.transfer_state, super::TransferState::Running);
         assert_eq!(app.transfer_progress, 0.5);
-        app.sync_native_minimized_state(None);
+        app.sync_native_minimized_state(&ctx, None);
         assert!(!app.window_in_tray);
     }
 

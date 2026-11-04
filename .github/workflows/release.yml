@@ -5,6 +5,7 @@ on:
     tags:
       - "v*"
       - "!v*-linux-test.*"
+      - "!v*-macos-test.*"
   workflow_dispatch:
     inputs:
       target:
