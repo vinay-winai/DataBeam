@@ -1,4 +1,4 @@
-name: Linux Flatpak test
+name: Linux Flatpak and updater test
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       tag:
         description: "Separate Linux test release tag"
         required: true
-        default: "v0.7.3-linux-test.1"
+        default: "v0.7.3-linux-test.2"
         type: string
 
 permissions:
@@ -46,7 +46,7 @@ jobs:
             flatpak flatpak-builder desktop-file-utils appstream-util dbus \
             libasound2-dev libglib2.0-dev libgtk-3-dev libssl-dev libudev-dev \
             libwayland-dev libx11-dev libxcursor-dev libxi-dev libxkbcommon-dev \
-            libxkbcommon-x11-0 libxrandr-dev mesa-common-dev
+            libxkbcommon-x11-0 libxrandr-dev mesa-common-dev libfuse2 libxdo-dev patchelf
       - name: Prepare patched Croc engine
         run: python scripts/prepare_croc.py --target '${{ matrix.arch }}-unknown-linux-gnu'
       - name: Build native test application
@@ -54,6 +54,7 @@ jobs:
       - name: Test Linux platform behavior and embedded Croc
         run: |
           cargo test --locked --features release-single-instance --bin databeam non_windows_
+          cargo test --locked --features release-single-instance --bin databeam app_update::install::tests
           cargo test --locked --features release-single-instance --bin databeam croc_bundled_engine_extracts_and_reports_patched_version
       - name: Install Flatpak build runtimes
         run: |
@@ -83,11 +84,17 @@ jobs:
             rmdir "$check_dir"
             curl --fail --silent --show-error --proto =https --max-time 30 https://raw.githubusercontent.com/vinay-winai/DataBeam/main/troubleshoot.md >/dev/null
           '
-      - name: Upload test bundles
+      - name: Package fixed v0.7.1 AppImage for updater testing
+        run: |
+          cargo install cargo-bundle --version 0.12.0 --locked
+          python scripts/package_appimage_update_test.py --arch '${{ matrix.arch }}'
+      - name: Upload test packages
         uses: actions/upload-artifact@v6
         with:
-          name: flatpak-${{ matrix.arch }}
-          path: dist/*.flatpak
+          name: linux-test-${{ matrix.arch }}
+          path: |
+            dist/*.flatpak
+            dist/*.AppImage
           if-no-files-found: error
 
   draft:
@@ -98,7 +105,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: actions/download-artifact@v6
         with:
-          pattern: flatpak-*
+          pattern: linux-test-*
           merge-multiple: true
           path: dist
       - name: Stage checked assets for publication
@@ -107,8 +114,8 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          (cd dist && sha256sum *.flatpak > SHA256SUMS.txt)
+          (cd dist && sha256sum *.flatpak *.AppImage > SHA256SUMS.txt)
           gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" \
-            --title "DataBeam Linux Flatpak - test" --draft --prerelease --latest=false \
+            --title "DataBeam Linux tray and updater - test 2" --draft --prerelease --latest=false \
             --notes-file release-notes/linux-flatpak-test.md
           gh release upload "$RELEASE_TAG" dist/*

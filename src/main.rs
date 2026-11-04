@@ -3,10 +3,16 @@ mod backend;
 mod app_update;
 #[cfg(all(windows, feature = "release-single-instance"))]
 mod activation;
+#[cfg(all(target_os = "linux", feature = "release-single-instance"))]
+#[path = "linux_activation.rs"]
+mod activation;
 mod theme;
 mod troubleshoot;
 #[cfg(target_os = "linux")]
 mod linux_desktop;
+#[cfg(all(target_os = "linux", any(test, feature = "release-single-instance")))]
+#[path = "linux_instance.rs"]
+mod single_instance;
 // Native Windows/macOS tray menus and the Linux KSNI indicator backend.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod tray;
@@ -340,7 +346,7 @@ struct DataBeamApp {
     #[cfg(target_os = "linux")]
     linux_tray_window_supported: bool,
     tray_action_rx: Option<mpsc::Receiver<tray::TrayRawEvent>>,
-    #[cfg(all(windows, feature = "release-single-instance"))]
+    #[cfg(all(any(windows, target_os = "linux"), feature = "release-single-instance"))]
     activation_listener: Option<activation::Listener>,
     /// Win32 HWND captured at startup, independent of the tray toggle, so a
     /// later toggle-time init still restores via direct Win32 wake.
@@ -475,7 +481,7 @@ impl Default for DataBeamApp {
             #[cfg(target_os = "linux")]
             linux_tray_window_supported: false,
             tray_action_rx: None,
-            #[cfg(all(windows, feature = "release-single-instance"))]
+            #[cfg(all(any(windows, target_os = "linux"), feature = "release-single-instance"))]
             activation_listener: None,
             startup_hwnd: None,
             last_good_inner: [WINDOW_DEFAULT_W, WINDOW_DEFAULT_H],
@@ -571,7 +577,7 @@ impl DataBeamApp {
 
         // Tray initialization is deferred until the native event loop is running.
 
-        #[cfg(all(windows, feature = "release-single-instance"))]
+        #[cfg(all(any(windows, target_os = "linux"), feature = "release-single-instance"))]
         {
             app.activation_listener = activation::Listener::start(cc.egui_ctx.clone(), app.startup_hwnd)
                 .map_err(|error| eprintln!("Could not enable window activation: {error}")).ok();
@@ -1343,7 +1349,7 @@ impl DataBeamApp {
         }
     }
 
-    #[cfg(all(windows, feature = "release-single-instance"))]
+    #[cfg(all(any(windows, target_os = "linux"), feature = "release-single-instance"))]
     fn poll_activation(&mut self, ctx: &egui::Context) {
         if self.activation_listener.as_ref().is_some_and(|listener| listener.take_request()) {
             self.show_main_window(ctx);
@@ -3870,7 +3876,7 @@ impl eframe::App for DataBeamApp {
         #[cfg(target_os = "macos")]
         self.sync_native_minimized_state(ctx.input(|i| i.viewport().minimized));
         self.poll_tray_startup(ctx);
-        #[cfg(all(windows, feature = "release-single-instance"))]
+        #[cfg(all(any(windows, target_os = "linux"), feature = "release-single-instance"))]
         self.poll_activation(ctx);
         // Handlers wake the native window; apply each queued action here.
         let tray_actions = match self.tray_action_rx.as_ref() {
@@ -6882,7 +6888,6 @@ fn enforce_single_instance_release() -> Option<single_instance::SingleInstance> 
     match single_instance::SingleInstance::new(instance_name) {
         Ok(instance) => {
             if !instance.is_single() {
-                #[cfg(windows)]
                 activation::notify_existing();
                 eprintln!("DataBeam is already running; exiting duplicate release instance.");
                 std::process::exit(0);

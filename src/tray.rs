@@ -319,11 +319,9 @@ pub fn init_tray(
 
     let mut builder = TrayIconBuilder::new()
         .with_menu(Box::new(menu.clone()))
-        // Explicit: left-click restores via Click events. The library
-        // DEFAULT shows the menu on left-click too (verified in source),
-        // which fights the restore and confuses the toggle-re-enable path.
-        // (macOS: left-click then delivers Click; right/Ctrl-click pops
-        // the menu — same split as Windows.)
+        // On Windows/macOS, left-click restores and right-click opens the
+        // menu. Linux tray hosts choose the gesture: Ubuntu/GNOME opens
+        // the menu on single-click and sends activation on double-click.
         .with_menu_on_left_click(false)
         .with_tooltip("DataBeam — Secure & Fast Transfer");
     // macOS menu-bar diff: template silhouette (native tint in dark/light

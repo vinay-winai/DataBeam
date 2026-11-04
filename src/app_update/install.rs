@@ -365,13 +365,18 @@ fn launch_app(plan: &InstallPlan, config: &Path) -> Result<Child, String> {
     } else {
         plan.target.clone()
     };
+    let log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(plan.workspace.join("restart.log"))
+        .map_err(|error| format!("Cannot create update restart log: {error}"))?;
     crate::backend::new_hidden_command(executable)
         .arg("--databeam-update-result")
         .arg(config)
         .current_dir(plan.target.parent().ok_or("Missing application folder")?)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(log))
         .spawn()
         .map_err(|error| error.to_string())
 }

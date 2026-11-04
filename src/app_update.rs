@@ -136,7 +136,7 @@ fn curl(url: &str, max_bytes: u64, timeout_secs: u64) -> std::process::Command {
 fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
     let output = curl(url, 1024 * 1024, 20)
         .output()
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| curl_start_error("Update check", error))?;
     if !output.status.success() {
         return Err(format!(
             "Update check failed: {}",
@@ -144,6 +144,19 @@ fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
         ));
     }
     Ok(output.stdout)
+}
+
+fn curl_start_error(action: &str, error: std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        let hint = if cfg!(target_os = "linux") {
+            "Install curl using your Linux package manager, then retry."
+        } else {
+            "Make sure curl is installed and available on PATH."
+        };
+        format!("{action} failed: could not start curl. {hint}")
+    } else {
+        format!("{action} failed: could not start curl: {error}")
+    }
 }
 
 fn fetch_update() -> Result<Option<AvailableUpdate>, String> {
@@ -211,7 +224,7 @@ fn download_verified(update: &AvailableUpdate, directory: &Path) -> Result<PathB
     .arg("--output")
     .arg(&path)
     .output()
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| curl_start_error("Update download", error))?;
     if !output.status.success() {
         return Err(format!(
             "Update download failed: {}",
