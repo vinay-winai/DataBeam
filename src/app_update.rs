@@ -15,6 +15,11 @@ const DOWNLOAD_ROOT: &str = "https://github.com/vinay-winai/DataBeam/releases/do
 const CHECK_INTERVAL: Duration = Duration::from_secs(3 * 60 * 60);
 const MAX_PACKAGE_SIZE: u64 = 512 * 1024 * 1024;
 
+pub fn managed_by_flatpak() -> bool {
+    cfg!(target_os = "linux") && (std::env::var_os("FLATPAK_ID").is_some()
+        || Path::new("/.flatpak-info").exists())
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct Asset {
     name: String,
@@ -246,6 +251,10 @@ impl AppUpdater {
     }
 
     pub fn check(&mut self, ctx: &egui::Context) {
+        if managed_by_flatpak() {
+            self.status = Some("Updates are managed by Flatpak.".into());
+            return;
+        }
         if self.busy() || self.installing {
             return;
         }
@@ -261,6 +270,10 @@ impl AppUpdater {
     }
 
     pub fn install(&mut self, ctx: &egui::Context) {
+        if managed_by_flatpak() {
+            self.status = Some("Updates are managed by Flatpak.".into());
+            return;
+        }
         if self.busy() || self.installing {
             return;
         }
@@ -282,6 +295,10 @@ impl AppUpdater {
 
     /// Returns true when a replacement helper is ready and the app should exit.
     pub fn poll(&mut self, ctx: &egui::Context) -> bool {
+        if managed_by_flatpak() {
+            self.status.get_or_insert_with(|| "Updates are managed by Flatpak.".into());
+            return false;
+        }
         if let Some(rx) = self.pending.take() {
             match rx.try_recv() {
                 Ok(Event::Checked(Ok(update))) => {

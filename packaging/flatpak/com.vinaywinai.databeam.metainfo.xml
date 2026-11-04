@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.vinaywinai.databeam</id>
+  <name>DataBeam</name>
+  <summary>Send files and text with croc and sendme</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>AGPL-3.0-only</project_license>
+  <launchable type="desktop-id">com.vinaywinai.databeam.desktop</launchable>
+  <description>
+    <p>DataBeam transfers files, folders and text using croc and sendme, with sharing codes, transfer progress and automatic retries.</p>
+  </description>
+  <url type="homepage">https://vinay-winai.github.io/DataBeam/</url>
+  <url type="bugtracker">https://github.com/vinay-winai/DataBeam/issues</url>
+  <content_rating type="oars-1.1"/>
+</component>

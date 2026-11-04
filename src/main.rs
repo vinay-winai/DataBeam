@@ -5,6 +5,8 @@ mod app_update;
 mod activation;
 mod theme;
 mod troubleshoot;
+#[cfg(target_os = "linux")]
+mod linux_desktop;
 // Native Windows/macOS tray menus and the Linux KSNI indicator backend.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod tray;
@@ -335,6 +337,8 @@ struct DataBeamApp {
     tray_quit_requested: bool,
     tray_state: Option<tray::TrayState>,
     tray_startup_pending: bool,
+    #[cfg(target_os = "linux")]
+    linux_tray_window_supported: bool,
     tray_action_rx: Option<mpsc::Receiver<tray::TrayRawEvent>>,
     #[cfg(all(windows, feature = "release-single-instance"))]
     activation_listener: Option<activation::Listener>,
@@ -468,6 +472,8 @@ impl Default for DataBeamApp {
             tray_quit_requested: false,
             tray_state: None,
             tray_startup_pending: true,
+            #[cfg(target_os = "linux")]
+            linux_tray_window_supported: false,
             tray_action_rx: None,
             #[cfg(all(windows, feature = "release-single-instance"))]
             activation_listener: None,
@@ -557,6 +563,11 @@ impl DataBeamApp {
             .window_handle()
             .ok()
             .and_then(|handle| tray::hwnd_from_raw(handle.as_raw()));
+        #[cfg(target_os = "linux")]
+        {
+            app.linux_tray_window_supported = cc.window_handle().ok()
+                .is_some_and(|handle| linux_desktop::supports_hide(handle.as_raw()));
+        }
 
         // Tray initialization is deferred until the native event loop is running.
 
@@ -1339,12 +1350,14 @@ impl DataBeamApp {
         }
     }
 
-    /// Keep the main window iconic to avoid eframe's hidden-window redraw
-    /// spin, while native window styles remove it from taskbar and Alt+Tab.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    /// Hide Linux/X11 windows completely. Windows retains an iconic window
+    /// with taskbar suppression; macOS keeps its existing minimize behavior.
     fn hide_to_tray(&mut self, ctx: &egui::Context) {
         self.window_in_tray = true;
         tray::debug_log("window hidden to tray");
+        #[cfg(target_os = "linux")]
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        #[cfg(not(target_os = "linux"))]
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         #[cfg(windows)]
         if let Some(hwnd) = Self::pick_restore_hwnd(self.startup_hwnd, tray::tray_hwnd()) {
@@ -1384,9 +1397,9 @@ impl DataBeamApp {
         }
     }
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     fn sync_native_minimized_state(&mut self, minimized: Option<bool>) {
-        // macOS/Linux keep their Dock/taskbar entry. Restoring there must
+        // macOS keeps its Dock entry. Restoring there must
         // resume drawing too, without requiring a separate tray-menu click.
         // Unknown/unsupported minimization must never blank a visible UI.
         self.window_in_tray = minimized == Some(true);
@@ -1395,6 +1408,13 @@ impl DataBeamApp {
     /// Toggle close-to-tray from the settings popup (persisted).
     fn set_minimize_to_tray(&mut self, ctx: &egui::Context, enabled: bool) {
         let enabled = tray::supported() && enabled;
+        #[cfg(target_os = "linux")]
+        if enabled && !self.linux_tray_window_supported {
+            self.minimize_to_tray = false;
+            self.show_toast("Close-to-tray requires X11/XWayland on this desktop.".to_string(), WARNING);
+            self.persist_user_settings();
+            return;
+        }
         if self.minimize_to_tray == enabled {
             return;
         }
@@ -3847,7 +3867,7 @@ impl eframe::App for DataBeamApp {
             self.last_good_inner = [screen.width(), screen.height()];
         }
         // ── System tray: close-to-tray + menu actions ──
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
         self.sync_native_minimized_state(ctx.input(|i| i.viewport().minimized));
         self.poll_tray_startup(ctx);
         #[cfg(all(windows, feature = "release-single-instance"))]
@@ -4036,7 +4056,7 @@ impl eframe::App for DataBeamApp {
         }
 
         if self.window_in_tray
-            && (cfg!(windows) || ctx.input(|i| i.viewport().minimized) == Some(true))
+            && (!cfg!(target_os = "macos") || ctx.input(|i| i.viewport().minimized) == Some(true))
         {
             // Poll background work above; hidden UI widgets must not animate.
             return;
@@ -4164,12 +4184,14 @@ impl eframe::App for DataBeamApp {
                             || self.eazy_next_retry_time.is_some()
                             || self.croc_update_phase != CrocUpdatePhase::Idle;
                         let available = self.app_updater.available.is_some();
-                        let label = if self.app_updater.installing { "Updating…" }
+                        let managed = app_update::managed_by_flatpak();
+                        let label = if managed { "Flatpak" }
+                            else if self.app_updater.installing { "Updating…" }
                             else if self.app_updater.busy() { "Checking…" }
                             else { "Update" };
                         let tooltip = if transfer_active { "Finish or stop the transfer before updating DataBeam." }
                             else { self.app_updater.status.as_deref().unwrap_or("Check for DataBeam updates") };
-                        let update_button = ui.add_enabled(!transfer_active && !self.app_updater.busy() && !self.app_updater.installing,
+                        let update_button = ui.add_enabled(!managed && !transfer_active && !self.app_updater.busy() && !self.app_updater.installing,
                             egui::Button::new(RichText::new(label).size(12.0).color(if available { Color32::YELLOW } else { TEXT_SECONDARY })));
                         if update_button
                             .on_hover_text(tooltip).clicked() {
@@ -6852,7 +6874,12 @@ fn dir_size_capped(path: &std::path::Path, depth: u32, max_depth: u32) -> u64 {
     any(target_os = "windows", target_os = "linux")
 ))]
 fn enforce_single_instance_release() -> Option<single_instance::SingleInstance> {
-    match single_instance::SingleInstance::new("com.vinaywinai.databeam.release") {
+    let instance_name = if app_update::managed_by_flatpak() {
+        "com.vinaywinai.databeam.flatpak"
+    } else {
+        "com.vinaywinai.databeam.release"
+    };
+    match single_instance::SingleInstance::new(instance_name) {
         Ok(instance) => {
             if !instance.is_single() {
                 #[cfg(windows)]
@@ -6886,6 +6913,9 @@ fn main() -> eframe::Result {
             .with_drag_and_drop(true),
         ..Default::default()
     };
+
+    #[cfg(target_os = "linux")]
+    let options = linux_desktop::configure(options);
 
     eframe::run_native(
         "DataBeam",
@@ -7030,7 +7060,7 @@ mod parse_tests {
         assert!(app.tray_action_rx.is_none());
     }
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     #[test]
     fn non_windows_dock_or_taskbar_restore_resumes_ui_and_keeps_transfer() {
         let mut app = DataBeamApp::default();

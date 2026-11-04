@@ -1335,7 +1335,7 @@ dependencies = [
 
 [[package]]
 name = "databeam"
-version = "0.7.2"
+version = "0.7.3-linux-test.1"
 dependencies = [
  "dirs",
  "eframe",
@@ -1362,6 +1362,7 @@ dependencies = [
  "tray-icon",
  "which",
  "windows-sys 0.60.2",
+ "winit",
  "winres",
  "zip",
 ]
