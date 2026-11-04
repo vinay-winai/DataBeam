@@ -24,7 +24,7 @@
 
 ## Common UI Issues
 
-- File drag-and-drop currently does not work on Linux Wayland. Use the file / folder buttons instead. In the meantime, you could try launching DataBeam with `env -u WAYLAND_DISPLAY databeam`.
+- On Linux Wayland, if file drag-and-drop does not work, launch DataBeam with `env -u WAYLAND_DISPLAY databeam` to use XWayland. This workaround has been confirmed working. You can also use the file / folder buttons.
 - If app width is small , UI persentation may not be desirable. In that case , please resize the app window.
 
 ## Suggestions

@@ -24,5 +24,8 @@ Validation: actionlint passed for both workflows; website download checks cover
 ARM64 user agents, CPU client hints, x64, Windows, macOS, missing ARM64 packages,
 and both asset orders (12 scenarios passed). Six updater tests passed, with the
 public-release download test left ignored. Cargo-bundle 0.12.0's published AppImage packager supports
-aarch64. Linux ARM64 binaries and GUI behavior still need the native release run
-and on-device testing; this Windows workspace does not provide that environment.
+aarch64. The v0.7.1 native ARM64 release build passed, and the published Debian
+package architecture/version, AppImage architecture, and checksums were verified.
+On November 4, the maintainer reported Linux and macOS working on their devices
+and confirmed Linux Wayland drag-and-drop works through XWayland with
+`env -u WAYLAND_DISPLAY databeam`.
