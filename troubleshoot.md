@@ -10,6 +10,13 @@
 [Release notes](https://github.com/vinay-winai/DataBeam/releases/tag/v0.7.1)
 
 # Troubleshooting DataBeam
+
+## Updating older versions
+
+**v0.6.8 and earlier:** [download the latest DataBeam from the website](https://vinay-winai.github.io/DataBeam/) and install it manually once. The v0.6.7/v0.6.8 updater cannot find the new version-free download filenames. **v0.7.0 and newer** can update through the app's Update button.
+
+## Transfer issues
+
 - If transfers are failing check if vpn or dns is causing this.
 
 ## Croc / EazySendme Transfer Issues
@@ -42,7 +49,7 @@
 
 - Add automatic update checks and one-click installation.
 
-v0.6.6 users: install v0.6.7 or newer manually once to enable app updates.
+v0.6.8 and earlier users: [download and install the latest version manually](https://vinay-winai.github.io/DataBeam/) once to use current app updates.
 
 [Release notes](https://github.com/vinay-winai/DataBeam/releases/tag/v0.6.7)
 
