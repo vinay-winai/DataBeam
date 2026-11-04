@@ -2,6 +2,7 @@ const API_URL = "https://api.github.com/repos/vinay-winai/DataBeam/releases/late
 
 let gReleaseData = null;
 let gUserOS = "unknown";
+let gUserArch = "x64";
 let gAutoDownloadUrl = null;
 
 async function fetchLatestRelease() {
@@ -37,12 +38,23 @@ function detectOS() {
     return "unknown";
 }
 
-function setupOSLinks() {
+async function setupOSLinks() {
     gUserOS = detectOS();
+    gUserArch = /aarch64|arm64/i.test(window.navigator.userAgent) ? "arm64" : "x64";
     
     // Set fallback GitHub page link if JS fails or API fails
     const mainBtn = document.getElementById("download-btn");
     mainBtn.href = "https://github.com/vinay-winai/DataBeam/releases/latest";
+    // Some browsers hide the CPU in the user agent. Use client hints when
+    // available; explicit architecture links remain available in all browsers.
+    if (gUserOS === "linux" && window.navigator.userAgentData?.getHighEntropyValues) {
+        try {
+            const cpu = await window.navigator.userAgentData.getHighEntropyValues(["architecture", "bitness"]);
+            if (cpu.architecture === "arm" && cpu.bitness === "64") gUserArch = "arm64";
+            else if (cpu.architecture === "x86" && cpu.bitness === "64") gUserArch = "x64";
+        } catch (_) { /* Keep the user-agent/default choice. */ }
+    }
+    updateDownloadLinks();
 }
 
 function updateDownloadLinks() {
@@ -51,8 +63,7 @@ function updateDownloadLinks() {
     let windowsAsset = null;
     let macUnivAsset = null;
     let macAarchAsset = null;
-    let linuxAppAsset = null;
-    let linuxDebAsset = null;
+    const linuxAssets = { x64: { app: null, deb: null }, arm64: { app: null, deb: null } };
 
     gReleaseData.assets.forEach(asset => {
         const name = asset.name.toLowerCase();
@@ -65,12 +76,15 @@ function updateDownloadLinks() {
             if (!macAarchAsset || name === "databeam_macos-aarch64.dmg") macAarchAsset = asset.browser_download_url;
         } else if (name.includes("mac") || name.includes("darwin")) {
             if (!macUnivAsset) macUnivAsset = asset.browser_download_url;
-        } else if (name.endsWith(".appimage")) {
-            if (!linuxAppAsset || name === "databeam_linux-x64.appimage") linuxAppAsset = asset.browser_download_url;
-        } else if (name.endsWith(".deb")) {
-            if (!linuxDebAsset || name === "databeam_linux-x64.deb") linuxDebAsset = asset.browser_download_url;
-        } else if (name.includes("linux")) {
-             if (!linuxAppAsset) linuxAppAsset = asset.browser_download_url;
+        } else {
+            const arch = name.includes("linux-arm64") ? "arm64" : name.includes("linux-x64") ? "x64" : null;
+            const kind = name.endsWith(".appimage") ? "app" : name.endsWith(".deb") ? "deb" : null;
+            if (arch && kind) {
+                const extension = kind === "app" ? "appimage" : "deb";
+                if (!linuxAssets[arch][kind] || name === `databeam_linux-${arch}.${extension}`) {
+                    linuxAssets[arch][kind] = asset.browser_download_url;
+                }
+            }
         }
     });
 
@@ -79,7 +93,10 @@ function updateDownloadLinks() {
 
     document.getElementById("link-windows").href = windowsAsset || releaseUrl;
     document.getElementById("link-mac").href = macUnivAsset || macAarchAsset || releaseUrl;
-    document.getElementById("link-linux").href = linuxAppAsset || linuxDebAsset || releaseUrl;
+    document.getElementById("link-linux").href = linuxAssets.x64.app || linuxAssets.x64.deb || releaseUrl;
+    document.getElementById("link-linux-arm64").href = linuxAssets.arm64.app || linuxAssets.arm64.deb || releaseUrl;
+    const linuxAppAsset = linuxAssets[gUserArch].app;
+    const linuxDebAsset = linuxAssets[gUserArch].deb;
 
     const mainBtn = document.getElementById("download-btn");
     const statusText = document.getElementById("download-status");
@@ -106,8 +123,9 @@ function updateDownloadLinks() {
         }
     } else if (gUserOS === "linux" && (linuxAppAsset || linuxDebAsset)) {
         autoUrl = linuxAppAsset || linuxDebAsset;
-        statusText.textContent = `Latest Release: ${gReleaseData.tag_name} (Linux)`;
-        btnText.textContent = autoUrl === linuxAppAsset ? "Download AppImage" : "Download Linux dist";
+        const archLabel = gUserArch === "arm64" ? "ARM64" : "x64";
+        statusText.textContent = `Latest Release: ${gReleaseData.tag_name} (Linux ${archLabel})`;
+        btnText.textContent = autoUrl === linuxAppAsset ? `Download Linux ${archLabel} AppImage` : `Download Linux ${archLabel} .deb`;
         if (secStatus && linuxDebAsset && autoUrl !== linuxDebAsset) {
             secStatus.style.display = "block";
             secStatus.innerHTML = `Also available: <a href="${linuxDebAsset}" style="color: #ff8c00; text-decoration: underline;">Download .deb package</a>`;

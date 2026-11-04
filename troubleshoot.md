@@ -2,6 +2,29 @@
 
 [Download DataBeam](https://vinay-winai.github.io/DataBeam/)
 
+## v0.7.1 released
+
+- Add Linux ARM64 downloads and automatic update support.
+- Use version-free download filenames and remove the Update button dot.
+
+[Release notes](https://github.com/vinay-winai/DataBeam/releases/tag/v0.7.1)
+
+# Troubleshooting DataBeam
+- If transfers are failing check if vpn or dns is causing this.
+
+## Croc / EazySendme Transfer Issues
+- If transfer does not start and logs show any errors like (including not limited to) room not found or room unavailable/room full/peer left, sender should **retry with a different Code Phrase**. Avoid using simple codes like 1234567 or aaaaaaa.
+
+## Common UI Issues
+
+- File drag-and-drop currently does not work on Linux Wayland. Use the file / folder buttons instead. In the meantime, you could try launching DataBeam with `env -u WAYLAND_DISPLAY databeam`.
+- If app width is small , UI persentation may not be desirable. In that case , please resize the app window.
+
+## Suggestions
+- Use Standalone Sendme mode for sensitive data transfers.
+
+# Previous releases
+
 ## v0.7.0 released
 
 - Improve preparation progress and smooth speed / ETA.
@@ -28,17 +51,3 @@ v0.6.6 users: install v0.6.7 or newer manually once to enable app updates.
 - Fix Croc relay connection issues and update security dependencies.
 
 [Release notes](https://github.com/vinay-winai/DataBeam/releases/tag/v0.6.6)
-
-# Troubleshooting DataBeam
-- If transfers are failing check if vpn or dns is causing this.
-
-## Croc / EazySendme Transfer Issues
-- If transfer does not start and logs show any errors like (including not limited to) room not found or room unavailable/room full/peer left, sender should **retry with a different Code Phrase**. Avoid using simple codes like 1234567 or aaaaaaa.
-
-## Common UI Issues
-
-- File drag-and-drop currently does not work on Linux Wayland. Use the file / folder buttons instead. In the meantime, you could try launching DataBeam with `env -u WAYLAND_DISPLAY databeam`.
-- If app width is small , UI persentation may not be desirable. In that case , please resize the app window.
-
-## Suggestions
-- Use Standalone Sendme mode for sensitive data transfers.

@@ -66,6 +66,8 @@ fn select_update(
         ("macos", "x86_64", _) => ("macos-universal.dmg", PackageKind::MacDmg),
         ("linux", "x86_64", true) => ("linux-x64.AppImage", PackageKind::LinuxAppImage),
         ("linux", "x86_64", false) => ("linux-x64.deb", PackageKind::LinuxDeb),
+        ("linux", "aarch64", true) => ("linux-arm64.AppImage", PackageKind::LinuxAppImage),
+        ("linux", "aarch64", false) => ("linux-arm64.deb", PackageKind::LinuxDeb),
         _ => return Err("Automatic updates are unavailable for this platform.".into()),
     };
     let stable_name = format!("databeam_{suffix}");
@@ -366,6 +368,8 @@ mod tests {
                 "macos-universal.dmg",
                 "linux-x64.AppImage",
                 "linux-x64.deb",
+                "linux-arm64.AppImage",
+                "linux-arm64.deb",
             ]
             .into_iter()
             .map(|suffix| format!("databeam_{tag}_{suffix}"))
@@ -410,6 +414,8 @@ mod tests {
             ("macos", "x86_64", false, "macos-universal.dmg"),
             ("linux", "x86_64", true, "linux-x64.AppImage"),
             ("linux", "x86_64", false, "linux-x64.deb"),
+            ("linux", "aarch64", true, "linux-arm64.AppImage"),
+            ("linux", "aarch64", false, "linux-arm64.deb"),
         ] {
             for versioned in [true, false] {
                 let mut available = release("v0.7.0");
@@ -431,6 +437,13 @@ mod tests {
                 assert_eq!(selected.name, expected);
             }
         }
+    }
+
+    #[test]
+    fn linux_arm64_never_selects_an_x64_package() {
+        let mut available = release("v0.7.1");
+        available.assets.retain(|asset| !asset.name.contains("linux-arm64"));
+        assert!(select_update(available, "0.7.0", "linux", "aarch64", true).is_err());
     }
 
     #[test]

@@ -15,6 +15,7 @@ on:
           - macos-universal
           - windows-x64
           - linux-x64
+          - linux-arm64
           - macos-linux
           - all
       tag:
@@ -84,11 +85,8 @@ jobs:
       - name: Package Windows x64 executable
         shell: pwsh
         run: |
-          $version = "${env:RELEASE_TAG}".TrimStart('v')
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item "target/release/databeam.exe" "dist/databeam_windows-x64.exe"
-          # Older installed updaters require this exact versioned asset name.
-          Copy-Item "dist/databeam_windows-x64.exe" "dist/databeam_v${version}_windows-x64.exe"
           $package = "target/windows-release-package"
           New-Item -ItemType Directory -Force -Path "$package/LICENSES" | Out-Null
           Copy-Item "target/release/databeam.exe" "$package/databeam.exe"
@@ -159,7 +157,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="${RELEASE_TAG#v}"
           mkdir -p dist
           cargo bundle --release --features release-single-instance --target aarch64-apple-darwin --format osx --binary-path target/aarch64-apple-darwin/release/databeam
 
@@ -188,9 +185,6 @@ jobs:
 
           dmg_path_univ="dist/databeam_macos-universal.dmg"
           hdiutil create -volname "DataBeam" -srcfolder "${app_path}" -ov -format UDZO "${dmg_path_univ}"
-          # Compatibility copies for updaters shipped before v0.7.0.
-          cp "${dmg_path_aarch}" "dist/databeam_v${version}_macos-aarch64.dmg"
-          cp "${dmg_path_univ}" "dist/databeam_v${version}_macos-universal.dmg"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v6
@@ -199,10 +193,14 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  build-linux-x64:
-    name: Build Assets (linux-x64)
-    if: github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == 'linux-x64' || github.event.inputs.target == 'macos-linux'
-    runs-on: ubuntu-22.04
+  build-linux:
+    name: Build Assets (linux-${{ matrix.arch }})
+    if: github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == 'linux-x64' || github.event.inputs.target == 'linux-arm64' || github.event.inputs.target == 'macos-linux'
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(github.event.inputs.target == 'linux-x64' && '["x64"]' || github.event.inputs.target == 'linux-arm64' && '["arm64"]' || '["x64", "arm64"]') }}
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-22.04-arm' || 'ubuntu-22.04' }}
 
     steps:
       - name: Checkout
@@ -228,7 +226,7 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Build patched Croc engine
-        run: python scripts/prepare_croc.py --target x86_64-unknown-linux-gnu
+        run: python scripts/prepare_croc.py --target ${{ matrix.arch == 'arm64' && 'aarch64-unknown-linux-gnu' || 'x86_64-unknown-linux-gnu' }}
 
       - name: Install Linux build dependencies
         run: |
@@ -265,11 +263,10 @@ jobs:
       - name: Verify non-Windows platform policy
         run: cargo test --locked --bin databeam non_windows_
 
-      - name: Package Linux x64 deb and AppImage
+      - name: Package Linux ${{ matrix.arch }} deb and AppImage
         shell: bash
         run: |
           set -euo pipefail
-          version="${RELEASE_TAG#v}"
           mkdir -p dist
 
           cargo bundle --release --features release-single-instance --format deb --binary-path target/release/databeam
@@ -279,7 +276,7 @@ jobs:
             find target/release -maxdepth 5 -type f | sort
             exit 1
           fi
-          cp "${deb_path}" "dist/databeam_linux-x64.deb"
+          cp "${deb_path}" "dist/databeam_linux-${{ matrix.arch }}.deb"
 
           cargo bundle --release --features release-single-instance --format appimage --binary-path target/release/databeam
           appimage_path="$(find target/release/bundle/appimage -maxdepth 1 -name '*.AppImage' -print -quit)"
@@ -288,15 +285,21 @@ jobs:
             find target/release -maxdepth 6 -type f | sort
             exit 1
           fi
-          cp "${appimage_path}" "dist/databeam_linux-x64.AppImage"
-          # Compatibility copies for updaters shipped before v0.7.0.
-          cp "dist/databeam_linux-x64.deb" "dist/databeam_v${version}_linux-x64.deb"
-          cp "dist/databeam_linux-x64.AppImage" "dist/databeam_v${version}_linux-x64.AppImage"
+          cp "${appimage_path}" "dist/databeam_linux-${{ matrix.arch }}.AppImage"
+
+      - name: Verify Linux package architecture
+        shell: bash
+        run: |
+          expected="${{ matrix.arch == 'arm64' && 'arm64' || 'amd64' }}"
+          test "$(dpkg-deb --field 'dist/databeam_linux-${{ matrix.arch }}.deb' Architecture)" = "$expected"
+
+      - name: Verify updater asset selection
+        run: cargo test --locked --bin databeam correct_assets_are_selected_on_all_shipping_platforms
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v6
         with:
-          name: release-linux-x64
+          name: release-linux-${{ matrix.arch }}
           path: dist/*
           if-no-files-found: error
 
@@ -306,7 +309,7 @@ jobs:
     needs:
       - build-windows-x64
       - build-macos-universal
-      - build-linux-x64
+      - build-linux
     if: |
       always() &&
       !contains(needs.*.result, 'failure') &&
