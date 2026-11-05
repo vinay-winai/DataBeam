@@ -2,7 +2,7 @@ const API_URL = "https://api.github.com/repos/vinay-winai/DataBeam/releases/late
 
 let gReleaseData = null;
 let gUserOS = "unknown";
-let gUserArch = "x64";
+let gUserArch = null;
 let gAutoDownloadUrl = null;
 
 async function fetchLatestRelease() {
@@ -28,7 +28,9 @@ async function fetchLatestRelease() {
 
 function detectOS() {
     const userAgent = window.navigator.userAgent.toLowerCase();
-    if (userAgent.includes("win")) {
+    if (userAgent.includes("android") || window.navigator.userAgentData?.platform === "Android") {
+        return "android";
+    } else if (userAgent.includes("win")) {
         return "windows";
     } else if (userAgent.includes("mac")) {
         return "mac";
@@ -38,21 +40,37 @@ function detectOS() {
     return "unknown";
 }
 
+function detectUserAgentArch(userAgent) {
+    if (/\b(aarch64|arm64)\b/i.test(userAgent)) return "arm64";
+    // Chromium freezes Linux's UA/platform to x86_64 even on other CPUs.
+    // Use its architecture hints instead; a denied hint needs a manual choice.
+    if (/(Chrome|Chromium|Edg|OPR)\//i.test(userAgent)) return null;
+    if (/\b(x86_64|amd64|x64)\b/i.test(userAgent)) return "x64";
+    return null;
+}
+
+function detectHintArch(cpu) {
+    if (cpu.bitness !== "64") return null;
+    const architecture = (cpu.architecture || "").toLowerCase();
+    if (["arm", "arm64", "aarch64"].includes(architecture)) return "arm64";
+    if (["x86", "x86_64", "amd64", "x64"].includes(architecture)) return "x64";
+    return null;
+}
+
 async function setupOSLinks() {
     gUserOS = detectOS();
-    gUserArch = /aarch64|arm64/i.test(window.navigator.userAgent) ? "arm64" : "x64";
+    gUserArch = detectUserAgentArch(window.navigator.userAgent);
     
     // Set fallback GitHub page link if JS fails or API fails
     const mainBtn = document.getElementById("download-btn");
     mainBtn.href = "https://github.com/vinay-winai/DataBeam/releases/latest";
     // Some browsers hide the CPU in the user agent. Use client hints when
     // available; explicit architecture links remain available in all browsers.
-    if (gUserOS === "linux" && window.navigator.userAgentData?.getHighEntropyValues) {
+    if (["linux", "android"].includes(gUserOS) && window.navigator.userAgentData?.getHighEntropyValues) {
         try {
             const cpu = await window.navigator.userAgentData.getHighEntropyValues(["architecture", "bitness"]);
-            if (cpu.architecture === "arm" && cpu.bitness === "64") gUserArch = "arm64";
-            else if (cpu.architecture === "x86" && cpu.bitness === "64") gUserArch = "x64";
-        } catch (_) { /* Keep the user-agent/default choice. */ }
+            gUserArch = detectHintArch(cpu);
+        } catch (_) { /* Keep only a usable, explicit user-agent architecture. */ }
     }
     updateDownloadLinks();
 }
@@ -119,12 +137,25 @@ function updateDownloadLinks() {
             secStatus.style.display = "block";
             secStatus.innerHTML = `On Apple Silicon? <a href="${macAarchAsset}" style="color: #ff8c00; text-decoration: underline;">Get aarch64 build for smaller app size</a>`;
         }
-    } else if (gUserOS === "linux" && linuxAppAsset) {
-        autoUrl = linuxAppAsset;
-        const archLabel = gUserArch === "arm64" ? "AArch64" : "x64";
-        statusText.textContent = `Latest Release: ${gReleaseData.tag_name} (Linux ${archLabel})`;
-        btnText.textContent = `Download Linux ${archLabel} AppImage`;
-
+    } else if (["linux", "android"].includes(gUserOS)) {
+        if (linuxAppAsset) {
+            autoUrl = linuxAppAsset;
+            const archLabel = gUserArch === "arm64" ? "AArch64" : "x64";
+            statusText.textContent = `Latest Release: ${gReleaseData.tag_name} (Linux ${archLabel})`;
+            btnText.textContent = `Download Linux ${archLabel} AppImage`;
+        } else if (!gUserArch) {
+            autoUrl = "#platform-downloads";
+            statusText.textContent = "Choose your Linux architecture below.";
+            btnText.textContent = "Choose Linux architecture";
+        } else {
+            autoUrl = releaseUrl;
+            statusText.textContent = `Latest Release: ${gReleaseData.tag_name} (Linux)`;
+            btnText.textContent = "View Linux downloads";
+        }
+        if (gUserOS === "android" && secStatus) {
+            secStatus.style.display = "block";
+            secStatus.textContent = "For DroidDeck or another Linux environment on Android.";
+        }
     } else {
         autoUrl = releaseUrl; // fallback
         statusText.textContent = `Latest Release: ${gReleaseData.tag_name} (Cross-Platform)`;
