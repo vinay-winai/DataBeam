@@ -249,8 +249,7 @@ jobs:
             libxrandr-dev \
             mesa-common-dev \
             patchelf \
-            squashfs-tools \
-            flatpak flatpak-builder desktop-file-utils appstream-util dbus
+            squashfs-tools
 
       - name: Update Cargo.toml version
         shell: bash
@@ -284,12 +283,6 @@ jobs:
           fi
           python scripts/bundle_appimage_runtime.py "${appimage_path}"
           cp "${appimage_path}" "dist/databeam_linux-${{ matrix.arch }}.AppImage"
-
-      - name: Package standalone Flatpak without automatic updates
-        run: |
-          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-          flatpak install --user -y --noninteractive flathub org.freedesktop.Platform//25.08 org.freedesktop.Sdk//25.08
-          dbus-run-session -- python scripts/package_flatpak.py --arch '${{ matrix.arch == 'arm64' && 'aarch64' || 'x86_64' }}' --branch stable
 
       - name: Verify updater asset selection
         run: cargo test --locked --bin databeam correct_assets_are_selected_on_all_shipping_platforms

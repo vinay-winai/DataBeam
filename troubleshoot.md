@@ -6,7 +6,7 @@
 
 - Fix macOS close-to-tray, Dock reopening and the tray logo.
 - Fix Linux tray/Dock reopening and updater restarts; include AppImage XWayland libraries.
-- Add standalone Flatpaks labelled `no-auto-update`; discontinue DEB packages.
+- Use AppImage for Linux downloads; DEB and Flatpak packages are discontinued.
 
 [Release notes](https://github.com/vinay-winai/DataBeam/releases/tag/v0.7.3)
 
@@ -16,7 +16,7 @@
 
 **v0.6.8 and earlier:** [download the latest DataBeam from the website](https://vinay-winai.github.io/DataBeam/) and install it manually once. The v0.6.7/v0.6.8 updater cannot find the new version-free download filenames. **v0.7.0 and newer** can update through the app's Update button.
 
-**Linux DEB installations:** switch manually to the AppImage from the website; DEB updates are discontinued. Standalone Flatpak bundles have no automatic updates: install the newer downloaded bundle with `flatpak install --user ./databeam_linux-x64_no-auto-update.flatpak` (or the ARM64 file).
+**Linux DEB or Flatpak installations:** switch manually to the AppImage from the website; these packages are discontinued.
 
 If an older Linux AppImage returns to the old version after updating, download and install v0.7.3 manually once. The updater restart fix then applies to future updates.
 

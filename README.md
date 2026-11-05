@@ -31,7 +31,7 @@ You can:
 - live Direct/Relay transfer mode on Sendme and EasySendMe receivers
 - scrollable, selectable Croc received-text panel with Copy text and an expanded view; long messages preserve their original line breaks and whitespace
 - Troubleshoot button shows an unread badge when the online guide changes; opening the guide clears it, and read status is remembered across restarts
-- Update button checks for stable DataBeam releases at launch and every three hours, shows a badge for newer versions, and downloads, verifies, installs, and restarts the app when clicked. Portable Windows EXEs, installed macOS app bundles in writable folders, and Linux AppImages update in place; standalone Flatpak bundles are updated manually. Linux downloads are AppImage and Flatpak; DEB packages are no longer published.
+- Update button checks for stable DataBeam releases at launch and every three hours, shows a badge for newer versions, and downloads, verifies, installs, and restarts the app when clicked. Portable Windows EXEs, installed macOS app bundles in writable folders, and Linux AppImages update in place. Linux downloads use AppImage only.
 
 The embedded Sendme engine includes the official 0.37.1 security fixes and
 receiver route reporting. See the [upstream synchronization notes](investigations/sendme-upstream-sync.md).

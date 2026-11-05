@@ -1,9 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=DataBeam
-Comment=Send files and text with croc and sendme
-Exec=databeam
-Icon=com.vinaywinai.databeam
-Terminal=false
-Categories=Network;FileTransfer;
-StartupWMClass=DataBeam
