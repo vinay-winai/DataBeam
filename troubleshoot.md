@@ -1,5 +1,7 @@
 # News
 
+DataBeam is verified running on Android via DroidDeck with the AArch64/ARM64 build.
+
 [Download DataBeam](https://vinay-winai.github.io/DataBeam/)
 
 ## v0.7.3 released
@@ -34,7 +36,8 @@ If an older Linux AppImage returns to the old version after updating, download a
 - If app width is small , UI persentation may not be desirable. In that case , please resize the app window.
 
 ## Suggestions
-- Use Standalone Sendme mode for sensitive data transfers.
+
+- EazySendme/Sendme recommended for sensitive data transfers.
 
 # Previous releases
 
