@@ -2,18 +2,23 @@
 
 [Download DataBeam](https://vinay-winai.github.io/DataBeam/)
 
-## v0.7.2 - test released
+## v0.7.3 released
 
-- Restore macOS/Linux system tray controls and fix Windows EXE reopening from the tray.
-- Improve tray startup and Dock/taskbar restoration.
+- Fix macOS close-to-tray, Dock reopening and the tray logo.
+- Fix Linux tray/Dock reopening and updater restarts; include AppImage XWayland libraries.
+- Add standalone Flatpaks labelled `no-auto-update`; discontinue DEB packages.
 
-[Release notes](https://github.com/vinay-winai/DataBeam/releases/tag/v0.7.2)
+[Release notes](https://github.com/vinay-winai/DataBeam/releases/tag/v0.7.3)
 
 # Troubleshooting DataBeam
 
 ## Updating older versions
 
 **v0.6.8 and earlier:** [download the latest DataBeam from the website](https://vinay-winai.github.io/DataBeam/) and install it manually once. The v0.6.7/v0.6.8 updater cannot find the new version-free download filenames. **v0.7.0 and newer** can update through the app's Update button.
+
+**Linux DEB installations:** switch manually to the AppImage from the website; DEB updates are discontinued. Standalone Flatpak bundles have no automatic updates: install the newer downloaded bundle with `flatpak install --user ./databeam_linux-x64_no-auto-update.flatpak` (or the ARM64 file).
+
+If an older Linux AppImage returns to the old version after updating, download and install v0.7.3 manually once. The updater restart fix then applies to future updates.
 
 ## Transfer issues
 
@@ -32,6 +37,13 @@
 - Use Standalone Sendme mode for sensitive data transfers.
 
 # Previous releases
+
+## v0.7.2 - test released
+
+- Restore macOS/Linux system tray controls and fix Windows EXE reopening from the tray.
+- Improve tray startup and Dock/taskbar restoration.
+
+[Release notes](https://github.com/vinay-winai/DataBeam/releases/tag/v0.7.2)
 
 ## v0.7.1 released
 
