@@ -3475,6 +3475,11 @@ impl DataBeamApp {
             self.eazy_retry_count = 0;
             self.eazy_next_retry_time = None;
         }
+        if self.selected_tool == SelectedTool::Sendme {
+            if let Some(ticket) = normalize_sendme_ticket(&self.receive_code) {
+                self.receive_code = ticket;
+            }
+        }
         if self.receive_code.trim().is_empty() {
             self.show_toast("Enter a code or ticket".to_string(), WARNING);
             return;
