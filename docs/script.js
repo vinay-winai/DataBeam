@@ -121,7 +121,7 @@ function updateDownloadLinks() {
         }
     } else if (gUserOS === "linux" && linuxAppAsset) {
         autoUrl = linuxAppAsset;
-        const archLabel = gUserArch === "arm64" ? "ARM64" : "x64";
+        const archLabel = gUserArch === "arm64" ? "AArch64" : "x64";
         statusText.textContent = `Latest Release: ${gReleaseData.tag_name} (Linux ${archLabel})`;
         btnText.textContent = `Download Linux ${archLabel} AppImage`;
 
