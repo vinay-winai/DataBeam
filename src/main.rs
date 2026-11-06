@@ -179,6 +179,8 @@ struct UserSettings {
     #[serde(default = "default_sendme_one_shot")]
     sendme_one_shot: bool,
     #[serde(default)]
+    native_engines_always_expanded: bool,
+    #[serde(default)]
     eazysendme_custom_code: String,
     #[serde(default = "default_true")]
     eazysendme_auto_retry: bool,
@@ -329,6 +331,7 @@ struct DataBeamApp {
     last_done_speed_sample: Option<(f64, u64)>,
     initialized_once: bool,
     native_engines_expanded: bool,
+    native_engines_always_expanded: bool,
     /// Persisted map of croc_code → sendme_ticket for local-blob retry.
     eazysendme_code_ticket_map: HashMap<String, EazyCacheEntry>,
 
@@ -472,6 +475,7 @@ impl Default for DataBeamApp {
             croc_update_last_check_at: None,
             croc_update_startup_check_done: false,
             native_engines_expanded: false,
+            native_engines_always_expanded: false,
             eazysendme_code_ticket_map: HashMap::new(),
             cleanup_scan_rx: None,
             cleanup_targets: Vec::new(),
@@ -674,6 +678,8 @@ impl DataBeamApp {
             .map(PathBuf::from)
             .filter(|p| !p.as_os_str().is_empty());
         self.sendme_one_shot = settings.sendme_one_shot;
+        self.native_engines_always_expanded = settings.native_engines_always_expanded;
+        self.native_engines_expanded = self.native_engines_always_expanded;
         self.eazysendme_custom_code = settings.eazysendme_custom_code;
         self.eazysendme_auto_retry = true; // Always true on launch
         self.croc_custom_code = settings.croc_custom_code;
@@ -708,6 +714,7 @@ impl DataBeamApp {
                 .as_ref()
                 .map(|p| p.to_string_lossy().to_string()),
             sendme_one_shot: self.sendme_one_shot,
+            native_engines_always_expanded: self.native_engines_always_expanded,
             eazysendme_custom_code: self.eazysendme_custom_code.clone(),
             eazysendme_auto_retry: self.eazysendme_auto_retry,
             croc_custom_code: self.croc_custom_code.clone(),
@@ -1540,10 +1547,10 @@ impl DataBeamApp {
         }
 
         // "File already exists" should be intercepted to show the overwrite modal.
-        let is_file_exists_error = e.to_lowercase().contains("already exists")
+        let is_file_exists_error = !e.starts_with("conflict-detected") && (e.to_lowercase().contains("already exists")
             || e.to_lowercase().contains("file exists")
             || e.to_lowercase().contains("os error 17") // EEXIST on Unix
-            || e.to_lowercase().contains("os error 183"); // ERROR_ALREADY_EXISTS on Windows
+            || e.to_lowercase().contains("os error 183")); // ERROR_ALREADY_EXISTS on Windows
 
         // NOTE: failure-path elapsed is shown on the Failed card for consistency;
         // the original request was the Elapsed label in the Completed body row
@@ -1551,7 +1558,10 @@ impl DataBeamApp {
         if is_file_exists_error {
             self.eazy_retry_count = 0;
             if self.selected_tool == SelectedTool::Croc {
-                self.transfer_state = TransferState::Failed("The file/folder you intended to download has the same name as another item at the destination. Rename that item and try a new transfer.".to_string());
+                let item = ["mkdir ", "open "].iter().find_map(|prefix| {
+                    e.strip_prefix(prefix)?.rsplit_once(": ").map(|(path, _)| path)
+                });
+                self.transfer_state = TransferState::Failed(croc_conflict_message(item));
             }
             // NOTE: freeze end-time here too so the failure-path elapsed is
             // accurate on these early-return paths (same note as above).
@@ -1559,9 +1569,9 @@ impl DataBeamApp {
             return;
         }
 
-        if e == "conflict-detected" {
+        if e == "conflict-detected" || e.starts_with("conflict-detected: ") {
             self.eazy_retry_count = 0;
-            self.transfer_state = TransferState::Failed("The file/folder you intended to download has the same name as another item at the destination. Rename that item and try a new transfer.".to_string());
+            self.transfer_state = TransferState::Failed(croc_conflict_message(e.strip_prefix("conflict-detected: ")));
             // NOTE: same as above — freeze end-time for an accurate
             // failure-path elapsed on this early-return path.
             self.transfer_end_time = Some(self.animation_time);
@@ -4422,24 +4432,51 @@ impl DataBeamApp {
 
         // ── Standalone engines collapsible ──────────────────────────
         {
-            let arrow = if self.native_engines_expanded {
-                "▾"
-            } else {
-                "▸"
-            };
-            let header_resp = ui.add(
-                egui::Button::new(
-                    RichText::new(format!("{} Standalone Engines", arrow))
-                        .size(13.0)
-                        .color(TEXT_SECONDARY),
-                )
+            egui::Frame::NONE
                 .fill(BG_CARD)
-                .min_size(Vec2::new(ui.available_width(), 36.0))
-                .corner_radius(egui::epaint::CornerRadius::same(6u8)),
-            );
-            if header_resp.clicked() {
-                self.native_engines_expanded = !self.native_engines_expanded;
-            }
+                .stroke(egui::Stroke::new(1.0, BORDER_SUBTLE))
+                .corner_radius(egui::epaint::CornerRadius::same(6u8))
+                .inner_margin(egui::Margin::symmetric(8, 4))
+                .show(ui, |ui| {
+                    ui.set_height(28.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if toggle_button_sized(
+                            ui, "Always expand", self.native_engines_always_expanded,
+                            self.engine_color(), Vec2::new(118.0, 28.0),
+                        ).clicked() {
+                            self.native_engines_always_expanded = !self.native_engines_always_expanded;
+                            if self.native_engines_always_expanded {
+                                self.native_engines_expanded = true;
+                            }
+                            self.persist_user_settings();
+                        }
+                        let (rect, response) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), 28.0), egui::Sense::click(),
+                        );
+                        response.widget_info(|| egui::WidgetInfo::selected(
+                            egui::WidgetType::CollapsingHeader,
+                            !self.native_engines_always_expanded,
+                            self.native_engines_expanded, "Standalone Engines",
+                        ));
+                        let center = egui::pos2(rect.left() + 8.0, rect.center().y);
+                        let direction = if self.native_engines_expanded { -1.0 } else { 1.0 };
+                        ui.painter().add(egui::Shape::convex_polygon(vec![
+                            center + egui::vec2(-5.0, -3.0 * direction),
+                            center + egui::vec2(5.0, -3.0 * direction),
+                            center + egui::vec2(0.0, 4.0 * direction),
+                        ], TEXT_SECONDARY, egui::Stroke::NONE));
+                        ui.painter().text(
+                            egui::pos2(rect.left() + 24.0, rect.center().y),
+                            egui::Align2::LEFT_CENTER, "Standalone Engines",
+                            egui::FontId::proportional(13.0), TEXT_SECONDARY,
+                        );
+                        if self.native_engines_always_expanded {
+                            response.on_hover_text("Turn off Always expand to collapse.");
+                        } else if response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            self.native_engines_expanded = !self.native_engines_expanded;
+                        }
+                    });
+                });
 
             if self.native_engines_expanded {
                 ui.add_space(3.0);
@@ -4497,7 +4534,7 @@ impl DataBeamApp {
 
         let accent = self.engine_color();
         let total_w = ui.available_width();
-        let btn_w = (total_w - 8.0) / 2.0;
+        let btn_w = (total_w - ui.spacing().item_spacing.x) / 2.0;
 
         ui.horizontal(|ui| {
             if accent_button_sized(ui, "📤 Send", accent, Vec2::new(btn_w, 42.0)).clicked() {
@@ -4509,57 +4546,47 @@ impl DataBeamApp {
         });
         ui.add_space(8.0);
 
-        ui.horizontal(|ui| {
-            let sendme_avail = sendme_status.as_ref().map(|s| s.available).unwrap_or(false);
-            let broadcast_btn = ui.add_enabled(
-                sendme_avail,
-                egui::Button::new(RichText::new("📡 Broadcast").size(12.0).color(
-                    if sendme_avail {
-                        Color32::BLACK
-                    } else {
-                        TEXT_MUTED
-                    },
-                ))
-                .min_size(Vec2::new(btn_w, 42.0))
-                .fill(if sendme_avail {
-                    SENDME_COLOR
-                } else {
-                    Color32::from_rgb(50, 50, 55)
-                })
-                .corner_radius(egui::epaint::CornerRadius::same(8u8)),
-            );
-            if broadcast_btn.clicked() && sendme_avail {
+        let idle = self.transfer_state != TransferState::Running;
+        let croc_avail = croc_status.as_ref().map(|s| s.available).unwrap_or(false);
+        egui::Frame::NONE
+            .fill(BG_CARD)
+            .stroke(egui::Stroke::new(1.0, BORDER_SUBTLE))
+            .corner_radius(BUTTON_ROUNDING)
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.set_min_width((total_w - 26.0).max(0.0));
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("🐊 Croc").strong().color(CROC_COLOR));
+                });
+                ui.add_space(4.0);
+                let action_w = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+                ui.add_enabled_ui(croc_avail && idle, |ui| {
+                    ui.horizontal(|ui| {
+                        for (label, text_mode) in [("Files", false), ("Text", true)] {
+                            if accent_button_sized(ui, label, CROC_COLOR, Vec2::new(action_w, 36.0)).clicked() {
+                                if self.selected_tool != SelectedTool::Croc {
+                                    self.switch_tool(SelectedTool::Croc);
+                                }
+                                self.croc_text_mode = text_mode;
+                                self.view = AppView::Send;
+                            }
+                        }
+                    });
+                });
+            });
+        ui.add_space(8.0);
+
+        let sendme_avail = sendme_status.as_ref().map(|s| s.available).unwrap_or(false);
+        ui.add_enabled_ui(sendme_avail && idle, |ui| {
+            if accent_button_sized(
+                ui, "📡 Broadcast with Sendme",
+                SENDME_COLOR, Vec2::new(btn_w, 42.0),
+            ).clicked() {
                 if self.selected_tool != SelectedTool::Sendme {
                     self.switch_tool(SelectedTool::Sendme);
                 }
                 self.sendme_one_shot = false;
-                self.view = AppView::Send;
-            }
-
-            let croc_avail = croc_status.as_ref().map(|s| s.available).unwrap_or(false);
-            let send_text_btn =
-                ui.add_enabled(
-                    croc_avail,
-                    egui::Button::new(RichText::new("🐊 Send Text").size(12.0).color(
-                        if croc_avail {
-                            Color32::BLACK
-                        } else {
-                            TEXT_MUTED
-                        },
-                    ))
-                    .min_size(Vec2::new(btn_w, 42.0))
-                    .fill(if croc_avail {
-                        CROC_COLOR
-                    } else {
-                        Color32::from_rgb(50, 50, 55)
-                    })
-                    .corner_radius(egui::epaint::CornerRadius::same(8u8)),
-                );
-            if send_text_btn.clicked() && croc_avail {
-                if self.selected_tool != SelectedTool::Croc {
-                    self.switch_tool(SelectedTool::Croc);
-                }
-                self.croc_text_mode = true;
+                self.persist_user_settings();
                 self.view = AppView::Send;
             }
         });
@@ -4915,6 +4942,13 @@ impl DataBeamApp {
         }
 
         card_frame(ui, |ui| {
+            if croc_text_conflict {
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("Text mode enabled: clear files/folders to send only text.")
+                        .size(13.0).strong().color(WARNING));
+                });
+                ui.add_space(4.0);
+            }
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("Items")
@@ -4995,11 +5029,13 @@ impl DataBeamApp {
                 ui.vertical_centered(|ui| {
                     ui.add_space(20.0);
                     ui.label(RichText::new("📁").size(32.0).color(TEXT_MUTED));
-                    ui.label(
-                        RichText::new("Drag & drop files here")
-                            .color(TEXT_MUTED)
-                            .size(14.0),
-                    );
+                    let message = if croc_text_mode {
+                        RichText::new("Text mode enabled: file/folder selection is disabled")
+                            .color(WARNING).strong()
+                    } else {
+                        RichText::new("Drag & drop files here").color(TEXT_MUTED)
+                    };
+                    ui.label(message.size(14.0));
                     ui.add_space(20.0);
                 });
             } else {
@@ -5049,34 +5085,24 @@ impl DataBeamApp {
                     self.send_items.remove(idx);
                 }
             }
-            if croc_text_mode {
-                ui.add_space(4.0);
-                let msg = if croc_text_conflict {
-                    "Text mode enabled: clear files/folders to send only text."
-                } else {
-                    "Text mode enabled: file/folder add is disabled."
-                };
-                ui.label(RichText::new(msg).size(10.5).color(WARNING));
-            }
         });
         // Removing the old bottom buttons block entirely
 
         if self.selected_tool == SelectedTool::Sendme {
             ui.add_space(4.0);
             ui.add_enabled_ui(!send_locked, |ui| {
-                if ui
-                    .checkbox(
-                        &mut self.sendme_one_shot,
-                        RichText::new("Stop after single transfer").size(12.0),
-                    )
-                    .changed()
-                {
+                if toggle_button_sized(
+                    ui, if self.sendme_one_shot { "📡 Broadcast" } else { "📡 Broadcast On" },
+                    !self.sendme_one_shot,
+                    SENDME_COLOR, Vec2::new(130.0, 32.0),
+                ).clicked() {
+                    self.sendme_one_shot = !self.sendme_one_shot;
                     self.persist_user_settings();
                 }
                 if !self.sendme_one_shot {
                     ui.label(
                         RichText::new(
-                            "Broadcast mode: sender stays online and shows active transfers.",
+                            "Broadcast enabled: sender stays online and shows active transfers.",
                         )
                         .size(10.0)
                         .color(TEXT_MUTED),
@@ -6697,6 +6723,11 @@ fn extract_croc_received_text(line: &str) -> Option<String> {
     None
 }
 
+fn croc_conflict_message(item: Option<&str>) -> String {
+    let detail = item.map(|name| format!("\n\nAffected item: {name}\n\n")).unwrap_or_else(|| " ".into());
+    format!("The file/folder you intended to download has the same name as another item at the destination.{detail}Rename that item and try a new transfer.")
+}
+
 fn normalize_sendme_ticket(text: &str) -> Option<String> {
     let trimmed = text.trim().trim_matches('"').trim_matches('\'');
     if trimmed.is_empty() {
@@ -6979,6 +7010,19 @@ mod parse_tests {
     };
     use eframe::egui::Color32;
     use std::sync::mpsc;
+
+    #[test]
+    fn croc_conflict_card_includes_the_affected_item() {
+        for name in ["folder/John's report.txt", "folder/file exists.txt"] {
+            let mut app = DataBeamApp::default();
+            app.selected_tool = SelectedTool::Croc;
+            app.view = AppView::Receive;
+            app.fail_transfer(format!("conflict-detected: {name}"));
+            let TransferState::Failed(message) = &app.transfer_state else { panic!("expected failure card") };
+            assert!(message.contains(&format!("Affected item: {name}")));
+            assert!(message.contains("Rename that item and try a new transfer."));
+        }
+    }
 
     #[test]
     fn old_settings_support_troubleshoot_news_and_preserve_it_when_saved() {

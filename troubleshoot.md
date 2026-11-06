@@ -4,13 +4,12 @@ DataBeam is verified running on Android via DroidDeck with the AArch64/ARM64 bui
 
 [Download DataBeam](https://vinay-winai.github.io/DataBeam/)
 
-## v0.7.3 released
+## v0.7.6 released
 
-- Fix macOS close-to-tray, Dock reopening and the tray logo.
-- Fix Linux tray/Dock reopening and updater restarts; include AppImage XWayland libraries.
-- Use AppImage for Linux downloads; DEB and Flatpak packages are discontinued.
+- Improve Home actions, saved standalone expansion, and Broadcast/text-mode controls.
+- Accept pasted Sendme receive commands and name conflicting Croc items.
 
-[Release notes](https://github.com/vinay-winai/DataBeam/releases/tag/v0.7.3)
+[Release notes](https://github.com/vinay-winai/DataBeam/releases/tag/v0.7.6)
 
 # Troubleshooting DataBeam
 
@@ -40,6 +39,14 @@ If an older Linux AppImage returns to the old version after updating, download a
 - EazySendme/Sendme recommended for sensitive data transfers.
 
 # Previous releases
+
+## v0.7.3 released
+
+- Fix macOS close-to-tray, Dock reopening and the tray logo.
+- Fix Linux tray/Dock reopening and updater restarts; include AppImage XWayland libraries.
+- Use AppImage for Linux downloads; DEB and Flatpak packages are discontinued.
+
+[Release notes](https://github.com/vinay-winai/DataBeam/releases/tag/v0.7.3)
 
 ## v0.7.2 - test released
 

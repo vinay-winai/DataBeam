@@ -116,6 +116,31 @@ pub fn accent_button_sized(
 
 // ── Card/Panel ─────────────────────────────────────────────────────
 
+pub fn toggle_button_sized(
+    ui: &mut egui::Ui,
+    text: &str,
+    selected: bool,
+    color: Color32,
+    size: Vec2,
+) -> egui::Response {
+    ui.allocate_ui_with_layout(
+        size,
+        egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+        |ui| {
+            ui.add(
+                egui::Button::new(RichText::new(text).size(12.0).color(
+                    if selected { Color32::BLACK } else { TEXT_SECONDARY },
+                ))
+                .selected(selected)
+                .fill(if selected { color } else { BG_CARD })
+                .stroke(Stroke::new(1.0, if selected { color } else { BORDER_SUBTLE }))
+                .corner_radius(BUTTON_ROUNDING)
+                .min_size(size),
+            )
+        },
+    ).inner
+}
+
 pub fn card_frame(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::NONE
         .fill(BG_CARD)

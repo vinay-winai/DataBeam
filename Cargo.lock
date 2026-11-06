@@ -1335,7 +1335,7 @@ dependencies = [
 
 [[package]]
 name = "databeam"
-version = "0.7.3"
+version = "0.7.6"
 dependencies = [
  "dirs",
  "eframe",

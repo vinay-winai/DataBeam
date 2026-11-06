@@ -1313,8 +1313,11 @@ fn read_lines_cr_aware(
                     // Check for prompts that don't end in newline (like "Overwrite? (y/N)")
                     if buf.len() >= 9 {
                         let partial = String::from_utf8_lossy(&buf);
-                        let lower = partial.to_lowercase();
-                        if lower.contains("overwrite") || lower.contains("--overwrite") {
+                        let lower = strip_ansi(&partial).to_lowercase();
+                        // Wait for the choices so the destination name has arrived.
+                        if lower.contains("(y/n)")
+                            && (lower.starts_with("overwrite ") || lower.starts_with("resume "))
+                        {
                             parser(&partial, false, &tx, &cancel);
                             buf.clear();
                         }
@@ -2569,8 +2572,25 @@ fn parse_croc_output(
     }
 
     let lower = trimmed.to_lowercase();
-    if lower.contains("overwrite") || lower.contains("--overwrite") {
-        let _ = tx.send(TransferMsg::Error("conflict-detected".to_string()));
+    if lower.contains("overwrite") || lower.contains("--overwrite")
+        || (lower.starts_with("resume ") && lower.contains("(y/n)"))
+    {
+        let detail = trimmed.split_once(' ').and_then(|(action, rest)| {
+            if action.eq_ignore_ascii_case("overwrite") || action.eq_ignore_ascii_case("resume") {
+                if let Some(quoted) = rest.strip_prefix('\'') {
+                    quoted.rsplit_once('\'').map(|(name, _)| name.to_string())
+                } else {
+                    serde_json::Deserializer::from_str(rest).into_iter::<String>().next()?.ok()
+                }
+            } else {
+                None
+            }
+        }).or_else(|| trimmed.split_once("(use --overwrite): ").map(|(_, path)| path.to_string()));
+        let message = detail.map_or_else(
+            || "conflict-detected".to_string(),
+            |name| format!("conflict-detected: {name}"),
+        );
+        let _ = tx.send(TransferMsg::Error(message));
         cancel.store(true, Ordering::Relaxed);
         return;
     }
@@ -2801,6 +2821,26 @@ pub(crate) fn kill_all_tracked_children() {
 #[cfg(test)]
 mod tests {
     use super::cleanup_sendme_send_dirs;
+
+    #[test]
+    fn croc_conflict_prompt_keeps_the_complete_item_name() {
+        use super::*;
+        for prompt in [
+            "\x1b[33mOverwrite\x1b[0m 'folder/John's report.txt'? (y/N) (use --overwrite to omit) ",
+            "Resume 'folder/John's report.txt' (50.0%)? (y/N)   (use --overwrite to omit) ",
+            "destination already exists (use --overwrite): folder/John's report.txt\n",
+        ] {
+            let (tx, rx) = mpsc::channel();
+            let cancel = Arc::new(AtomicBool::new(false));
+            read_lines_cr_aware(std::io::Cursor::new(prompt.as_bytes().to_vec()), tx,
+                |line, _, tx, cancel| parse_croc_output(line, tx, cancel, true), cancel.clone());
+            let errors: Vec<_> = rx.try_iter().filter_map(|event| match event {
+                TransferMsg::Error(message) => Some(message), _ => None,
+            }).collect();
+            assert_eq!(errors, ["conflict-detected: folder/John's report.txt"]);
+            assert!(cancel.load(Ordering::Relaxed));
+        }
+    }
 
     const CROC_DNS_ERROR: &str = "could not connect to 1.getcroc.com:9009: 1.getcroc.com:9009: comm.NewConnection failed: dial tcp: lookup 1.getcroc.com: i/o timeout";
 
@@ -3365,6 +3405,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires DATABEAM_CROC_TEST_BINARY and a configured Croc relay"]
+    fn croc_real_overwrite_conflict_keeps_name_and_existing_file() {
+        use super::*;
+        struct StopOnDrop(ProcessHandle);
+        impl Drop for StopOnDrop { fn drop(&mut self) { self.0.request_cancel(); } }
+        let binary = std::env::var("DATABEAM_CROC_TEST_BINARY").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let name = "John's report copy.txt";
+        let source = temp.path().join(name);
+        let output = temp.path().join("received");
+        fs::create_dir(&output).unwrap();
+        fs::write(&source, b"new short payload").unwrap();
+        let original = vec![b'o'; 4096];
+        fs::write(output.join(name), &original).unwrap();
+        let code = random_croc_code();
+        let (receive_rx, receive_handle) = croc_receive(CrocReceiveOptions {
+            code: code.clone(), output_dir: Some(output.clone()),
+        }, &binary);
+        let _receiver = StopOnDrop(receive_handle);
+        let (_send_rx, send_handle) = croc_send(CrocSendOptions {
+            paths: vec![source], custom_code: Some(code), text_mode: false, text_value: None,
+        }, &binary);
+        let _sender = StopOnDrop(send_handle);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let error = loop {
+            assert!(Instant::now() < deadline, "no real overwrite error");
+            match receive_rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(TransferMsg::Error(error)) => break error,
+                Ok(TransferMsg::Completed) => panic!("collision was silently overwritten"),
+                Ok(TransferMsg::Output(line)) => eprintln!("receiver: {line}"),
+                _ => {}
+            }
+        };
+        eprintln!("Real conflict result: {error}");
+        assert!(error.starts_with("conflict-detected: "), "{error}");
+        assert!(error.contains(name), "missing affected filename: {error}");
+        let mut app = crate::DataBeamApp::default();
+        app.selected_tool = crate::SelectedTool::Croc;
+        app.view = crate::AppView::Receive;
+        app.fail_transfer(error);
+        assert!(matches!(app.transfer_state, crate::TransferState::Failed(ref message)
+            if message.contains(name) && message.contains("Affected item:")));
+        assert_eq!(fs::read(output.join(name)).unwrap(), original);
     }
 
     #[test]
