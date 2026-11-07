@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod backend;
+mod blob_cleanup;
 mod app_update;
 #[cfg(all(windows, feature = "release-single-instance"))]
 mod activation;
@@ -176,6 +177,8 @@ struct UserSettings {
     sendme_blob_dir_mode: SendmeBlobDirMode,
     #[serde(default)]
     sendme_blob_custom_dir: Option<String>,
+    #[serde(default)]
+    sendme_blob_cleanup_dirs: Vec<PathBuf>,
     #[serde(default = "default_sendme_one_shot")]
     sendme_one_shot: bool,
     #[serde(default)]
@@ -234,6 +237,7 @@ struct DataBeamApp {
     receive_output_dir: Option<PathBuf>,
     sendme_blob_dir_mode: SendmeBlobDirMode,
     sendme_blob_custom_dir: Option<PathBuf>,
+    sendme_blob_cleanup_dirs: Vec<PathBuf>,
 
     // Transfer
     transfer_state: TransferState,
@@ -335,7 +339,7 @@ struct DataBeamApp {
     /// Persisted map of croc_code → sendme_ticket for local-blob retry.
     eazysendme_code_ticket_map: HashMap<String, EazyCacheEntry>,
 
-    cleanup_scan_rx: Option<mpsc::Receiver<(Vec<PathBuf>, u64)>>,
+    cleanup_scan_rx: Option<mpsc::Receiver<blob_cleanup::Scan>>,
     cleanup_targets: Vec<PathBuf>,
     cleanup_bytes: u64,
     cleanup_prompt_open: bool,
@@ -399,6 +403,7 @@ impl Default for DataBeamApp {
             receive_output_dir: None,
             sendme_blob_dir_mode: SendmeBlobDirMode::SystemTemp,
             sendme_blob_custom_dir: None,
+            sendme_blob_cleanup_dirs: Vec::new(),
             transfer_state: TransferState::Idle,
             transfer_progress: 0.0,
             transfer_code: None,
@@ -672,6 +677,10 @@ impl DataBeamApp {
             .map(PathBuf::from)
             .filter(|p| !p.as_os_str().is_empty());
         self.sendme_blob_dir_mode = settings.sendme_blob_dir_mode;
+        self.sendme_blob_cleanup_dirs = settings.sendme_blob_cleanup_dirs.into_iter()
+            .filter(|path| !path.as_os_str().is_empty()).map(|path| blob_cleanup::absolute(&path)).collect();
+        let mut seen = std::collections::HashSet::new();
+        self.sendme_blob_cleanup_dirs.retain(|path| seen.insert(path.clone()));
         self.sendme_blob_custom_dir = settings
             .sendme_blob_custom_dir
             .as_ref()
@@ -709,6 +718,7 @@ impl DataBeamApp {
                 .as_ref()
                 .map(|p| p.to_string_lossy().to_string()),
             sendme_blob_dir_mode: self.sendme_blob_dir_mode,
+            sendme_blob_cleanup_dirs: self.sendme_blob_cleanup_dirs.clone(),
             sendme_blob_custom_dir: self
                 .sendme_blob_custom_dir
                 .as_ref()
@@ -784,13 +794,53 @@ impl DataBeamApp {
     }
 
     fn sendme_blob_scan_roots(&self) -> Vec<PathBuf> {
-        let mut roots = vec![std::env::temp_dir()];
-        if let Some(custom) = self.effective_sendme_blob_dir() {
-            if !roots.iter().any(|root| root == &custom) {
-                roots.push(custom);
-            }
+        let mut roots = self.sendme_blob_cleanup_dirs.clone();
+        for path in [std::env::temp_dir(), self.effective_sendme_blob_dir().unwrap_or_else(std::env::temp_dir)] {
+            let path = blob_cleanup::absolute(&path);
+            if !roots.contains(&path) { roots.push(path); }
         }
         roots
+    }
+
+    fn remember_sendme_blob_dir(&mut self) {
+        let path = blob_cleanup::absolute(&self.effective_sendme_blob_dir().unwrap_or_else(std::env::temp_dir));
+        if !self.sendme_blob_cleanup_dirs.contains(&path) {
+            self.sendme_blob_cleanup_dirs.push(path);
+            self.persist_user_settings();
+        }
+    }
+
+    fn start_blob_cleanup_scan(&mut self, show_prompt: bool) {
+        if self.cleanup_scan_rx.is_some() { return; }
+        let roots = self.sendme_blob_scan_roots();
+        let current = blob_cleanup::absolute(&self.effective_sendme_blob_dir().unwrap_or_else(std::env::temp_dir));
+        let known = self.eazysendme_code_ticket_map.values()
+            .filter_map(|entry| native_ticket_to_hex_hash(&entry.ticket)).collect();
+        let (tx, rx) = mpsc::channel();
+        self.cleanup_scan_rx = Some(rx);
+        thread::spawn(move || { let _ = tx.send(blob_cleanup::scan(roots, &current, &known, show_prompt)); });
+    }
+
+    fn apply_blob_cleanup_scan(&mut self, scan: blob_cleanup::Scan) {
+        let before = self.sendme_blob_cleanup_dirs.clone();
+        let active = (self.transfer_state == TransferState::Running)
+            .then(|| blob_cleanup::absolute(&self.effective_sendme_blob_dir().unwrap_or_else(std::env::temp_dir)));
+        for root in scan.occupied {
+            if !self.sendme_blob_cleanup_dirs.contains(&root) { self.sendme_blob_cleanup_dirs.push(root); }
+        }
+        self.sendme_blob_cleanup_dirs.retain(|root| !scan.empty.contains(root) || active.as_ref() == Some(root));
+        if before != self.sendme_blob_cleanup_dirs { self.persist_user_settings(); }
+        if scan.show_prompt {
+            self.cleanup_targets.clear();
+            self.cleanup_bytes = 0;
+            for (path, size) in scan.targets {
+                if active.as_deref() != path.parent() {
+                    self.cleanup_targets.push(path);
+                    self.cleanup_bytes += size;
+                }
+            }
+            self.cleanup_prompt_open = !self.cleanup_targets.is_empty();
+        }
     }
 
     fn sendme_blob_dir_summary(&self) -> String {
@@ -3495,6 +3545,9 @@ impl DataBeamApp {
             return;
         }
 
+        if matches!(self.selected_tool, SelectedTool::Sendme | SelectedTool::EazySendme) {
+            self.remember_sendme_blob_dir();
+        }
         self.reset_transfer();
         self.transfer_code = Some(self.receive_code.trim().to_string());
 
@@ -3785,7 +3838,7 @@ impl DataBeamApp {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.label("DataBeam found incomplete temporary EazySendme downloads.");
+                ui.label("DataBeam found incomplete temporary Sendme/EazySendme downloads.");
                 ui.add_space(4.0);
                 ui.label(RichText::new(format!(
                     "Found {} folder(s) using {}.",
@@ -3798,12 +3851,19 @@ impl DataBeamApp {
                 
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    if accent_button_sized(ui, "Delete Files", Color32::from_rgb(200, 60, 60), Vec2::new(120.0, 32.0)).clicked() {
+                    if ui.add_enabled_ui(self.transfer_state != TransferState::Running, |ui|
+                        accent_button_sized(ui, "Delete Files", Color32::from_rgb(200, 60, 60), Vec2::new(120.0, 32.0))
+                    ).inner.clicked() {
                         let targets = self.cleanup_targets.clone();
+                        let roots = self.sendme_blob_scan_roots();
+                        let current = blob_cleanup::absolute(&self.effective_sendme_blob_dir().unwrap_or_else(std::env::temp_dir));
+                        let (tx, rx) = mpsc::channel();
+                        self.cleanup_scan_rx = Some(rx);
                         std::thread::spawn(move || {
                             for path in targets {
                                 let _ = std::fs::remove_dir_all(&path);
                             }
+                            let _ = tx.send(blob_cleanup::scan(roots, &current, &Default::default(), false));
                         });
                         self.show_toast("Deleted incomplete downloads".to_string(), SUCCESS);
                         close_modal = true;
@@ -3965,77 +4025,14 @@ impl eframe::App for DataBeamApp {
                 self.cleanup_eazy_cache_by_hash(&hash, true);
             }
 
-            // Background check for orphaned/incomplete temp downloads
-            let (tx, rx) = std::sync::mpsc::channel();
-            self.cleanup_scan_rx = Some(rx);
-            let map = self.eazysendme_code_ticket_map.clone();
-            let scan_roots = self.sendme_blob_scan_roots();
-            std::thread::spawn(move || {
-                let mut targets = Vec::new();
-                let mut total_bytes = 0;
-
-                fn dir_size(path: &std::path::Path) -> u64 {
-                    let mut total = 0;
-                    if let Ok(entries) = std::fs::read_dir(path) {
-                        for entry in entries.flatten() {
-                            if let Ok(meta) = entry.metadata() {
-                                if meta.is_dir() {
-                                    total += dir_size(&entry.path());
-                                } else {
-                                    total += meta.len();
-                                }
-                            }
-                        }
-                    }
-                    total
-                }
-
-                for root in scan_roots {
-                    if let Ok(entries) = std::fs::read_dir(&root) {
-                        for entry in entries.flatten() {
-                            let name = entry.file_name().to_string_lossy().to_string();
-                            if name.starts_with(".sendme-recv-") {
-                                let path = entry.path();
-                                if !path.is_dir() {
-                                    continue;
-                                }
-
-                                let hex_hash = name.strip_prefix(".sendme-recv-").unwrap_or("");
-                                let mut is_incomplete = true;
-                                for cache in map.values() {
-                                    if let Some(h) = native_ticket_to_hex_hash(&cache.ticket) {
-                                        if h == hex_hash {
-                                            is_incomplete = false;
-                                            break;
-                                        }
-                                    }
-                                }
-                                let size = dir_size(&path);
-                                if is_incomplete
-                                    && size > 1024 * 1024
-                                    && !targets.iter().any(|existing| existing == &path)
-                                {
-                                    targets.push(path);
-                                    total_bytes += size;
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                if !targets.is_empty() {
-                    let _ = tx.send((targets, total_bytes));
-                }
-            });
+            self.start_blob_cleanup_scan(true);
         }
 
         if let Some(rx) = &self.cleanup_scan_rx {
             match rx.try_recv() {
-                Ok((targets, total_bytes)) => {
-                    self.cleanup_targets = targets;
-                    self.cleanup_bytes = total_bytes;
-                    self.cleanup_prompt_open = true;
+                Ok(scan) => {
                     self.cleanup_scan_rx = None;
+                    self.apply_blob_cleanup_scan(scan);
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.cleanup_scan_rx = None;
@@ -4053,7 +4050,11 @@ impl eframe::App for DataBeamApp {
         self.poll_picker_results();
         self.handle_dropped_files(ctx);
         self.poll_size_updates();
+        let was_running = self.transfer_state == TransferState::Running;
         self.poll_transfer();
+        if was_running && self.transfer_state == TransferState::Completed {
+            self.start_blob_cleanup_scan(false);
+        }
         if self.troubleshoot_monitor.poll(ctx, &mut self.troubleshoot_news) {
             self.persist_user_settings();
         }
@@ -8312,6 +8313,54 @@ mod parse_tests {
         fn drop(&mut self) {
             std::env::remove_var("DATABEAM_SETTINGS_FILE");
         }
+    }
+
+    #[test]
+    fn blob_cleanup_history_survives_destination_change_and_prunes_after_removal() {
+        let _lock = super::tray::TRAY_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let _settings = SettingsFileGuard::set(&temp.path().join("settings.json"));
+        let old = temp.path().join("old");
+        let new = temp.path().join("new");
+        let cache = old.join(format!(".sendme-recv-{}", "a".repeat(64)));
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::create_dir(&new).unwrap();
+        std::fs::write(cache.join("data"), vec![0; 1024 * 1024 + 1]).unwrap();
+        let mut app = DataBeamApp::default();
+        app.sendme_blob_dir_mode = super::SendmeBlobDirMode::DownloadDir;
+        app.receive_output_dir = Some(old.clone());
+        app.remember_sendme_blob_dir();
+        app.remember_sendme_blob_dir();
+        assert_eq!(app.sendme_blob_cleanup_dirs, [old.clone()]);
+        app.receive_output_dir = Some(new.clone());
+        app.persist_user_settings();
+
+        let mut restarted = DataBeamApp::default();
+        restarted.load_user_settings();
+        assert!(restarted.sendme_blob_scan_roots().contains(&old));
+        assert!(restarted.sendme_blob_scan_roots().contains(&new));
+        restarted.apply_blob_cleanup_scan(crate::blob_cleanup::scan(
+            vec![old.clone(), new.clone()], &new, &Default::default(), true,
+        ));
+        assert_eq!(restarted.cleanup_targets, [cache.clone()]);
+        assert!(restarted.cleanup_prompt_open);
+
+        assert!(cache.starts_with(temp.path()));
+        std::fs::remove_dir_all(&cache).unwrap();
+        restarted.apply_blob_cleanup_scan(crate::blob_cleanup::scan(
+            vec![old.clone()], &new, &Default::default(), false,
+        ));
+        let mut restored = DataBeamApp::default();
+        restored.load_user_settings();
+        assert!(!restored.sendme_blob_cleanup_dirs.contains(&old));
+
+        restored.remember_sendme_blob_dir();
+        restored.view = AppView::Home;
+        restored.transfer_state = TransferState::Running;
+        restored.apply_blob_cleanup_scan(crate::blob_cleanup::scan(
+            vec![new.clone()], &new, &Default::default(), false,
+        ));
+        assert!(restored.sendme_blob_cleanup_dirs.contains(&new), "do not prune a receiver's directory before its store is created");
     }
 
     #[test]
