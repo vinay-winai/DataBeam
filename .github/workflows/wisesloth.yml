@@ -1,0 +1,26 @@
+name: Rebuild WiseSloth
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wisesloth-rebuild
+  cancel-in-progress: false
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger the shared static site build
+        env:
+          DEPLOY_HOOK: ${{ secrets.WISESLOTH_DEPLOY_HOOK }}
+        run: |
+          test -n "$DEPLOY_HOOK"
+          curl --fail --silent --show-error --retry 2 --request POST "$DEPLOY_HOOK" > /dev/null
