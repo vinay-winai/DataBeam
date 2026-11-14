@@ -11,7 +11,11 @@
 
 APK: `app/build/outputs/apk/debug/app-debug.apk`, 31,550,621 bytes.
 SHA-256: `f8251f737cc77480b4ecefcfb5704faf85fdd6a22a60c2be8d0dd63327b8b854`.
-Version 0.8.0 is installed. Desktop uses Croc 11.6.5; Android is independently pinned to its validated 11.5.5 base with the same local GUI progress reporting. No Iroh GSO override is shipped.
+Version 0.8.0 is installed. Desktop and Android retain Croc 11.5.5 with the same local GUI progress reporting; the evaluated desktop 11.6.5 upgrade was deferred at the user's request. No Iroh GSO override is shipped.
+
+Desktop release revision (2026-11-15): the 11.6.5 release run was cancelled before publication. Desktop now reuses the validated 11.5.5 telemetry patch, with its normal desktop transport build. The EasySendMe ticket receiver owns a private temporary directory under the user's DataBeam cache until Croc exits; normal Croc receives use the app directory by default, matching the displayed save destination. The previous end-to-end handoff test supplied its own folder and missed this GUI path; it now calls the actual ticket receiver.
+
+Final revised desktop checks: 138 tests passed, eight fixture/manual checks ignored by the ordinary suite. Three real-transfer regressions also passed with `TEMP` and `TMP` set to `C:\Windows\Temp`: EasySendMe ticket/payload round trip, Croc text/file round trips, and Croc conflict/overwrite protection. A separate Croc 11.5.5 probe reproduced the original `open receive root: ... Access is denied` when run directly in that system Temp root. Android's shipped engine/APK is unchanged by this desktop correction.
 
 ## Phone and configuration
 
@@ -95,7 +99,7 @@ The final APK is installed. Storage and share-entry device regressions passed ag
 
 - Desktop header DataBeam text removed and the extra Receive/Troubleshoot gap removed. The user launched the release build and confirmed the header UI is correct.
 - Android’s bottom ? button opens the same troubleshooting URL. The on-device share-entry test intercepted and verified the exact ACTION_VIEW target without launching a browser; share/text selection/draft checks also passed.
-- Desktop Croc upgraded from official v11.5.5 to verified v11.6.5. Its upstream/telemetry and bundle/progress regressions passed. Both default and one-shot progress use exact engine totals rather than legacy rounded terminal bars.
+- Historical evaluation (not shipped): desktop Croc was upgraded from official v11.5.5 to verified v11.6.5. Its upstream/telemetry and bundle/progress regressions passed. Both default and one-shot progress use exact engine totals rather than legacy rounded terminal bars.
 - A real Android receive with v11.6.5 failed in its new bundle capability probe (`linkat: permission denied`). That engine upgrade is not shipped on Android. The Android recipe uses the previously validated v11.5.5 base plus selection-wide progress and explicit verification markers. No Croc output wrapper is added.
 - The Iroh direct-path timeout closely matches upstream #4555, including a Samsung Android 16/Iroh 1.4.1 report. PR #4645 remained open when checked. The user explicitly chose documentation and normal relay fallback over a local workaround. Experimental no-GSO test results are diagnostic only; the override was removed from the installed/shipping build. See investigations/sendme-android-direct-relay.md.
 - Correct Android DNS application-context initialization and platform network callbacks remain integrated; these are the documented platform API integration.

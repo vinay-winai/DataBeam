@@ -8,6 +8,8 @@ DataBeam is verified running on Android via DroidDeck with the AArch64/ARM64 bui
 
 - croc and iroh relay checks and croc auto relay fail handling added.
 - qr code style changed
+- Croc remains pinned to the tested 11.5.5 engine.
+- Fix EasySendMe ticket reception when the Windows system Temp folder cannot be opened. Files still save to the chosen destination.
 
 [Release notes](https://github.com/vinay-winai/DataBeam/releases/tag/v0.8.0)
 

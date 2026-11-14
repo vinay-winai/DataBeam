@@ -29,7 +29,7 @@
 
 ### Patched Croc engine
 
-Install Python 3.9+, Git, and Go 1.27.3. Prepare the engine before building:
+Install Python 3.9+, Git, and Go 1.27.2. Prepare the engine before building:
 
 ```bash
 # Windows x64; use the Rust target for your platform.
@@ -40,7 +40,7 @@ cargo build --release --features release-single-instance
 Other release targets are `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`,
 and `x86_64-apple-darwin`. For macOS universal builds, pass `--target` twice
 to prepare both payloads before building both Rust targets. The script verifies
-the pinned 11.6.5 source archive SHA-256, applies the compatibility patch, runs its Go tests,
+the pinned 11.5.5 source archive SHA-256, applies the compatibility patch, runs its Go tests,
 and builds the embedded engine. It uses Go's normal platform resolver; it does
 not force the `netgo` build tag used by the official CLI release.
 
@@ -54,7 +54,7 @@ without a payload still compile, but Croc transfers then need a system engine
 whose version exactly matches the patched version. CI and release workflows
 prepare the payload on Windows, Linux, and macOS.
 
-Official 11.6.5 supplies the receiver keepalive, route display, Windows text-temp-file and safe discovery-budget handling. DataBeam retains compatibility regressions and adds local preparation/rate/selection-wide progress telemetry, including negotiated bundles. The telemetry does not alter file layout or the transfer protocol. On future upgrades, update the recipe and builder, retest receiver-first text/files and Croc web, and use a new engine identity. Do not reuse the custom cache identity for official binaries or enable unverified self-updates.
+Desktop and Android retain official 11.5.5 with the validated `croc-v11.5.5-android-databeam.patch` compatibility and GUI telemetry patch. Despite its historical filename, that patch also builds on desktop without Android's separate build tag. Preparation, rate, selection-wide progress and verification reporting remain available. The telemetry does not alter file layout or the transfer protocol. The evaluated 11.6.5 upgrade is deferred. On future upgrades, update the recipe and builder, retest receiver-first text/files and Croc web, and use a new engine identity. Do not reuse the custom cache identity for official binaries or enable unverified self-updates.
 
 ### Rust checks
 

@@ -3726,11 +3726,13 @@ impl DataBeamApp {
                 }
 
                 // Fall back to Phase 1 (Croc)
-                let opts = CrocReceiveOptions {
-                    code: code_key,
-                    output_dir: None, 
+                let (rx, handle) = match crate::backend::croc_receive_ticket(code_key, &binary) {
+                    Ok(transfer) => transfer,
+                    Err(error) => {
+                        self.show_toast(error, ERROR);
+                        return;
+                    }
                 };
-                let (rx, handle) = croc_receive(opts, &binary);
                 self.transfer_rx = Some(rx);
                 self.transfer_handle = Some(handle);
             }

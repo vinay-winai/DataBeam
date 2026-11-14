@@ -65,8 +65,8 @@ def main():
         test_env['GOTOOLCHAIN'] = 'go' + RECIPE['go_version']
         for key in ('GOOS', 'GOARCH', 'CROC_SECRET', 'CROC_RELAY', 'CROC_RELAY6'):
             test_env.pop(key, None)
-        # Upstream now implements the old runtime patches. Keep their DataBeam
-        # regressions plus coverage for the replacement local-listener startup.
+        # Exercise GUI telemetry and compatibility protections for the pinned
+        # recipe, including its platform-specific receive and discovery paths.
         test_flags = []
         if os.name == 'nt':
             # These upstream cases create symlinks and require Windows developer

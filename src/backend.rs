@@ -1871,12 +1871,50 @@ pub fn croc_receive(
     opts: CrocReceiveOptions,
     binary_path: &str,
 ) -> (mpsc::Receiver<TransferMsg>, ProcessHandle) {
+    spawn_croc_receive(opts, binary_path, None)
+}
+
+/// EasySendMe exchanges its ticket as Croc text. Croc still opens a receive
+/// root for text, so keep a private directory alive until that child exits.
+/// The system temp root itself need not grant directory-read access on Windows.
+pub fn croc_receive_ticket(
+    code: String,
+    binary_path: &str,
+) -> Result<(mpsc::Receiver<TransferMsg>, ProcessHandle), String> {
+    let parent = dirs::cache_dir().unwrap_or_else(std::env::temp_dir)
+        .join("databeam").join("ticket-receive");
+    fs::create_dir_all(&parent)
+        .map_err(|error| format!("Create ticket cache folder: {error}"))?;
+    let directory = tempfile::Builder::new()
+        .prefix("databeam-ticket-")
+        .tempdir_in(parent)
+        .map_err(|error| format!("Create ticket receive folder: {error}"))?;
+    Ok(spawn_croc_receive(
+        CrocReceiveOptions { code, output_dir: None },
+        binary_path,
+        Some(directory),
+    ))
+}
+
+fn spawn_croc_receive(
+    opts: CrocReceiveOptions,
+    binary_path: &str,
+    ticket_directory: Option<tempfile::TempDir>,
+) -> (mpsc::Receiver<TransferMsg>, ProcessHandle) {
     let binary = binary_path.to_owned();
+    let app_directory = std::env::current_dir().ok();
     spawn_croc_transfer(
         Some(opts.code),
         false,
         move |code, relay| {
             let mut cmd = croc_transfer_command(&binary, code, relay);
+            if let Some(directory) = ticket_directory.as_ref() {
+                cmd.current_dir(directory.path());
+            } else if let Some(directory) = &app_directory {
+                // Match the default location displayed by the desktop UI and
+                // resolve relative --out paths against the app's directory.
+                cmd.current_dir(directory);
+            }
             if let Some(dir) = &opts.output_dir {
                 cmd.arg("--out").arg(dir);
             }
@@ -3715,11 +3753,7 @@ mod tests {
 
         // Exercise the same receiver-first Croc text handoff used by the GUI.
         let code = random_croc_code();
-        let handoff_dir = temp.path().join("handoff");
-        fs::create_dir(&handoff_dir).unwrap();
-        let (receive_rx, receive_handle) = croc_receive(CrocReceiveOptions {
-            code: code.clone(), output_dir: Some(handoff_dir),
-        }, &binary);
+        let (receive_rx, receive_handle) = croc_receive_ticket(code.clone(), &binary).unwrap();
         let _receive_guard = CancelOnDrop(receive_handle);
         thread::sleep(Duration::from_secs(3));
         let (send_rx, send_handle) = croc_send(CrocSendOptions {
