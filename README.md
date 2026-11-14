@@ -42,7 +42,7 @@ receiver route reporting. See the [upstream synchronization notes](investigation
 
 Actual Windows v0.6.5 captures using a local build that permits multiple instances. Transfers used generated dummy files on one PC; received files were checked with SHA-256. The galleries show file/folder and text sharing, QR codes, automatic retry, manual resume, conflict protection, and two simultaneous broadcast receivers.
 
-[Browse the interactive gallery](https://vinay-winai.github.io/DataBeam/gallery.html) · [Gallery source](docs/gallery.html)
+[Browse the interactive gallery](https://wisesloth.pages.dev/DataBeam/gallery.html) · [Gallery source](docs/gallery.html)
 
 | Multiple-file sharing | Manual Stop and Retry | Two broadcast receivers |
 | --- | --- | --- |

@@ -2,7 +2,7 @@
 
 DataBeam is verified running on Android via DroidDeck with the AArch64/ARM64 build.
 
-[Download DataBeam](https://vinay-winai.github.io/DataBeam/)
+[Download DataBeam](https://wisesloth.pages.dev/DataBeam/)
 
 ## v0.7.6 released
 
@@ -15,7 +15,7 @@ DataBeam is verified running on Android via DroidDeck with the AArch64/ARM64 bui
 
 ## Updating older versions
 
-**v0.6.8 and earlier:** [download the latest DataBeam from the website](https://vinay-winai.github.io/DataBeam/) and install it manually once. The v0.6.7/v0.6.8 updater cannot find the new version-free download filenames. **v0.7.0 and newer** can update through the app's Update button.
+**v0.6.8 and earlier:** [download the latest DataBeam from the website](https://wisesloth.pages.dev/DataBeam/) and install it manually once. The v0.6.7/v0.6.8 updater cannot find the new version-free download filenames. **v0.7.0 and newer** can update through the app's Update button.
 
 **Linux DEB or Flatpak installations:** switch manually to the AppImage from the website; these packages are discontinued.
 
@@ -87,7 +87,7 @@ DataBeam retains upstream's normal transport settings and automatic Direct/Relay
 
 - Add automatic update checks and one-click installation.
 
-v0.6.8 and earlier users: [download and install the latest version manually](https://vinay-winai.github.io/DataBeam/) once to use current app updates.
+v0.6.8 and earlier users: [download and install the latest version manually](https://wisesloth.pages.dev/DataBeam/) once to use current app updates.
 
 [Release notes](https://github.com/vinay-winai/DataBeam/releases/tag/v0.6.7)
 
