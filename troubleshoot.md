@@ -4,12 +4,13 @@ DataBeam is verified running on Android via DroidDeck with the AArch64/ARM64 bui
 
 [Download DataBeam](https://wisesloth.pages.dev/DataBeam/)
 
-## v0.7.6 released
+## v0.8.0 released
 
-- Improve Home actions, saved standalone expansion, and Broadcast/text-mode controls.
-- Accept pasted Sendme receive commands and name conflicting Croc items.
+- croc and iroh relay checks and croc auto relay fail handling added.
+- qr code style changed
+- croc updated to 11.6.5
 
-[Release notes](https://github.com/vinay-winai/DataBeam/releases/tag/v0.7.6)
+[Release notes](https://github.com/vinay-winai/DataBeam/releases/tag/v0.8.0)
 
 # Troubleshooting DataBeam
 
@@ -47,6 +48,11 @@ DataBeam retains upstream's normal transport settings and automatic Direct/Relay
 - EazySendme/Sendme recommended for sensitive data transfers.
 
 # Previous releases
+
+## v0.7.6 released
+
+- Improve Home actions, saved standalone expansion, and Broadcast/text-mode controls.
+- Accept pasted Sendme receive commands and name conflicting Croc items.
 
 ## v0.7.3 released
 
