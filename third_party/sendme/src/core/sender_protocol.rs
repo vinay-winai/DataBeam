@@ -1,4 +1,6 @@
 //! Keep a one-shot sender alive until QUIC acknowledges the response data.
+use super::types::AppHandle;
+use n0_future::StreamExt;
 use std::io;
 
 use bytes::Bytes;
@@ -16,15 +18,33 @@ use iroh_blobs::{
     util::SendStream as BlobSendStream,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(super) struct AcknowledgedBlobs {
     store: Store,
     events: EventSender,
+    route_emitter: AppHandle,
+}
+
+impl std::fmt::Debug for AcknowledgedBlobs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcknowledgedBlobs")
+            .field("store", &self.store)
+            .finish_non_exhaustive()
+    }
 }
 
 impl AcknowledgedBlobs {
     pub(super) fn new(store: Store, events: EventSender) -> Self {
-        Self { store, events }
+        Self {
+            store,
+            events,
+            route_emitter: None,
+        }
+    }
+
+    pub(super) fn with_route_emitter(mut self, emitter: AppHandle) -> Self {
+        self.route_emitter = emitter;
+        self
     }
 
     pub(super) fn store(&self) -> &Store {
@@ -35,6 +55,65 @@ impl AcknowledgedBlobs {
 impl ProtocolHandler for AcknowledgedBlobs {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let connection_id = connection.stable_id() as u64;
+        // Report each receiver independently: simultaneous receivers may use different paths.
+        let route_emitter = self.route_emitter.clone();
+        struct RouteClosed {
+            emitter: AppHandle,
+            id: u64,
+        }
+        impl Drop for RouteClosed {
+            fn drop(&mut self) {
+                if let Some(emitter) = &self.emitter {
+                    let _ = emitter.emit_event_with_payload(
+                        "send-route",
+                        &serde_json::json!({"connection":self.id.to_string(),"route":"closed"})
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        let _closed = RouteClosed {
+            emitter: route_emitter.clone(),
+            id: connection_id,
+        };
+        if let Some(emitter) = &route_emitter {
+            let _ = emitter.emit_event_with_payload(
+                "send-route",
+                &serde_json::json!({"connection":connection_id.to_string(),"route":"unknown"})
+                    .to_string(),
+            );
+        }
+        let _route_watcher = n0_future::task::AbortOnDropHandle::new(tokio::spawn({
+            let connection = connection.clone();
+            let route_emitter = route_emitter.clone();
+            async move {
+                let mut paths = connection.paths_stream();
+                let mut last = None;
+                while let Some(list) = paths.next().await {
+                    if let Some(emitter) = &route_emitter {
+                        let _ = emitter.emit_event_with_payload("send-paths", &serde_json::json!({
+                            "connection": connection_id.to_string(),
+                            "paths": super::network::describe_paths(&list),
+                        }).to_string());
+                    }
+                    let selected = (&list)
+                        .into_iter()
+                        .find(|path| path.is_selected())
+                        .map(|path| path.is_relay());
+                    if selected != last {
+                        if let Some(emitter) = &route_emitter {
+                            let route = match selected {
+                                Some(true) => "relay",
+                                Some(false) => "direct",
+                                None => "unknown",
+                            };
+                            let _=emitter.emit_event_with_payload("send-route",&serde_json::json!({"connection":connection_id.to_string(),"route":route}).to_string());
+                        }
+                        last = selected;
+                    }
+                }
+            }
+        }));
         if let Err(error) = self
             .events
             .client_connected(|| ClientConnected {

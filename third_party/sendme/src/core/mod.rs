@@ -1,4 +1,7 @@
 pub mod receive;
+pub mod diagnostics;
+mod directories;
+pub mod network;
 pub mod live_rate;
 pub mod send;
 mod sender_protocol;

@@ -243,6 +243,9 @@ struct DataBeamApp {
     transfer_state: TransferState,
     transfer_progress: f32,
     transfer_code: Option<String>,
+    croc_relay_notice: Option<String>,
+    croc_suggest_sendme: bool,
+    croc_browser_send: bool,
     transfer_log: Vec<String>,
     transfer_rx: Option<mpsc::Receiver<TransferMsg>>,
     transfer_handle: Option<ProcessHandle>,
@@ -252,6 +255,8 @@ struct DataBeamApp {
     transfer_speed_bps: Option<f64>,
     transfer_rate_updated_at: Option<Instant>,
     croc_has_live_rate: bool,
+    croc_has_overall_progress: bool,
+    croc_verifying: bool,
     transfer_speed_samples: Vec<f64>,
     latest_cli_progress_line: Option<String>,
     croc_file_progress: Option<(u64, u64)>,
@@ -286,6 +291,11 @@ struct DataBeamApp {
     croc_text_popup_open: bool,
     croc_text_copied_until: Option<f64>,
     settings_popup_open: bool,
+    croc_relay_check_rx: Option<mpsc::Receiver<Vec<PublicRelayStatus>>>,
+    croc_relay_results: Vec<PublicRelayStatus>,
+    croc_relay_check_error: Option<String>,
+    sendme_relay_check_rx: Option<mpsc::Receiver<Result<Vec<String>, String>>>,
+    sendme_relay_result: Option<Result<Vec<String>, String>>,
     /// Tray debug log to temp file (default off; see tray::set_debug_enabled).
     tray_debug_log: bool,
 
@@ -407,6 +417,9 @@ impl Default for DataBeamApp {
             transfer_state: TransferState::Idle,
             transfer_progress: 0.0,
             transfer_code: None,
+            croc_relay_notice: None,
+            croc_suggest_sendme: false,
+            croc_browser_send: false,
             transfer_log: Vec::new(),
             transfer_rx: None,
             transfer_handle: None,
@@ -416,6 +429,8 @@ impl Default for DataBeamApp {
             transfer_speed_bps: None,
             transfer_rate_updated_at: None,
             croc_has_live_rate: false,
+            croc_has_overall_progress: false,
+            croc_verifying: false,
             transfer_speed_samples: Vec::new(),
             latest_cli_progress_line: None,
             croc_file_progress: None,
@@ -471,6 +486,11 @@ impl Default for DataBeamApp {
             eazysendme_croc_handle: None,
             eazysendme_croc_rx: None,
             croc_receive_recent_codes: Vec::new(),
+            croc_relay_check_rx: None,
+            croc_relay_results: Vec::new(),
+            croc_relay_check_error: None,
+            sendme_relay_check_rx: None,
+            sendme_relay_result: None,
             croc_update_phase: CrocUpdatePhase::Idle,
             croc_update_check_rx: None,
             croc_update_apply_rx: None,
@@ -888,6 +908,7 @@ impl DataBeamApp {
     /// When croc switches to the next file's bar, the finished file's size is
     /// accumulated so progress never resets between files.
     fn apply_croc_bar_frame(&mut self, frame: CrocBarFrame) {
+        if self.croc_has_overall_progress { return; }
         // A new bar starts with a blank 0% render, so a done-bytes drop means
         // another file with the same name began (croc's bar description is the
         // bare filename, which repeats across folders).
@@ -980,7 +1001,9 @@ impl DataBeamApp {
             "Receiving"
         };
         let current_file = self.croc_bar_file.clone().unwrap_or_default();
-        let title = if progress_stale {
+        let title = if self.croc_verifying {
+            "Verifying files…".to_string()
+        } else if progress_stale {
             format!("{verb}\u{2026} (waiting for progress)")
         } else if current_file.is_empty() {
             format!("{verb}\u{2026}")
@@ -1006,7 +1029,7 @@ impl DataBeamApp {
             _ => None,
         };
 
-        let (rate_value, eta_value) = self.panel_rate_eta(done, total, progress_stale);
+        let (rate_value, eta_value) = self.panel_rate_eta(done, total, progress_stale || self.croc_verifying);
 
         CrocPanelData {
             title,
@@ -1149,6 +1172,7 @@ impl DataBeamApp {
             return;
         }
         self.selected_tool = tool;
+        self.croc_browser_send = false;
         self.persist_user_settings();
         self.send_items.clear();
         self.receive_code.clear();
@@ -1283,6 +1307,8 @@ impl DataBeamApp {
         self.transfer_progress = 0.0;
         self.transfer_code = None;
         self.transfer_log.clear();
+        self.croc_relay_notice = None;
+        self.croc_suggest_sendme = false;
         self.transfer_rx = None;
         self.transfer_handle = None;
         self.transfer_start_time = None;
@@ -1291,6 +1317,8 @@ impl DataBeamApp {
         self.transfer_speed_bps = None;
         self.transfer_rate_updated_at = None;
         self.croc_has_live_rate = false;
+        self.croc_has_overall_progress = false;
+        self.croc_verifying = false;
         self.transfer_speed_samples.clear();
         self.latest_cli_progress_line = None;
         self.croc_file_progress = None;
@@ -1563,6 +1591,28 @@ impl DataBeamApp {
             || (lower.contains("lookup") && lower.contains("i/o timeout"))
     }
 
+    fn handle_croc_relay_status(&mut self, message: String, replacement: Option<String>, suggest_sendme: bool) {
+        self.croc_relay_notice = Some(message.clone()); self.croc_suggest_sendme = suggest_sendme;
+        if self.view == AppView::Send && (message.starts_with("Auto troubleshooting") || suggest_sendme) {
+            self.transfer_code = None;
+            self.croc_qr_popup_open = false;
+        }
+        self.transfer_log.push(message);
+        if let Some(code) = replacement {
+            self.transfer_code = None; self.croc_qr_popup_open = false;
+            if self.selected_tool == SelectedTool::EazySendme {
+                self.eazysendme_custom_code = code.clone();
+                self.eazysendme_recent_codes.retain(|item| item != &code);
+                self.eazysendme_recent_codes.insert(0, code); self.eazysendme_recent_codes.truncate(5);
+            } else {
+                self.croc_use_custom_code = true; self.croc_custom_code = code.clone();
+                self.croc_recent_codes.retain(|item| item != &code);
+                self.croc_recent_codes.insert(0, code); self.croc_recent_codes.truncate(5);
+            }
+            self.persist_user_settings();
+        }
+    }
+
     fn fail_transfer(&mut self, e: String) {
         if let Some(handle) = &self.transfer_handle {
             handle.request_cancel();
@@ -1643,6 +1693,7 @@ impl DataBeamApp {
         if self.selected_tool == SelectedTool::EazySendme
             && self.eazysendme_auto_retry
             && self.eazy_retry_count < 3
+            && !e.starts_with("Croc public relay")
             && e != "Transfer cancelled"
             && !is_file_exists_error
         {
@@ -1762,7 +1813,7 @@ impl DataBeamApp {
             None
         };
         let export_line = lower.contains("exporting ");
-        let croc_counter_any = if self.selected_tool == SelectedTool::Croc {
+        let croc_counter_any = if self.selected_tool == SelectedTool::Croc && !self.croc_has_overall_progress {
             parse_croc_file_counter_progress(line)
         } else {
             None
@@ -1793,7 +1844,7 @@ impl DataBeamApp {
             }
         }
 
-        if self.selected_tool == SelectedTool::Croc && self.preparation_progress.is_none() {
+        if self.selected_tool == SelectedTool::Croc && self.preparation_progress.is_none() && !self.croc_has_overall_progress {
             if let Some(total) = parse_croc_total_size_hint(line) {
                 let update = match self.transfer_total_bytes {
                     Some(existing) => total > existing,
@@ -2706,6 +2757,33 @@ impl DataBeamApp {
                                     }
                                 }
                             }
+                            TransferMsg::CrocProgress(progress) => {
+                                if self.selected_tool == SelectedTool::Croc && self.transfer_state == TransferState::Running {
+                                    self.croc_has_overall_progress = true;
+                                    self.croc_verifying = false;
+                                    self.croc_has_live_rate = true;
+                                    self.transfer_phase = TransferPhase::Transferring;
+                                    self.preparing_progress = 1.0;
+                                    self.transfer_payload_start_time.get_or_insert(self.animation_time);
+                                    self.transfer_done_bytes = Some(progress.done);
+                                    self.transfer_total_bytes = Some(progress.total);
+                                    self.transfer_speed_bps = (progress.speed_bps > 0.0).then_some(progress.speed_bps);
+                                    self.transfer_rate_updated_at = Some(Instant::now());
+                                    self.croc_last_frame_at = Some(self.animation_time);
+                                    self.croc_file_progress = Some((progress.files_done, progress.files_total));
+                                    self.transfer_progress = if progress.total > 0 {
+                                        progress.done as f32 / progress.total as f32
+                                    } else if progress.files_total > 0 {
+                                        progress.files_done as f32 / progress.files_total as f32
+                                    } else { 0.0 };
+                                }
+                            }
+                            TransferMsg::CrocVerifying => {
+                                if self.selected_tool == SelectedTool::Croc && self.transfer_state == TransferState::Running {
+                                    self.croc_verifying = true;
+                                    self.transfer_speed_bps = None;
+                                }
+                            }
                             TransferMsg::SendmeSenderProgress {
                                 done,
                                 total,
@@ -2751,6 +2829,7 @@ impl DataBeamApp {
                                 }
                             }
                             TransferMsg::Progress(p) => {
+                                if self.selected_tool == SelectedTool::Croc && self.croc_has_overall_progress { continue; }
                                 if self.eazy_local_check_started_at.is_some() && p > 0.0 {
                                     self.eazy_local_check_started_at = None;
                                 }
@@ -2781,6 +2860,9 @@ impl DataBeamApp {
                                         }
                                     }
                                 }
+                            }
+                            TransferMsg::CrocRelayStatus { message, replacement, suggest_sendme } => {
+                                self.handle_croc_relay_status(message, replacement, suggest_sendme);
                             }
                             TransferMsg::Code(code) => {
                                 let should_replace = if is_masked_croc_code(&code) {
@@ -3155,6 +3237,8 @@ impl DataBeamApp {
                                 self.preparation_updated_at = None;
                                 self.transfer_rate_updated_at = None;
                                 self.croc_has_live_rate = false;
+                                self.croc_has_overall_progress = false;
+                                self.croc_verifying = false;
                                 if self.selected_tool == SelectedTool::Croc
                                     && self.view == AppView::Send
                                 {
@@ -3234,6 +3318,9 @@ impl DataBeamApp {
                                     }
                                 }
                             }
+                            TransferMsg::CrocRelayStatus { message, replacement, suggest_sendme } => {
+                                self.handle_croc_relay_status(message, replacement, suggest_sendme);
+                            }
                             TransferMsg::Code(code) => {
                                 // This is the short code we want to show!
                                 self.transfer_code = Some(code);
@@ -3249,7 +3336,8 @@ impl DataBeamApp {
                                 }
                             }
                             TransferMsg::Error(e) => {
-                                self.show_toast(format!("Croc error: {}", e), ERROR);
+                                if e.starts_with("Croc public relay") { self.fail_transfer(e); }
+                                else { self.show_toast(format!("Croc error: {}", e), ERROR); }
                             }
                             TransferMsg::Completed => {
                                 self.transfer_log
@@ -3760,13 +3848,36 @@ impl DataBeamApp {
         }
     }
 
+    fn poll_relay_checks(&mut self) {
+        if let Some(rx) = &self.croc_relay_check_rx {
+            match rx.try_recv() {
+                Ok(results) => { self.croc_relay_results = results; self.croc_relay_check_rx = None; }
+                Err(mpsc::TryRecvError::Disconnected) => { self.croc_relay_check_error = Some("Croc relay check could not complete. Try again.".into()); self.croc_relay_check_rx = None; }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(rx) = &self.sendme_relay_check_rx {
+            match rx.try_recv() {
+                Ok(result) => { self.sendme_relay_result = Some(result); self.sendme_relay_check_rx = None; }
+                Err(mpsc::TryRecvError::Disconnected) => { self.sendme_relay_result = Some(Err("Sendme relay check could not complete. Try again.".into())); self.sendme_relay_check_rx = None; }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+    }
+
     fn render_settings_popup(&mut self, ctx: &egui::Context) {
+        self.poll_relay_checks();
+        if self.croc_relay_check_rx.is_some() || self.sendme_relay_check_rx.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(150));
+        }
         let mut open = self.settings_popup_open;
         egui::Window::new("Settings")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::RIGHT_BOTTOM, [-12.0, -12.0])
+            .vscroll(true)
+            .max_height((ctx.screen_rect().height() - 48.0).clamp(200.0, 600.0))
             .show(ctx, |ui| {
                 ui.set_min_width(260.0);
                 // Only an owned tray icon may intercept window close.
@@ -3795,6 +3906,41 @@ impl DataBeamApp {
                             tray::set_debug_enabled(debug_toggle);
                             self.persist_user_settings();
                         }
+                    }
+                }
+                ui.add_space(8.0);
+                ui.separator();
+                ui.label(RichText::new("Public relay checks").strong());
+                ui.label(RichText::new("Reachability from this PC; transfers may use Direct or Relay.").size(11.0).color(TEXT_MUTED));
+                if ui.add_enabled(self.croc_relay_check_rx.is_none(), egui::Button::new("Check Croc public relays")).clicked() {
+                    self.croc_relay_results.clear(); self.croc_relay_check_error = None;
+                    self.croc_relay_check_rx = Some(backend::check_public_croc_relays());
+                    ctx.request_repaint();
+                }
+                if self.croc_relay_check_rx.is_some() {
+                    ui.horizontal(|ui| { ui.spinner(); ui.label("Checking four Croc relays…"); });
+                }
+                for result in &self.croc_relay_results {
+                    ui.label(RichText::new(format!("{} · {}", result.endpoint, if result.reachable { "Reachable" } else { "Unreachable" }))
+                        .size(11.0).color(if result.reachable { SUCCESS } else { WARNING }));
+                }
+                if !self.croc_relay_results.is_empty() && self.croc_relay_results.iter().all(|result| !result.reachable) {
+                    ui.label(RichText::new("No Croc public relay reachable. Use Sendme instead.").size(11.0).color(WARNING));
+                }
+                if let Some(error) = &self.croc_relay_check_error { ui.label(RichText::new(error).size(11.0).color(WARNING)); }
+                if ui.add_enabled(self.sendme_relay_check_rx.is_none(), egui::Button::new("Check Sendme public relay")).clicked() {
+                    self.sendme_relay_result = None;
+                    self.sendme_relay_check_rx = Some(backend::check_public_sendme_relay());
+                    ctx.request_repaint();
+                }
+                if self.sendme_relay_check_rx.is_some() {
+                    ui.horizontal(|ui| { ui.spinner(); ui.label("Connecting to a Sendme relay…"); });
+                }
+                if let Some(result) = &self.sendme_relay_result {
+                    match result {
+                        Ok(relays) => { ui.label(RichText::new(format!("Reachable · {}", relays.join(", "))).size(11.0).color(SUCCESS));
+                            ui.label(RichText::new("Iroh relay connection established.").size(11.0).color(TEXT_MUTED)); }
+                        Err(error) => { ui.label(RichText::new(error).size(11.0).color(WARNING)); }
                     }
                 }
                 // Croc self-update status + manual check (automatic checks
@@ -3885,15 +4031,17 @@ impl DataBeamApp {
         let mut open = self.croc_qr_popup_open;
         let code_opt = self.transfer_code.clone();
         let accent = self.engine_color();
+        let qr_side: f32 = if self.selected_tool == SelectedTool::Sendme { 420.0 } else { 320.0 };
         let (title, share_label) = match self.selected_tool {
             SelectedTool::Croc => ("Croc QR", "Scan or copy this code"),
             SelectedTool::Sendme => ("Sendme QR", "Scan or copy this ticket"),
-            SelectedTool::EazySendme => ("EazySendme QR", "Scan or copy this ticket"),
+            SelectedTool::EazySendme => ("EazySendme QR", "Scan or copy this code"),
         };
         egui::Window::new(title)
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
+            .min_width((qr_side + 16.0).min((ctx.screen_rect().width() - 32.0).max(240.0)))
             .show(ctx, |ui| {
                 let Some(code) = code_opt.as_ref() else {
                     ui.label("Waiting for code...");
@@ -3906,12 +4054,12 @@ impl DataBeamApp {
                     self.show_toast("Code copied".to_string(), SUCCESS);
                 }
                 ui.add_space(4.0);
-                render_qr_blocks(ui, code, 320.0);
+                render_qr_blocks(ui, code, qr_side);
                 ui.label(
                     RichText::new(code)
                         .monospace()
                         .size(11.0)
-                        .color(Color32::BLACK),
+                        .color(TEXT_PRIMARY),
                 );
             });
         self.croc_qr_popup_open = open;
@@ -4128,13 +4276,7 @@ impl eframe::App for DataBeamApp {
                 ui.horizontal(|ui| {
                     let accent = self.engine_color();
                     ui.label(RichText::new("⚡").size(18.0).color(accent));
-                    ui.label(
-                        RichText::new("DataBeam")
-                            .size(16.0)
-                            .color(TEXT_PRIMARY)
-                            .strong(),
-                    );
-                    ui.add_space(12.0);
+                    ui.add_space(4.0);
 
                     ui.scope(|ui| {
                         let mut style = (*ui.style()).as_ref().clone();
@@ -4174,6 +4316,7 @@ impl eframe::App for DataBeamApp {
                             );
                             if btn.clicked() && self.view != *view && !transfer_running {
                                 self.view = *view;
+                                self.croc_browser_send = false;
                                 // Clear state to prevent confusion
                                 self.send_items.clear();
                                 self.receive_code.clear();
@@ -4181,7 +4324,6 @@ impl eframe::App for DataBeamApp {
                             }
                         }
 
-                        ui.add_space(8.0);
                         let unread_news = self.troubleshoot_news.has_unread();
                         let troubleshoot_button = ui.selectable_label(false,
                             RichText::new("❓ Troubleshoot").size(12.0).color(TEXT_SECONDARY));
@@ -4568,6 +4710,7 @@ impl DataBeamApp {
                                 if self.selected_tool != SelectedTool::Croc {
                                     self.switch_tool(SelectedTool::Croc);
                                 }
+                                self.croc_browser_send = false;
                                 self.croc_text_mode = text_mode;
                                 self.view = AppView::Send;
                             }
@@ -4575,6 +4718,19 @@ impl DataBeamApp {
                     });
                 });
             });
+        ui.add_space(8.0);
+
+        ui.add_enabled_ui(croc_avail && idle, |ui| {
+            if accent_button_sized(ui, "🌐 Send to browser", CROC_COLOR, Vec2::new(total_w, 38.0)).clicked() {
+                if self.selected_tool != SelectedTool::Croc {
+                    self.switch_tool(SelectedTool::Croc);
+                }
+                self.reset_transfer();
+                self.croc_text_mode = false;
+                self.croc_browser_send = true;
+                self.view = AppView::Send;
+            }
+        });
         ui.add_space(8.0);
 
         let sendme_avail = sendme_status.as_ref().map(|s| s.available).unwrap_or(false);
@@ -4856,6 +5012,14 @@ impl DataBeamApp {
     }
 
     fn show_send(&mut self, ui: &mut egui::Ui) {
+        if self.selected_tool == SelectedTool::Croc && self.croc_browser_send {
+            card_frame(ui, |ui| {
+                ui.label(RichText::new("On the receiving device, open:").strong().color(TEXT_PRIMARY));
+                ui.hyperlink_to("https://getcroc.com", "https://getcroc.com");
+                ui.label(RichText::new("Choose files below, send, and share the Croc code with the receiver.").size(12.0).color(TEXT_SECONDARY));
+            });
+            ui.add_space(8.0);
+        }
         section_header(ui, "📤", "Send");
         ui.add_space(4.0);
         let send_locked = self.transfer_state == TransferState::Running;
@@ -5510,6 +5674,7 @@ impl DataBeamApp {
     fn show_transfer_status(&mut self, ui: &mut egui::Ui) {
         let wants_cancel = false;
         let mut wants_show_qr = false;
+        let mut wants_sendme = false;
 
         card_frame(ui, |ui| {
             match &self.transfer_state {
@@ -5919,6 +6084,11 @@ impl DataBeamApp {
                 }
             }
 
+            if let Some(message) = &self.croc_relay_notice {
+                ui.add_space(6.0);
+                ui.label(RichText::new(message).color(WARNING).size(12.0));
+                if self.croc_suggest_sendme && ui.button("Use Sendme instead").clicked() { wants_sendme = true; }
+            }
             // Code/ticket — for Croc sender, only show once past the Preparing phase
             let show_code = self.transfer_code.is_some() && {
                 let sendme_receiver =
@@ -5980,6 +6150,11 @@ impl DataBeamApp {
         if wants_cancel {
             self.cancel_transfer();
         }
+        if wants_sendme {
+            self.reset_transfer(); self.selected_tool = SelectedTool::Sendme;
+            if self.view == AppView::Receive { self.receive_code.clear(); }
+            self.show_toast("Sendme selected. Sender: share a new ticket. Receiver: paste the sender's ticket.".into(), WARNING);
+        }
         if wants_show_qr {
             self.croc_qr_popup_open = true;
         }
@@ -5988,34 +6163,46 @@ impl DataBeamApp {
 
 // ── Helpers ────────────────────────────────────────────────────────
 
-fn render_qr_blocks(ui: &mut egui::Ui, code: &str, max_side: f32) {
-    let Ok(qr) = QrCode::new(code.as_bytes()) else {
-        ui.label("Unable to generate QR");
-        return;
-    };
-    let colors = qr.to_colors();
+// Shared by the desktop widget and interoperability fixtures. Include the QR
+// quiet zone and rasterize whole pixels instead of anti-aliased vector modules.
+fn desktop_qr_image(code: &str, module_pixels: usize) -> Result<egui::ColorImage, qrcode::types::QrError> {
+    let qr = QrCode::new(code.as_bytes())?;
     let side = qr.width();
-    if side == 0 {
-        ui.label("Unable to generate QR");
-        return;
-    }
-
-    let module = (max_side / side as f32).max(2.0);
-    let draw_side = module * side as f32;
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(draw_side, draw_side), egui::Sense::hover());
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 6.0, Color32::WHITE);
-
+    let scale = module_pixels.max(1);
+    let width = (side + 8) * scale;
+    let mut image = egui::ColorImage::new([width, width], Color32::WHITE);
+    let modules = qr.to_colors();
     for y in 0..side {
         for x in 0..side {
-            let idx = y * side + x;
-            if colors[idx] == QrModuleColor::Dark {
-                let min = rect.min + Vec2::new(x as f32 * module, y as f32 * module);
-                let max = min + Vec2::splat(module);
-                painter.rect_filled(egui::Rect::from_min_max(min, max), 0.0, Color32::BLACK);
+            if modules[y * side + x] == QrModuleColor::Dark {
+                for py in (y + 4) * scale..(y + 5) * scale {
+                    for px in (x + 4) * scale..(x + 5) * scale {
+                        image.pixels[py * width + px] = Color32::BLACK;
+                    }
+                }
             }
         }
     }
+    Ok(image)
+}
+
+fn render_qr_blocks(ui: &mut egui::Ui, code: &str, max_side: f32) {
+    let Ok(qr) = QrCode::new(code.as_bytes()) else { ui.label("Unable to generate QR"); return; };
+    let ppp = ui.ctx().pixels_per_point();
+    let scale = ((max_side.min(ui.available_width()) * ppp) / (qr.width() + 8) as f32).floor().max(1.0) as usize;
+    let id = egui::Id::new("desktop-transfer-qr-texture");
+    let cached = ui.ctx().data_mut(|d| d.get_temp::<(String, usize, egui::TextureHandle)>(id));
+    let texture = match cached {
+        Some((old, old_scale, texture)) if old == code && old_scale == scale => texture,
+        _ => {
+            let Ok(image) = desktop_qr_image(code, scale) else { return; };
+            let texture = ui.ctx().load_texture("DataBeam sharing QR", image, egui::TextureOptions::NEAREST);
+            ui.ctx().data_mut(|d| d.insert_temp(id, (code.to_owned(), scale, texture.clone())));
+            texture
+        }
+    };
+    let size = texture.size_vec2() / ppp;
+    ui.image((texture.id(), size));
 }
 
 fn is_masked_croc_code(code: &str) -> bool {
@@ -7013,6 +7200,89 @@ mod parse_tests {
     use std::sync::mpsc;
 
     #[test]
+    fn desktop_qr_has_four_white_modules_and_integer_blocks() {
+        let image = super::desktop_qr_image("desktop-qr-test", 5).unwrap();
+        let width = image.size[0];
+        for y in 0..width {
+            for x in 0..width {
+                if x < 20 || y < 20 || x >= width - 20 || y >= width - 20 { assert_eq!(image.pixels[y * width + x], Color32::WHITE); }
+                assert_eq!(image.pixels[y * width + x], image.pixels[(y / 5 * 5) * width + (x / 5 * 5)]);
+            }
+        }
+        // Standard finder: black outer ring, white inner ring, black centre.
+        for (module, expected) in [(4, Color32::BLACK), (5, Color32::WHITE), (7, Color32::BLACK)] {
+            assert_eq!(image.pixels[(module * 5) * width + module * 5], expected);
+        }
+    }
+
+    #[test]
+    #[ignore = "writes exact desktop QR image fixtures into DATABEAM_QR_FIXTURE_DIR"]
+    fn desktop_qr_interop_fixtures() {
+        let folder = std::path::PathBuf::from(std::env::var("DATABEAM_QR_FIXTURE_DIR").unwrap());
+        std::fs::create_dir_all(&folder).unwrap();
+        let ticket = std::env::var("DATABEAM_QR_TICKET_FILE").ok()
+            .map(|path| std::fs::read_to_string(path).unwrap().trim().to_owned())
+            .unwrap_or_else(|| "blob".to_string() + &"a".repeat(220));
+        for (name, value) in [("croc", "desktop-croc-code".to_string()), ("easysendme", "desktop-easy-code".to_string()), ("sendme", ticket)] {
+            let raster = super::desktop_qr_image(&value, 6).unwrap();
+            let mut png = image::RgbImage::new(raster.size[0] as u32, raster.size[1] as u32);
+            for (i, pixel) in raster.pixels.iter().enumerate() { png.put_pixel((i % raster.size[0]) as u32, (i / raster.size[0]) as u32, image::Rgb([pixel.r(), pixel.g(), pixel.b()])); }
+            png.save(folder.join(format!("{name}.png"))).unwrap();
+            std::fs::write(folder.join(format!("{name}.txt")), value).unwrap();
+        }
+    }
+
+    #[test]
+    fn relay_checks_do_not_block_and_recover_when_a_worker_disconnects() {
+        let mut app=DataBeamApp::default();
+        let (croc_tx,croc_rx)=mpsc::channel();
+        let (sendme_tx,sendme_rx)=mpsc::channel();
+        app.croc_relay_check_rx=Some(croc_rx);app.sendme_relay_check_rx=Some(sendme_rx);
+        app.poll_relay_checks();
+        assert!(app.croc_relay_check_rx.is_some() && app.sendme_relay_check_rx.is_some());
+        drop(croc_tx);
+        sendme_tx.send(Ok(vec!["https://relay.example/".into()])).unwrap();
+        app.poll_relay_checks();
+        assert!(app.croc_relay_check_rx.is_none());assert!(app.croc_relay_check_error.is_some());
+        assert!(app.sendme_relay_check_rx.is_none());
+        assert_eq!(app.sendme_relay_result,Some(Ok(vec!["https://relay.example/".into()])));
+    }
+
+    #[test]
+    #[ignore="requires public relay network access"]
+    fn desktop_live_public_relay_checks() {
+        let croc=super::backend::check_public_croc_relays().recv_timeout(std::time::Duration::from_secs(8)).unwrap();
+        assert_eq!(croc.len(),4);
+        for result in croc {println!("{} reachable={}",result.endpoint,result.reachable);}
+        let sendme=super::backend::check_public_sendme_relay().recv_timeout(std::time::Duration::from_secs(16)).unwrap().unwrap();
+        assert!(!sendme.is_empty());println!("Sendme Iroh relay connected: {}",sendme.join(", "));
+    }
+
+    #[test]
+    fn croc_relay_replacement_updates_input_and_clears_stale_share_code() {
+        let temp = tempfile::tempdir().unwrap();
+        let _settings = SettingsFileGuard::set(&temp.path().join("settings.json"));
+        for tool in [SelectedTool::Croc, SelectedTool::EazySendme] {
+            let mut app = DataBeamApp::default(); app.selected_tool = tool;
+            app.transfer_code = Some("old-code".into()); app.croc_qr_popup_open = true;
+            app.handle_croc_relay_status("Earlier code temporarily failing".into(), Some("new-working-code".into()), false);
+            assert!(app.transfer_code.is_none()); assert!(!app.croc_qr_popup_open);
+            if tool == SelectedTool::Croc { assert_eq!(app.croc_custom_code, "new-working-code"); }
+            else { assert_eq!(app.eazysendme_custom_code, "new-working-code"); }
+        }
+    }
+
+    #[test]
+    fn croc_all_relays_down_does_not_loop_easysendme_auto_retry() {
+        let mut app = DataBeamApp::default(); app.selected_tool = SelectedTool::EazySendme;
+        app.eazysendme_auto_retry = true;
+        app.handle_croc_relay_status("Use Sendme instead".into(), None, true);
+        app.fail_transfer("Croc public relays could not be reached. Use Sendme instead.".into());
+        assert!(app.croc_suggest_sendme); assert!(app.eazy_next_retry_time.is_none());
+        assert!(matches!(app.transfer_state, TransferState::Failed(_)));
+    }
+
+    #[test]
     fn croc_conflict_card_includes_the_affected_item() {
         for name in ["folder/John's report.txt", "folder/file exists.txt"] {
             let mut app = DataBeamApp::default();
@@ -7606,6 +7876,32 @@ mod parse_tests {
         assert_eq!(app.croc_completed_bytes, 0);
         app.reset_transfer();
         assert!(app.preparation_progress.is_none());
+    }
+
+    #[test]
+    fn croc_overall_telemetry_supersedes_legacy_file_bars() {
+        let mut app = DataBeamApp::default();
+        app.selected_tool = SelectedTool::Croc;
+        app.transfer_state = TransferState::Running;
+        let (tx, rx) = mpsc::channel();
+        app.transfer_rx = Some(rx);
+        tx.send(TransferMsg::CrocProgress(crate::backend::CrocProgress {
+            done: 250, total: 400, speed_bps: 50.0, files_done: 1, files_total: 3,
+        })).unwrap();
+        tx.send(TransferMsg::Output("second.bin  10% |█ | (30/300 B, 1 B/s) [0s:1s]".into())).unwrap();
+        tx.send(TransferMsg::Output(" 2/3".into())).unwrap();
+        tx.send(TransferMsg::Progress(0.99)).unwrap();
+        app.poll_transfer();
+        assert_eq!(app.transfer_done_bytes, Some(250));
+        assert_eq!(app.transfer_total_bytes, Some(400));
+        assert_eq!(app.transfer_progress, 0.625);
+        assert_eq!(app.croc_file_progress, Some((1, 3)));
+        tx.send(TransferMsg::CrocVerifying).unwrap();
+        app.poll_transfer();
+        assert_eq!(app.build_croc_panel_data(Color32::WHITE, app.transfer_progress, 250, 400).title, "Verifying files…");
+        assert_eq!(app.transfer_done_bytes, Some(250));
+        app.reset_transfer();
+        assert!(!app.croc_has_overall_progress);
     }
 
     #[test]

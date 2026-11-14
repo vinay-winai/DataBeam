@@ -1,5 +1,7 @@
 pub mod core;
 pub use core::live_rate::LiveRate;
+pub use core::diagnostics::check_public_relay;
+pub use core::network::notify_network_change;
 
 pub use core::{
     receive::{

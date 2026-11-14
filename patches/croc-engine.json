@@ -1,7 +1,7 @@
 {
-  "upstream_tag": "v11.5.5",
-  "engine_version": "11.5.5-databeam",
-  "source_sha256": "c8f6b6cea7d57aed8cdddda4d13d468b15c4d6b195c75ff389d1d64effabdc1b",
-  "patch": "croc-v11.5.5-databeam.patch",
-  "go_version": "1.27.2"
+  "upstream_tag": "v11.6.5",
+  "engine_version": "11.6.5-databeam",
+  "source_sha256": "4685fdf9b3f57b47c50efd0a9136b5728ad445461d2500bd1309c1d6f16a5349",
+  "patch": "croc-v11.6.5-databeam.patch",
+  "go_version": "1.27.3"
 }

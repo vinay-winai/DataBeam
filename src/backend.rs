@@ -899,6 +899,8 @@ pub fn resolve_tool_path(tool: &Tool, statuses: &[ToolStatus]) -> Option<String>
 pub enum TransferMsg {
     PreparationProgress(PreparationProgress),
     CrocRate(f64),
+    CrocProgress(CrocProgress),
+    CrocVerifying,
     SendmeSenderProgress {
         done: u64,
         total: u64,
@@ -906,6 +908,7 @@ pub enum TransferMsg {
     },
     Output(String),
     ReceivedText(String),
+    CrocRelayStatus { message: String, replacement: Option<String>, suggest_sendme: bool },
     Progress(f32),
     Code(String),
     Completed,
@@ -923,6 +926,15 @@ pub struct PreparationProgress {
     pub done: u64,
     pub total: u64,
     pub speed_bps: f64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct CrocProgress {
+    pub done: u64,
+    pub total: u64,
+    pub speed_bps: f64,
+    pub files_done: u64,
+    pub files_total: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1494,6 +1506,7 @@ fn croc_transfer_command(binary: &str, code: Option<&str>, relay: Option<&str>) 
     // of the selected files or --text. All these flags are global.
     cmd.args(["--yes", "--ignore-stdin"]);
     cmd.env("DATABEAM_CROC_PROGRESS", "1");
+    cmd.env("CROC_NO_UPDATE_CHECK", "1");
     let custom_relay = ["CROC_RELAY", "CROC_RELAY6"]
         .iter()
         .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()));
@@ -1520,11 +1533,87 @@ fn croc_transfer_command(binary: &str, code: Option<&str>, relay: Option<&str>) 
     cmd
 }
 
+fn public_relay_connection_error(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    !lower.contains("lookup ") && !lower.contains("room ") &&
+    (lower.contains("could not connect to ") || lower.contains("relay connection failed")) &&
+    ["i/o timeout", "connection refused", "connection reset", "network is unreachable", "no route to host", "relay closed"].iter().any(|cause| lower.contains(cause))
+}
+
+// Bounded connectivity checks on worker threads; cancellation never waits for DNS.
+pub const CROC_PUBLIC_RELAYS: [&str; 4] = ["1.getcroc.com:9009", "2.getcroc.com:9009", "3.getcroc.com:9009", "4.getcroc.com:9009"];
+
+#[derive(Debug, Clone)]
+pub struct PublicRelayStatus {
+    pub endpoint: String,
+    pub reachable: bool,
+}
+
+pub fn check_public_croc_relays() -> mpsc::Receiver<Vec<PublicRelayStatus>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let healthy = probe_public_croc_relays(&Arc::new(AtomicBool::new(false)));
+        let results = CROC_PUBLIC_RELAYS.iter().map(|endpoint| PublicRelayStatus {
+            endpoint: (*endpoint).to_owned(), reachable: healthy.contains(endpoint),
+        }).collect();
+        let _ = tx.send(results);
+    });
+    rx
+}
+
+pub fn check_public_sendme_relay() -> mpsc::Receiver<Result<Vec<String>, String>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result = tokio::runtime::Runtime::new()
+            .map_err(|error| error.to_string())
+            .and_then(|runtime| runtime.block_on(sendme_native::check_public_relay()).map_err(|error| error.to_string()));
+        let _ = tx.send(result);
+    });
+    rx
+}
+
+fn probe_public_croc_relays(cancel: &Arc<AtomicBool>) -> Vec<&'static str> {
+    let (tx, rx) = mpsc::channel();
+    for endpoint in CROC_PUBLIC_RELAYS {
+        let tx = tx.clone(); let cancel = cancel.clone();
+        thread::spawn(move || {
+            let reachable = endpoint.to_socket_addrs().ok().is_some_and(|addrs| addrs.filter(|addr| addr.is_ipv4()).any(|addr| {
+                !cancel.load(Ordering::Relaxed) && std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(3)).is_ok()
+            }));
+            let _ = tx.send((endpoint, reachable));
+        });
+    }
+    drop(tx);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut healthy = Vec::new(); let mut replies = 0;
+    while replies < 4 && Instant::now() < deadline && !cancel.load(Ordering::Relaxed) {
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok((relay, reachable)) => { replies += 1; if reachable { healthy.push(relay); } }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+    healthy.sort_unstable(); healthy
+}
+
+fn replacement_croc_code(old: &str, relay: &str) -> Option<String> {
+    (0..256).map(|_| random_croc_code()).find(|code| code != old && croc_relay_for_code(code) == relay)
+}
+
 fn spawn_croc_transfer(
     initial_code: Option<String>,
     announce_code: bool,
     make_command: impl Fn(Option<&str>, Option<&str>) -> Command + Send + 'static,
     resolve_relay: impl Fn(&str) -> Option<String> + Send + 'static,
+) -> (mpsc::Receiver<TransferMsg>, ProcessHandle) {
+    spawn_croc_transfer_with_probe(initial_code, announce_code, make_command, resolve_relay, probe_public_croc_relays)
+}
+
+fn spawn_croc_transfer_with_probe(
+    initial_code: Option<String>, announce_code: bool,
+    make_command: impl Fn(Option<&str>, Option<&str>) -> Command + Send + 'static,
+    resolve_relay: impl Fn(&str) -> Option<String> + Send + 'static,
+    probe_relays: impl Fn(&Arc<AtomicBool>) -> Vec<&'static str> + Send + 'static,
 ) -> (mpsc::Receiver<TransferMsg>, ProcessHandle) {
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -1536,10 +1625,12 @@ fn spawn_croc_transfer(
         let mut code = initial_code;
         let mut relay_override: Option<String> = None;
         let mut dns_retried = false;
+        let mut health_checked = false;
+        let custom_relay = ["CROC_RELAY", "CROC_RELAY6"].iter().any(|key| std::env::var_os(key).is_some_and(|v| !v.is_empty()));
         let _ = tx.send(TransferMsg::Started);
-        // At most one probe fallback and one DNS fallback, before payload
-        // transfer only. Never replay a partially completed transfer.
-        for _ in 0..3 {
+        // One code replacement plus the existing probe/DNS fallbacks, before
+        // payload transfer only. Never replay a partially completed transfer.
+        for _ in 0..4 {
             if cancel2.load(Ordering::Relaxed) {
                 break;
             }
@@ -1695,6 +1786,31 @@ fn spawn_croc_transfer(
                     "Public relay probes failed; retrying with a fresh random code and croc's normal connection timeout.".to_string()
                 ));
                 continue;
+            }
+            if !health_checked && !custom_relay && !output.payload_started
+                && output.error.as_deref().is_some_and(public_relay_connection_error) {
+                health_checked = true;
+                let _ = tx.send(TransferMsg::CrocRelayStatus { message: "Auto troubleshooting Croc public relays…".into(), replacement: None, suggest_sendme: false });
+                let healthy = probe_relays(&cancel2);
+                if cancel2.load(Ordering::Relaxed) { break; }
+                if healthy.is_empty() {
+                    let message = "Croc public relays could not be reached from this device. Use Sendme instead and share its ticket with the receiver.".to_string();
+                    let _ = tx.send(TransferMsg::CrocRelayStatus { message: message.clone(), replacement: None, suggest_sendme: true });
+                    let _ = tx.send(TransferMsg::Error(message)); return;
+                }
+                if !announce_code {
+                    let message = "Croc public relay for this code is temporarily failing. Other relays are reachable. Ask the sender to generate and share a replacement code, or use Sendme.".to_string();
+                    let _ = tx.send(TransferMsg::CrocRelayStatus { message: message.clone(), replacement: None, suggest_sendme: false });
+                    let _ = tx.send(TransferMsg::Error(message)); return;
+                }
+                if let Some(old) = code.as_deref() {
+                    let relay = healthy.iter().copied().find(|relay| *relay != croc_relay_for_code(old)).unwrap_or(healthy[0]);
+                    if let Some(new_code) = replacement_croc_code(old, relay) {
+                        let message = format!("Earlier code {old} is temporarily failing due to a Croc public relay connection problem. Generated a replacement for {relay}. Share the new code with the receiver.");
+                        let _ = tx.send(TransferMsg::CrocRelayStatus { message, replacement: Some(new_code.clone()), suggest_sendme: false });
+                        code = Some(new_code); relay_override = None; continue;
+                    }
+                }
             }
             if !dns_retried {
                 if let Some(endpoint) = output.dns_relay() {
@@ -2551,6 +2667,16 @@ fn parse_croc_output(
         return;
     }
     if trimmed == "DATABEAM_PREPARED_V1" { return; }
+    if trimmed == "DATABEAM_VERIFY_V1" { let _ = tx.send(TransferMsg::CrocVerifying); return; }
+    if let Some(json) = trimmed.strip_prefix("DATABEAM_TRANSFER_V1 ") {
+        if let Ok(progress) = serde_json::from_str::<CrocProgress>(json) {
+            if progress.done <= progress.total && progress.files_done <= progress.files_total
+                && progress.speed_bps.is_finite() && progress.speed_bps >= 0.0 {
+                let _ = tx.send(TransferMsg::CrocProgress(progress));
+            }
+        }
+        return;
+    }
 
     if let Some(json) = trimmed.strip_prefix("DATABEAM_PREPARE_V1 ") {
         if let Ok(progress) = serde_json::from_str::<PreparationProgress>(json) {
@@ -2821,6 +2947,7 @@ pub(crate) fn kill_all_tracked_children() {
 #[cfg(test)]
 mod tests {
     use super::cleanup_sendme_send_dirs;
+    use super::{Arc, Ordering, Duration};
 
     #[test]
     fn croc_conflict_prompt_keeps_the_complete_item_name() {
@@ -3105,6 +3232,10 @@ mod tests {
             super::parse_croc_output(line, &tx, &cancel, false);
         }
         assert!(rx.try_recv().is_err());
+        super::parse_croc_output("DATABEAM_TRANSFER_V1 {\"done\":250,\"total\":400,\"speed_bps\":50,\"files_done\":1,\"files_total\":3}", &tx, &cancel, false);
+        assert!(matches!(rx.try_recv().unwrap(), super::TransferMsg::CrocProgress(progress) if progress.done == 250 && progress.total == 400 && progress.files_done == 1));
+        super::parse_croc_output("DATABEAM_TRANSFER_V1 {\"done\":401,\"total\":400,\"speed_bps\":50,\"files_done\":1,\"files_total\":3}", &tx, &cancel, false);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -3160,6 +3291,90 @@ mod tests {
         ] {
             assert!(!super::croc_preparation_summary(status));
         }
+    }
+
+    const RELAY_CONNECT_ERROR: &str = "could not connect to 3.getcroc.com:9009: dial tcp 165.227.90.189:9009: i/o timeout";
+
+    #[test]
+    fn croc_relay_recovery_replaces_sender_code_and_retries_once() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = calls.clone();
+        let (rx, _) = super::spawn_croc_transfer_with_probe(
+            Some("custom-failed-code".into()), true,
+            move |code, _| {
+                let mut calls = observed.lock().unwrap(); calls.push(code.unwrap().to_string());
+                if calls.len() == 1 { fake_croc(&[RELAY_CONNECT_ERROR], 1) }
+                else { assert_eq!(super::croc_relay_for_code(code.unwrap()), "1.getcroc.com:9009"); fake_croc(&["DATABEAM_PREPARED_V1"], 0) }
+            }, |_| None, |_| vec!["1.getcroc.com:9009"],
+        );
+        let mut checking = false; let mut replacement = None; let mut announced = None;
+        loop {
+            match rx.recv_timeout(Duration::from_secs(15)).unwrap() {
+                super::TransferMsg::CrocRelayStatus { message, replacement: next, .. } => {
+                    checking |= message.contains("Auto troubleshooting"); if next.is_some() { replacement = next; }
+                }
+                super::TransferMsg::Code(code) => announced = Some(code),
+                super::TransferMsg::Completed => break,
+                super::TransferMsg::Error(error) => panic!("{error}"), _ => {}
+            }
+        }
+        assert!(checking); assert_eq!(replacement, announced); assert_ne!(replacement.as_deref(), Some("custom-failed-code"));
+        assert_eq!(calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn croc_unreachable_relays_prompt_sendme_without_retrying() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0)); let count = calls.clone();
+        let (rx, _) = super::spawn_croc_transfer_with_probe(Some("failed-code".into()), true,
+            move |_, _| { count.fetch_add(1, Ordering::Relaxed); fake_croc(&[RELAY_CONNECT_ERROR], 1) }, |_| None, |_| vec![]);
+        let mut suggest = false;
+        loop { match rx.recv_timeout(Duration::from_secs(15)).unwrap() {
+            super::TransferMsg::CrocRelayStatus { suggest_sendme, replacement, .. } => { suggest |= suggest_sendme; assert!(replacement.is_none()); }
+            super::TransferMsg::Error(error) => { assert!(error.contains("Use Sendme")); break; }
+            _ => {}
+        }}
+        assert!(suggest); assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn croc_receiver_never_invents_a_replacement_secret() {
+        let (rx, _) = super::spawn_croc_transfer_with_probe(Some("sender-owned-code".into()), false,
+            |code, _| { assert_eq!(code, Some("sender-owned-code")); fake_croc(&[RELAY_CONNECT_ERROR], 1) }, |_| None, |_| vec!["1.getcroc.com:9009"]);
+        loop { match rx.recv_timeout(Duration::from_secs(15)).unwrap() {
+            super::TransferMsg::CrocRelayStatus { replacement, .. } => assert!(replacement.is_none()),
+            super::TransferMsg::Code(_) => panic!("receiver changed the secret"),
+            super::TransferMsg::Error(error) => { assert!(error.contains("Ask the sender")); break; }, _ => {}
+        }}
+    }
+
+    #[test]
+    fn croc_relay_recovery_does_not_replay_payload_or_authentication_errors() {
+        for lines in [vec!["Sending (127.0.0.1->192.0.2.1)", RELAY_CONNECT_ERROR], vec!["error: incorrect passphrase"], vec!["error: room not found"], vec!["decompress data: corrupt input"]] {
+            let (rx, _) = super::spawn_croc_transfer_with_probe(Some("original-code".into()), true,
+                move |_, _| fake_croc(&lines, 1), |_| None, |_| panic!("must not probe/replay this failure"));
+            assert!(matches!(croc_terminal_message(rx), super::TransferMsg::Error(_)));
+        }
+    }
+
+    #[test]
+    fn croc_relay_replacement_is_bounded_even_if_next_attempt_fails() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0)); let count = attempts.clone();
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0)); let checks = probes.clone();
+        let (rx, _) = super::spawn_croc_transfer_with_probe(Some("failed-code".into()), true,
+            move |_, _| { count.fetch_add(1, Ordering::Relaxed); fake_croc(&[RELAY_CONNECT_ERROR], 1) }, |_| None,
+            move |_| { checks.fetch_add(1, Ordering::Relaxed); vec!["1.getcroc.com:9009"] });
+        assert!(matches!(croc_terminal_message(rx), super::TransferMsg::Error(_)));
+        assert_eq!(attempts.load(Ordering::Relaxed), 2); assert_eq!(probes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn croc_cancel_during_relay_checks_never_starts_a_new_attempt() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0)); let count = attempts.clone();
+        let (rx, _) = super::spawn_croc_transfer_with_probe(Some("original-code".into()), true,
+            move |_, _| { count.fetch_add(1, Ordering::Relaxed); fake_croc(&[RELAY_CONNECT_ERROR], 1) }, |_| None,
+            |cancel| { cancel.store(true, Ordering::Relaxed); vec!["1.getcroc.com:9009"] });
+        assert!(matches!(croc_terminal_message(rx), super::TransferMsg::Error(error) if error == "Transfer cancelled"));
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
     }
 
     #[test]

@@ -1,0 +1,965 @@
+diff --git a/src/croc/bundle.go b/src/croc/bundle.go
+index 84ee47c..698f5bb 100644
+--- a/src/croc/bundle.go
++++ b/src/croc/bundle.go
+@@ -638,6 +638,7 @@ func (c *Client) finishReceivedBundle(unit *bundleReceiveUnit) error {
+ // All verification precedes any publication. Staged files are private, and
+ // every cleanup path leaves already-published members in place.
+ func (c *Client) verifyAndCommitBundle(spool *os.File) (result error) {
++	c.dataBeamVerifying()
+ 	started := time.Now()
+ 	s := c.bundleState()
+ 	payloadHash := xxhash.New()
+@@ -800,6 +801,10 @@ func recheckBundleDestination(root *receivefs.Root, file FileInfo) error {
+ }
+ 
+ func (c *Client) newBundleProgress(indices []int, offsets []int64) func(int64, int) {
++	c.startDataBeamTransfer()
++	if c.dataBeamTransfer != nil {
++		c.dataBeamTransfer.begin(indices[0], 0)
++	}
+ 	// Render only original names and sizes. The payload ID and temporary filename
+ 	// never become visible in normal output, including sender progress.
+ 	var mu sync.Mutex
+@@ -817,7 +822,14 @@ func (c *Client) newBundleProgress(indices []int, offsets []int64) func(int64, i
+ 		mu.Lock()
+ 		defer mu.Unlock()
+ 		for i := range indices {
+-			done[i] += max(int64(0), min(offsets[i]+sizes[i], position+int64(length))-max(offsets[i], position))
++			delta := max(int64(0), min(offsets[i]+sizes[i], position+int64(length))-max(offsets[i], position))
++			done[i] += delta
++			if c.dataBeamTransfer != nil {
++				c.dataBeamTransfer.advance(indices[i], delta)
++			}
++			if c.dataBeamRate != nil {
++				c.dataBeamRate.add(delta)
++			}
+ 		}
+ 		for current < last && done[current] == sizes[current] {
+ 			current++
+diff --git a/src/croc/croc.go b/src/croc/croc.go
+index 86724c0..e12c0f4 100644
+--- a/src/croc/croc.go
++++ b/src/croc/croc.go
+@@ -294,6 +294,9 @@ type Client struct {
+ 	sourceSnapshots          []os.FileInfo
+ 	remainingPreparationOnce sync.Once
+ 	preparationErr           atomic.Value
++	dataBeamPreparation      *dataBeamPreparation
++	dataBeamRate             *dataBeamRate
++	dataBeamTransfer         *dataBeamTransfer
+ 	exactHashMu              sync.Mutex
+ 	exactHashPending         int
+ 	exactHashLocal           []byte
+@@ -1314,6 +1317,9 @@ func exactPathExcluded(exclusions []string, candidate string) bool {
+ }
+ 
+ func (c *Client) sendCollectFiles(filesInfo []FileInfo) (err error) {
++	if os.Getenv("DATABEAM_CROC_PROGRESS") == "1" {
++		c.dataBeamPreparation = newDataBeamPreparation(filesInfo, os.Stderr)
++	}
+ 	c.FilesToTransfer = filesInfo
+ 	c.sourceSnapshots = make([]os.FileInfo, len(filesInfo))
+ 	totalFilesSize := int64(0)
+@@ -1388,6 +1394,9 @@ func (c *Client) sendCollectFiles(filesInfo []FileInfo) (err error) {
+ 	} else {
+ 		fmt.Fprintf(output, "\rSending %s (%s)\n", fname, utils.ByteCountDecimal(totalFilesSize))
+ 	}
++	if c.dataBeamPreparation != nil {
++		fmt.Fprintln(os.Stderr, "\nDATABEAM_PREPARED_V1")
++	}
+ 	return
+ }
+ 
+@@ -3099,6 +3108,7 @@ func (c *Client) processMessage(payload []byte, attempt *transferAttemptState) (
+ 	case message.TypeBundleRequest, message.TypeBundleOffer, message.TypeBundleReady, message.TypeBundleDone, message.TypeBundleClosed:
+ 		err = bundleVisibleError(c.processBundleMessage(m, attempt))
+ 	case message.TypeFinished:
++		c.finishDataBeamTransfer()
+ 		err = message.Send(c.connection(0), c.Key, message.Message{
+ 			Type: message.TypeFinished,
+ 		})
+@@ -3351,6 +3361,7 @@ func (c *Client) recipientInitializeFile() (err error) {
+ 
+ func (c *Client) recipientGetFileReady(finished bool) (err error) {
+ 	if finished {
++		c.finishDataBeamTransfer()
+ 		// TODO: do the last finishing stuff
+ 		log.Debug("finished")
+ 		err = message.Send(c.connection(0), c.Key, message.Message{
+@@ -3643,6 +3654,7 @@ func (c *Client) updateState(attempt *transferAttemptState) (err error) {
+ }
+ 
+ func (c *Client) setBar() {
++	c.startDataBeamTransfer()
+ 	description := fmt.Sprintf("%-*s", c.longestFilename, c.FilesToTransfer[c.FilesToTransferCurrentNum].Name)
+ 	folder, _ := filepath.Split(c.FilesToTransfer[c.FilesToTransferCurrentNum].FolderRemote)
+ 	if folder == "./" {
+@@ -3660,6 +3672,13 @@ func (c *Client) setBar() {
+ 		c.FilesToTransfer[c.FilesToTransferCurrentNum].Size,
+ 		models.TCP_BUFFER_SIZE/2,
+ 	)
++	if c.dataBeamTransfer != nil {
++		credited := int64(0)
++		if byteToDo > 0 {
++			credited = c.FilesToTransfer[c.FilesToTransferCurrentNum].Size - byteToDo
++		}
++		c.dataBeamTransfer.begin(c.FilesToTransferCurrentNum, credited)
++	}
+ 	if byteToDo > 0 {
+ 		bytesDone := c.FilesToTransfer[c.FilesToTransferCurrentNum].Size - byteToDo
+ 		log.Debug(byteToDo)
+@@ -3789,6 +3808,7 @@ func (c *Client) receiveData(i int, dataConn *comm.Comm, attempt *transferAttemp
+ 			return
+ 		}
+ 		c.TotalSent += int64(len(data[8:]))
++		fileIndex := c.FilesToTransferCurrentNum
+ 		c.TotalChunksTransferred++
+ 		finished := c.TotalChunksTransferred == c.CurrentFileChunkCount ||
+ 			c.TotalSent == c.FilesToTransfer[c.FilesToTransferCurrentNum].Size
+@@ -3798,6 +3818,12 @@ func (c *Client) receiveData(i int, dataConn *comm.Comm, attempt *transferAttemp
+ 		c.receiveMutex.Unlock()
+ 
+ 		c.addProgress(int64(len(data[8:])))
++		if c.dataBeamTransfer != nil {
++			c.dataBeamTransfer.advance(fileIndex, int64(len(data[8:])))
++		}
++		if c.dataBeamRate != nil {
++			c.dataBeamRate.add(int64(len(data[8:])))
++		}
+ 		if finished {
+ 			log.Debug("finished receiving!")
+ 			if err = receiveFile.Close(); err != nil {
+@@ -3864,6 +3890,7 @@ func chunkFits(size int64, position uint64, payloadLength int) error {
+ }
+ 
+ func (c *Client) sendData(i int, dataConn *comm.Comm, fread *os.File, queue *requestedChunkQueue, attempt *transferAttemptState) {
++	fileIndex := c.FilesToTransferCurrentNum
+ 	defer func() {
+ 		if r := recover(); r != nil {
+ 			attempt.report(fmt.Errorf("send data panic: %v", r))
+@@ -3941,6 +3968,12 @@ func (c *Client) sendData(i int, dataConn *comm.Comm, fread *os.File, queue *req
+ 				queue.progress(readingPos, n)
+ 			} else {
+ 				c.addProgress(int64(n))
++				if c.dataBeamTransfer != nil {
++					c.dataBeamTransfer.advance(fileIndex, int64(n))
++				}
++				if c.dataBeamRate != nil {
++					c.dataBeamRate.add(int64(n))
++				}
+ 			}
+ 			c.mutex.Lock()
+ 			c.TotalSent += int64(n)
+diff --git a/src/croc/ctx.go b/src/croc/ctx.go
+index 67089a2..046f2a7 100644
+--- a/src/croc/ctx.go
++++ b/src/croc/ctx.go
+@@ -3,7 +3,9 @@ package croc
+ 
+ import (
+ 	"context"
++	"fmt"
+ 	"net"
++	"os"
+ 	"sync"
+ 	"time"
+ 
+@@ -70,6 +72,10 @@ func NewCtx(ctx context.Context, ops Options) (*Client, error) {
+ 	}
+ 	c.stop = newStop(ctx)
+ 	c.stop.gui = true
++	if os.Getenv("DATABEAM_CROC_PROGRESS") == "1" {
++		c.dataBeamRate = &dataBeamRate{writer: os.Stderr}
++		fmt.Fprintln(os.Stderr, `DATABEAM_RATE_V1 {"speed_bps":0}`)
++	}
+ 	c.stop.hash = func(fname string, algorithm string, showProgress ...bool) (hash256 []byte, err error) {
+ 		return utils.HashFileCtx(c.stop.ctx, fname, algorithm, showProgress...)
+ 	}
+diff --git a/src/croc/databeam_compatibility_test.go b/src/croc/databeam_compatibility_test.go
+new file mode 100644
+index 0000000..a11b0c4
+--- /dev/null
++++ b/src/croc/databeam_compatibility_test.go
+@@ -0,0 +1,67 @@
++package croc
++
++import (
++	"context"
++	"errors"
++	"net"
++	"testing"
++	"time"
++
++	"github.com/schollz/croc/v11/src/comm"
++	"github.com/schollz/croc/v11/src/utils"
++)
++
++func TestDataBeamLocalProbeConsumesSlowReplyBeforeRelayFallback(t *testing.T) {
++	left, right := net.Pipe()
++	reader, writer := comm.New(left), comm.New(right)
++	defer reader.Close()
++	defer writer.Close()
++	done := make(chan error, 1)
++	go func() {
++		if err := writer.Send([]byte{1}); err != nil {
++			done <- err
++			return
++		}
++		// A slow relay/VPN can exceed the upstream 500 ms control deadline.
++		time.Sleep(750 * time.Millisecond)
++		if err := writer.Send([]byte("delayed PAKE response")); err != nil {
++			done <- err
++			return
++		}
++		done <- writer.Send([]byte("next protocol frame"))
++	}()
++	got, err := receiveControlFrame(reader)
++	if !errors.Is(err, errLocalProbeExpired) || got != nil {
++		t.Fatalf("delayed probe = %q, %v; want safe relay fallback", got, err)
++	}
++	got, err = reader.ReceiveWithDeadline(time.Now().Add(time.Second))
++	if err != nil || string(got) != "next protocol frame" {
++		t.Fatalf("late probe corrupted next frame: %q, %v", got, err)
++	}
++	if err := <-done; err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestDataBeamValidatedTextDoesNotPromptForItsOwnTempFile(t *testing.T) {
++	t.Chdir(t.TempDir())
++	name, err := utils.RandomFileName()
++	if err != nil {
++		t.Fatal(err)
++	}
++	previous := receiveOverwriteInput
++	receiveOverwriteInput = func(context.Context, string) (string, error) {
++		t.Error("validated text prompted to overwrite its receiver-created temp file")
++		return "n", nil
++	}
++	t.Cleanup(func() { receiveOverwriteInput = previous })
++	client := overwriteTestClient(t, FileInfo{
++		Name: name, FolderRemote: ".", Size: 32, Mode: 0o600,
++	}, Options{SendingText: true, NoPrompt: true, HashAlgorithm: defaultHashAlgorithm})
++	if err := client.updateIfRecipientHasFileInfo(); err != nil {
++		t.Fatal(err)
++	}
++	if client.FilesToTransfer[0].declined {
++		t.Fatal("receiver declined its validated text payload")
++	}
++}
+diff --git a/src/croc/databeam_local_probe_test.go b/src/croc/databeam_local_probe_test.go
+new file mode 100644
+index 0000000..208427a
+--- /dev/null
++++ b/src/croc/databeam_local_probe_test.go
+@@ -0,0 +1,54 @@
++package croc
++
++import (
++	"bytes"
++	"errors"
++	"io"
++	"net"
++	"testing"
++
++	"github.com/schollz/croc/v11/src/comm"
++)
++
++func TestDataBeamLocalProbeResponseSkipsRelayKeepalives(t *testing.T) {
++	for _, payload := range [][]byte{
++		[]byte(`{"Kind":"pake2","Version":2}`),
++		{0x80, 0x02, 0x01, 0xff}, // encrypted endpoint response remains opaque
++	} {
++		left, right := net.Pipe()
++		reader, writer := comm.New(left), comm.New(right)
++		done := make(chan error, 1)
++		go func() {
++			defer writer.Close()
++			for _, frame := range [][]byte{{1}, {1}, payload} {
++				if err := writer.Send(frame); err != nil {
++					done <- err
++					return
++				}
++			}
++			done <- nil
++		}()
++		got, err := receiveControlFrame(reader)
++		reader.Close()
++		if err != nil || !bytes.Equal(got, payload) {
++			t.Fatalf("got %x, %v; want %x", got, err, payload)
++		}
++		if err := <-done; err != nil {
++			t.Fatal(err)
++		}
++	}
++}
++
++func TestDataBeamLocalProbeResponseReturnsDisconnectAfterKeepalive(t *testing.T) {
++	left, right := net.Pipe()
++	reader, writer := comm.New(left), comm.New(right)
++	defer reader.Close()
++	go func() {
++		defer writer.Close()
++		_ = writer.Send([]byte{1})
++	}()
++	_, err := receiveControlFrame(reader)
++	if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrClosedPipe) {
++		t.Fatalf("got %v; want a closed connection error", err)
++	}
++}
+diff --git a/src/croc/databeam_preparation.go b/src/croc/databeam_preparation.go
+new file mode 100644
+index 0000000..76c2492
+--- /dev/null
++++ b/src/croc/databeam_preparation.go
+@@ -0,0 +1,149 @@
++package croc
++
++import (
++	"encoding/json"
++	"fmt"
++	"io"
++	"sync"
++	"time"
++)
++
++// Count only bytes actually sent/received, never resume/skipped bytes added
++// to the terminal's progress bar. Average over the trailing second.
++type dataBeamRate struct {
++	mu     sync.Mutex
++	last   time.Time
++	bytes  int64
++	window dataBeamRateWindow
++	writer io.Writer
++}
++
++func (r *dataBeamRate) add(n int64) {
++	if n <= 0 {
++		return
++	}
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	now := time.Now()
++	r.bytes += n
++	if r.last.IsZero() {
++		r.last = now
++		r.window.observe(0, now)
++		return
++	}
++	seconds := now.Sub(r.last).Seconds()
++	if seconds < 0.1 {
++		return
++	}
++	data, err := json.Marshal(struct {
++		Speed float64 `json:"speed_bps"`
++	}{r.window.observe(r.bytes, now)})
++	if err == nil {
++		fmt.Fprintf(r.writer, "\nDATABEAM_RATE_V1 %s\n", data)
++	}
++	r.last = now
++}
++
++type dataBeamRatePoint struct {
++	at    time.Time
++	bytes int64
++}
++
++// Local measurements are time weighted, with interpolation at the window
++// boundary so uneven update intervals do not bias the displayed rate.
++type dataBeamRateWindow struct {
++	points []dataBeamRatePoint
++}
++
++func (w *dataBeamRateWindow) observe(bytes int64, now time.Time) float64 {
++	if len(w.points) == 0 {
++		w.points = append(w.points, dataBeamRatePoint{now, bytes})
++		return 0
++	}
++	last := w.points[len(w.points)-1]
++	if bytes < last.bytes || now.Before(last.at) {
++		w.points = []dataBeamRatePoint{{now, bytes}}
++		return 0
++	}
++	if now.Sub(last.at) >= time.Second && bytes == last.bytes {
++		w.points = []dataBeamRatePoint{{now, last.bytes}}
++		return 0
++	}
++	if !now.After(last.at) {
++		return 0
++	}
++	w.points = append(w.points, dataBeamRatePoint{now, bytes})
++	cutoff := now.Add(-time.Second)
++	for len(w.points) > 1 && !w.points[1].at.After(cutoff) {
++		w.points = w.points[1:]
++	}
++	first := w.points[0]
++	start := first.at
++	delta := float64(bytes - first.bytes)
++	if start.Before(cutoff) {
++		start = cutoff
++		next := w.points[1]
++		fraction := start.Sub(first.at).Seconds() / next.at.Sub(first.at).Seconds()
++		delta -= float64(next.bytes-first.bytes) * fraction
++	}
++	return delta / now.Sub(start).Seconds()
++}
++
++// Local GUI telemetry only. These counters never enter the transfer protocol.
++type dataBeamPreparation struct {
++	mu        sync.Mutex
++	sizes     []int64
++	done      []int64
++	total     int64
++	completed int64
++	last      time.Time
++	rate      dataBeamRateWindow
++	writer    io.Writer
++}
++
++func newDataBeamPreparation(files []FileInfo, writer io.Writer) *dataBeamPreparation {
++	p := &dataBeamPreparation{sizes: make([]int64, len(files)), done: make([]int64, len(files)), writer: writer}
++	for i, file := range files {
++		if file.Size > 0 {
++			p.sizes[i] = file.Size
++			p.total += file.Size
++		}
++	}
++	p.emit(true)
++	return p
++}
++
++func (p *dataBeamPreparation) advance(index int, offset int64) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	if index < 0 || index >= len(p.sizes) {
++		return
++	}
++	if offset > p.sizes[index] {
++		offset = p.sizes[index]
++	}
++	if offset <= p.done[index] {
++		return
++	}
++	p.completed += offset - p.done[index]
++	p.done[index] = offset
++	p.emit(p.completed == p.total)
++}
++
++func (p *dataBeamPreparation) emit(force bool) {
++	now := time.Now()
++	if !force && !p.last.IsZero() && now.Sub(p.last) < 100*time.Millisecond {
++		return
++	}
++	rate := p.rate.observe(p.completed, now)
++	p.last = now
++	value := struct {
++		Done  int64   `json:"done"`
++		Total int64   `json:"total"`
++		Speed float64 `json:"speed_bps"`
++	}{p.completed, p.total, rate}
++	data, err := json.Marshal(value)
++	if err == nil {
++		fmt.Fprintf(p.writer, "\nDATABEAM_PREPARE_V1 %s\n", data)
++	}
++}
+diff --git a/src/croc/databeam_preparation_test.go b/src/croc/databeam_preparation_test.go
+new file mode 100644
+index 0000000..ca2cd97
+--- /dev/null
++++ b/src/croc/databeam_preparation_test.go
+@@ -0,0 +1,154 @@
++package croc
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"github.com/schollz/croc/v11/src/utils"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++)
++
++func TestDataBeamPreparationTracksSelectionWithoutDoubleCounting(t *testing.T) {
++	var output bytes.Buffer
++	p := newDataBeamPreparation([]FileInfo{{Name: "dup", Size: 1000}, {Name: "dup", Size: 3000}, {Name: "small", Size: 100}, {Name: "empty", Size: 0}}, &output)
++	p.advance(0, 1000)
++	p.advance(0, 1000)
++	p.advance(1, 1500)
++	p.advance(1, 1000)
++	if p.completed != 2500 || p.total != 4100 {
++		t.Fatalf("wrong overall bytes: %d / %d", p.completed, p.total)
++	}
++	p.advance(1, 5000)
++	p.advance(2, 100)
++	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
++	last := strings.TrimPrefix(lines[len(lines)-1], "DATABEAM_PREPARE_V1 ")
++	var event struct {
++		Done, Total int64
++		Speed       float64 `json:"speed_bps"`
++	}
++	if err := json.Unmarshal([]byte(last), &event); err != nil {
++		t.Fatal(err)
++	}
++	if event.Done != 4100 || event.Total != 4100 {
++		t.Fatalf("bad final event: %+v", event)
++	}
++}
++
++func TestDataBeamPreparationDoesNotChangeHashes(t *testing.T) {
++	t.Setenv("DATABEAM_CROC_PROGRESS", "1")
++	directory := t.TempDir()
++	files := []FileInfo{}
++	for _, item := range []struct {
++		name string
++		size int
++	}{{"a", 1024 * 1024}, {"b", 8192}, {"empty", 0}} {
++		name := filepath.Join(directory, item.name)
++		if err := os.WriteFile(name, bytes.Repeat([]byte{0x53}, item.size), 0600); err != nil {
++			t.Fatal(err)
++		}
++		info, err := os.Stat(name)
++		if err != nil {
++			t.Fatal(err)
++		}
++		files = append(files, FileInfo{Name: item.name, FolderSource: directory, Size: info.Size(), ModTime: info.ModTime(), Mode: info.Mode()})
++	}
++	client := &Client{stop: newStop(context.Background()), Options: Options{IsSender: true, NoCompress: true}}
++	if err := client.sendCollectFiles(files); err != nil {
++		t.Fatal(err)
++	}
++	if client.dataBeamPreparation.completed != 1024*1024+8192 {
++		t.Fatal("small files missing from total")
++	}
++	for _, file := range client.FilesToTransfer {
++		expected, err := utils.HashFileCtx(context.Background(), filepath.Join(directory, file.Name), defaultHashAlgorithm)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if !bytes.Equal(expected, file.Hash) {
++			t.Fatalf("hash changed for %s", file.Name)
++		}
++	}
++}
++
++func TestDataBeamRatePublishesWindowedWireBytes(t *testing.T) {
++	var output bytes.Buffer
++	start := time.Now().Add(-500 * time.Millisecond)
++	rate := &dataBeamRate{last: start, bytes: 1000, writer: &output}
++	rate.window.observe(0, start)
++	rate.add(1000)
++	var value struct {
++		Speed float64 `json:"speed_bps"`
++	}
++	line := strings.TrimPrefix(strings.TrimSpace(output.String()), "DATABEAM_RATE_V1 ")
++	if err := json.Unmarshal([]byte(line), &value); err != nil {
++		t.Fatal(err)
++	}
++	if value.Speed < 3900 || value.Speed > 4100 {
++		t.Fatalf("bad first rate: %f", value.Speed)
++	}
++	if rate.bytes != 2000 {
++		t.Fatalf("wire count was reset: %d", rate.bytes)
++	}
++
++}
++
++func TestDataBeamRateWindowSmoothsBurstsAndExpiresOldData(t *testing.T) {
++	start := time.Unix(100, 0)
++	var window dataBeamRateWindow
++	window.observe(1000000, start) // Resumed bytes are the initial baseline.
++	if got := window.observe(1010000, start.Add(100*time.Millisecond)); got != 100000 {
++		t.Fatalf("initial rate: %f", got)
++	}
++	if got := window.observe(1011000, start.Add(200*time.Millisecond)); got != 55000 {
++		t.Fatalf("burst was not smoothed: %f", got)
++	}
++	window.observe(1011000, start.Add(300*time.Millisecond))
++	for tick := int64(4); tick <= 13; tick++ {
++		got := window.observe(1011000+(tick-3)*1000, start.Add(time.Duration(tick)*100*time.Millisecond))
++		if tick == 13 && got != 10000 {
++			t.Fatalf("old burst did not expire: %f", got)
++		}
++	}
++}
++
++func TestDataBeamRateWindowWeightsIrregularIntervalsAndResetsAfterIdle(t *testing.T) {
++	start := time.Unix(100, 0)
++	var window dataBeamRateWindow
++	window.observe(0, start)
++	for _, sample := range []struct{ ms, bytes int64 }{{100, 10000}, {350, 35000}, {1050, 105000}} {
++		if got := window.observe(sample.bytes, start.Add(time.Duration(sample.ms)*time.Millisecond)); got != 100000 {
++			t.Fatalf("irregular interval rate: %f", got)
++		}
++	}
++	if got := window.observe(105000, start.Add(3*time.Second)); got != 0 {
++		t.Fatalf("idle rate: %f", got)
++	}
++	if got := window.observe(105100, start.Add(3100*time.Millisecond)); got != 1000 {
++		t.Fatalf("rate after idle: %f", got)
++	}
++	if got := window.observe(0, start.Add(3200*time.Millisecond)); got != 0 {
++		t.Fatalf("reset rate: %f", got)
++	}
++	for tick := int64(33); tick <= 1000; tick++ {
++		window.observe((tick-32)*100, start.Add(time.Duration(tick)*100*time.Millisecond))
++		if len(window.points) > 12 {
++			t.Fatalf("unbounded rate history: %d", len(window.points))
++		}
++	}
++}
++
++func TestDataBeamRateWindowSupportsSlowUpdates(t *testing.T) {
++	start := time.Unix(100, 0)
++	var window dataBeamRateWindow
++	window.observe(0, start)
++	if got := window.observe(2000, start.Add(2*time.Second)); got != 1000 {
++		t.Fatalf("slow rate: %f", got)
++	}
++	if got := window.observe(4000, start.Add(4*time.Second)); got != 1000 {
++		t.Fatalf("repeated slow rate: %f", got)
++	}
++}
+diff --git a/src/croc/databeam_route_display_test.go b/src/croc/databeam_route_display_test.go
+new file mode 100644
+index 0000000..bb03391
+--- /dev/null
++++ b/src/croc/databeam_route_display_test.go
+@@ -0,0 +1,23 @@
++package croc
++
++import "testing"
++
++// Preserve DataBeam's route regression against the implementation now upstream.
++func TestDataBeamRouteTracksSelectedConnection(t *testing.T) {
++	c := &Client{}
++	c.selectedDataTransport.Store(selectedTransportRelay)
++	c.ExternalIP = "192.168.1.2"
++	c.ExternalIPConnected = "192.168.1.3"
++	c.setRelayControlRoute("192.168.1.3:9009", "", false)
++	if c.peerToPeerDataPath() {
++		t.Fatal("a private custom relay must not be inferred to be direct")
++	}
++	c.setRelayControlRoute("192.168.1.3:9009", "", true)
++	if got := c.transferDirection(); got != "192.168.1.2<-192.168.1.3" {
++		t.Fatalf("direct route: %s", got)
++	}
++	c.setRelayControlRoute("203.0.113.1:9009", "", false)
++	if got := c.transferDirection(); got != "<-192.168.1.3" {
++		t.Fatalf("relay fallback must clear the direct display: %s", got)
++	}
++}
+diff --git a/src/croc/databeam_transfer.go b/src/croc/databeam_transfer.go
+new file mode 100644
+index 0000000..0bcdbb9
+--- /dev/null
++++ b/src/croc/databeam_transfer.go
+@@ -0,0 +1,118 @@
++package croc
++
++import (
++	"encoding/json"
++	"fmt"
++	"io"
++	"os"
++	"sync"
++	"time"
++)
++
++// Selection-wide GUI progress. Resume/skipped bytes contribute to completion,
++// while only successfully written payload bytes contribute to the live rate.
++// Nothing in this reporter changes file layout, hashes or network messages.
++type dataBeamTransfer struct {
++	mu          sync.Mutex
++	sizes, done []int64
++	resolved    []bool
++	total, wire int64
++	rate        dataBeamRateWindow
++	last        time.Time
++	writer      io.Writer
++}
++
++func newDataBeamTransfer(files []FileInfo, writer io.Writer) *dataBeamTransfer {
++	p := &dataBeamTransfer{sizes: make([]int64, len(files)), done: make([]int64, len(files)), resolved: make([]bool, len(files)), writer: writer}
++	for i, file := range files {
++		if file.Size > 0 {
++			p.sizes[i] = file.Size
++			p.total += file.Size
++		}
++	}
++	p.rate.observe(0, time.Now())
++	return p
++}
++
++func (p *dataBeamTransfer) begin(index int, credited int64) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	if index < 0 || index >= len(p.sizes) {
++		return
++	}
++	for i := 0; i < index; i++ {
++		p.done[i] = p.sizes[i]
++		p.resolved[i] = true
++	}
++	p.done[index] = max(0, min(credited, p.sizes[index]))
++	p.resolved[index] = p.done[index] == p.sizes[index]
++	p.emit(true)
++}
++
++func (p *dataBeamTransfer) advance(index int, n int64) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	if index < 0 || index >= len(p.sizes) || n <= 0 {
++		return
++	}
++	p.wire += n
++	p.done[index] += min(n, p.sizes[index]-p.done[index])
++	p.resolved[index] = p.done[index] == p.sizes[index]
++	p.emit(p.resolved[index])
++}
++
++func (p *dataBeamTransfer) finish() {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	for i := range p.sizes {
++		p.done[i] = p.sizes[i]
++		p.resolved[i] = true
++	}
++	p.emit(true)
++}
++
++func (p *dataBeamTransfer) emit(force bool) {
++	now := time.Now()
++	if !force && !p.last.IsZero() && now.Sub(p.last) < 100*time.Millisecond {
++		return
++	}
++	p.last = now
++	var done int64
++	filesDone := 0
++	for i, n := range p.done {
++		done += n
++		if p.resolved[i] {
++			filesDone++
++		}
++	}
++	event := struct {
++		Done       int64   `json:"done"`
++		Total      int64   `json:"total"`
++		Speed      float64 `json:"speed_bps"`
++		FilesDone  int     `json:"files_done"`
++		FilesTotal int     `json:"files_total"`
++	}{done, p.total, p.rate.observe(p.wire, now), filesDone, len(p.sizes)}
++	data, err := json.Marshal(event)
++	if err == nil {
++		fmt.Fprintf(p.writer, "\nDATABEAM_TRANSFER_V1 %s\n", data)
++	}
++}
++
++func (c *Client) startDataBeamTransfer() {
++	if c.dataBeamTransfer == nil && c.dataBeamRate != nil {
++		c.dataBeamTransfer = newDataBeamTransfer(c.FilesToTransfer, os.Stderr)
++	}
++}
++
++func (c *Client) finishDataBeamTransfer() {
++	c.startDataBeamTransfer()
++	if c.dataBeamTransfer != nil {
++		c.dataBeamTransfer.finish()
++	}
++}
++
++func (c *Client) dataBeamVerifying() {
++	if c.dataBeamRate != nil {
++		fmt.Fprintln(os.Stderr, "\nDATABEAM_VERIFY_V1")
++	}
++}
+diff --git a/src/croc/databeam_transfer_test.go b/src/croc/databeam_transfer_test.go
+new file mode 100644
+index 0000000..18456ba
+--- /dev/null
++++ b/src/croc/databeam_transfer_test.go
+@@ -0,0 +1,49 @@
++package croc
++
++import (
++	"bytes"
++	"encoding/json"
++	"strings"
++	"testing"
++)
++
++func TestDataBeamTransferAggregatesFilesAndResumeWithoutInflatingRate(t *testing.T) {
++	var output bytes.Buffer
++	p := newDataBeamTransfer([]FileInfo{{Size: 100}, {Size: 300}, {Size: 0}}, &output)
++	p.begin(1, 150) // First file was already present; second file is half cached.
++	if p.wire != 0 {
++		t.Fatal("cached bytes counted as network traffic")
++	}
++	p.advance(1, 50)
++	p.begin(1, 200) // Reopening a connection does not add the same credit twice.
++	if p.wire != 50 {
++		t.Fatal("resume inflated traffic")
++	}
++	p.advance(1, 100)
++	p.begin(2, 0)
++	p.finish()
++	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
++	var event struct {
++		Done, Total int64
++		FilesDone   int `json:"files_done"`
++		FilesTotal  int `json:"files_total"`
++	}
++	if err := json.Unmarshal([]byte(strings.TrimPrefix(lines[len(lines)-1], "DATABEAM_TRANSFER_V1 ")), &event); err != nil {
++		t.Fatal(err)
++	}
++	if event.Done != 400 || event.Total != 400 || event.FilesDone != 3 || event.FilesTotal != 3 {
++		t.Fatalf("bad totals: %+v", event)
++	}
++	if p.wire != 150 {
++		t.Fatal("wrong network-byte count")
++	}
++}
++
++func TestDataBeamTransferZeroByteSelectionCompletes(t *testing.T) {
++	var output bytes.Buffer
++	p := newDataBeamTransfer([]FileInfo{{Size: 0}}, &output)
++	p.finish()
++	if !strings.Contains(output.String(), `"files_done":1,"files_total":1`) {
++		t.Fatal(output.String())
++	}
++}
+diff --git a/src/croc/file_preparation.go b/src/croc/file_preparation.go
+index 9a01f0b..efe4f3d 100644
+--- a/src/croc/file_preparation.go
++++ b/src/croc/file_preparation.go
+@@ -3,6 +3,7 @@ package croc
+ import (
+ 	"encoding/json"
+ 	"fmt"
++	"github.com/schollz/croc/v11/src/utils"
+ 	"os"
+ 	"path/filepath"
+ 
+@@ -63,7 +64,13 @@ func (c *Client) prepareFile(index int, algorithm string, scratch *filePreparati
+ 			scratch.compressionOutput,
+ 		)
+ 	}
+-	hash, err := c.stop.hash(fullPath, algorithm, fileInfo.Size > 1e7)
++	var hash []byte
++	if progress := c.dataBeamPreparation; progress != nil {
++		ctx := utils.WithHashProgress(c.clientContext(), func(offset int64) { progress.advance(index, offset) })
++		hash, err = utils.HashFileCtx(ctx, fullPath, algorithm, false)
++	} else {
++		hash, err = c.stop.hash(fullPath, algorithm, fileInfo.Size > 1e7)
++	}
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -77,6 +84,9 @@ func (c *Client) prepareFile(index int, algorithm string, scratch *filePreparati
+ 	c.FilesToTransfer[index].Hash = hash
+ 	c.FilesToTransfer[index].Prepared = true
+ 	c.sourceSnapshots[index] = after
++	if progress := c.dataBeamPreparation; progress != nil {
++		progress.advance(index, fileInfo.Size)
++	}
+ 	log.Debugf("hashed %s to %x using %s", fullPath, hash, algorithm)
+ 	return nil
+ }
+diff --git a/src/croc/receive_preflight.go b/src/croc/receive_preflight.go
+index 9437eae..f39f1c9 100644
+--- a/src/croc/receive_preflight.go
++++ b/src/croc/receive_preflight.go
+@@ -43,6 +43,7 @@ func (c *Client) preflightReceiveFile(index int) (receiveDecision, error) {
+ 	}
+ 	matches := false
+ 	if exists && file.Size > 0 && file.Symlink == "" && stat.Mode().IsRegular() && stat.Size() == file.Size {
++		c.dataBeamVerifying()
+ 		hash, err := receiveFileHash(c.clientContext(), destination, c.Options.HashAlgorithm, !c.Options.SendingText)
+ 		if err != nil {
+ 			return receiveDecision{}, fmt.Errorf("hash existing destination %q: %w", destination, err)
+diff --git a/src/utils/ctx.go b/src/utils/ctx.go
+index 92eba96..cd10909 100644
+--- a/src/utils/ctx.go
++++ b/src/utils/ctx.go
+@@ -27,13 +27,23 @@ var imoHashV2Domain = []byte("croc-imohash-v2\x00")
+ 
+ // ctxFile wraps os.File with context cancellation support.
+ type ctxFile struct {
+-	ctx context.Context
+-	f   *os.File
++	ctx      context.Context
++	f        *os.File
++	progress func(int64)
++}
++
++type hashProgressKey struct{}
++
++// WithHashProgress reports the end offset of each hash read. Ordinary hashing
++// contexts have no callback, and use the exact same hash algorithms as before.
++func WithHashProgress(ctx context.Context, progress func(int64)) context.Context {
++	return context.WithValue(ctx, hashProgressKey{}, progress)
+ }
+ 
+ // NewCtxFile creates a new context-aware file wrapper.
+ func NewCtxFile(ctx context.Context, f *os.File) *ctxFile {
+-	return &ctxFile{ctx: ctx, f: f}
++	progress, _ := ctx.Value(hashProgressKey{}).(func(int64))
++	return &ctxFile{ctx: ctx, f: f, progress: progress}
+ }
+ 
+ // Read implements io.Reader interface with context cancellation.
+@@ -60,6 +70,9 @@ func (c *ctxFile) ReadAt(p []byte, off int64) (n int, err error) {
+ 		if c.ctx.Err() != nil {
+ 			return 0, c.ctx.Err()
+ 		}
++		if n > 0 && c.progress != nil {
++			c.progress(off + int64(n))
++		}
+ 		return n, err
+ 	}
+ }
+diff --git a/src/utils/databeam_progress_test.go b/src/utils/databeam_progress_test.go
+new file mode 100644
+index 0000000..17f9cb5
+--- /dev/null
++++ b/src/utils/databeam_progress_test.go
+@@ -0,0 +1,35 @@
++package utils
++
++import (
++	"bytes"
++	"context"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestDataBeamHashProgressUsesReadBytesAndPreservesCancellation(t *testing.T) {
++	name := filepath.Join(t.TempDir(), "data")
++	data := bytes.Repeat([]byte{0x31}, 1024*1024)
++	if err := os.WriteFile(name, data, 0600); err != nil {
++		t.Fatal(err)
++	}
++	var previous int64
++	ctx := WithHashProgress(context.Background(), func(offset int64) {
++		if offset < previous || offset > int64(len(data)) {
++			t.Fatalf("bad offset %d", offset)
++		}
++		previous = offset
++	})
++	if _, err := HashFileCtx(ctx, name, "xxhash"); err != nil {
++		t.Fatal(err)
++	}
++	if previous != int64(len(data)) {
++		t.Fatalf("missing read progress: %d", previous)
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	ctx = WithHashProgress(ctx, func(_ int64) { cancel() })
++	if _, err := HashFileCtx(ctx, name, "xxhash"); err == nil {
++		t.Fatal("cancellation ignored")
++	}
++}

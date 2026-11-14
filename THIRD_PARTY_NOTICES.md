@@ -9,7 +9,9 @@ The license notices below are provided to satisfy attribution requirements.
 - Copyright: (c) 2017-2025 Zack and contributors to `croc`
 - License: MIT
 - License text: [LICENSES/CROC-MIT.txt](LICENSES/CROC-MIT.txt), unchanged upstream notice
-- Bundled engine: upstream v11.5.5 plus [DataBeam's compatibility patch and regressions](patches/croc-v11.5.5-databeam.patch), labeled `11.5.5-databeam`. Upstream implements the earlier receiver keepalive and route-display fixes; DataBeam additionally fixes Windows text-temp-file handling and slow-relay probe deadlines.
+- Bundled engine: upstream v11.6.5 plus [DataBeam's local GUI telemetry and compatibility regressions](patches/croc-v11.6.5-databeam.patch), labeled `11.6.5-databeam`. Upstream provides Windows text handling and safe local-discovery fallback; DataBeam adds preparation, live-rate and selection-wide progress telemetry.
+
+- Android engine: independently pinned v11.5.5 plus [Android GUI telemetry and compatibility regressions](patches/croc-v11.5.5-android-databeam.patch), using the supported `croc_no_tailcat` build tag. The desktop v11.6.5 bundle feature was not adopted on Android after its hard-link publication probe failed in the app sandbox.
 
 ## 2) sendme (official upstream reference)
 

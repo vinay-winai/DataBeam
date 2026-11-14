@@ -3,7 +3,7 @@ use anyhow::Context;
 use iroh::{address_lookup::dns::DnsAddressLookup, endpoint::presets, Endpoint};
 use iroh_blobs::{
     api::{
-        blobs::{ExportMode, ExportOptions, ExportProgressItem},
+        blobs::{BlobStatus, ExportMode, ExportOptions, ExportProgressItem},
         remote::GetProgressItem,
         Store,
     },
@@ -91,6 +91,7 @@ pub async fn download(
     }
 
     let endpoint = builder.bind().await?;
+    let _network_handle = super::network::watch_endpoint(endpoint.clone());
 
     // Stable blob store directory name based on ticket hash.
     // Uses user-configured blob_dir if set, otherwise system temp dir.
@@ -168,6 +169,7 @@ pub async fn download(
                     let mut paths = connection.paths_stream();
                     let mut last = None;
                     while let Some(list) = paths.next().await {
+                        emit_event_with_payload(&app_handle, "receive-paths", &super::network::describe_paths(&list).to_string());
                         let selected = (&list)
                             .into_iter()
                             .find(|path| path.is_selected())
@@ -492,6 +494,16 @@ async fn export(
         } else {
             name.as_str()
         };
+        if root.is_some() && relative == super::directories::NAME {
+            // Validate every path before creating any directories. get_export_path
+            // applies the same traversal protection as ordinary collection entries.
+            anyhow::ensure!(matches!(db.status(*hash).await?, BlobStatus::Complete { size } if size <= super::directories::MAX_BYTES as u64), "directory metadata is incomplete or too large");
+            let bytes = db.get_bytes(*hash).await?;
+            let directories = super::directories::decode(&bytes)?;
+            let targets = directories.iter().map(|name| get_export_path(output_dir, name)).collect::<anyhow::Result<Vec<_>>>()?;
+            for target in targets { tokio::fs::create_dir_all(target).await?; }
+            continue;
+        }
         let target = get_export_path(output_dir, relative)?;
         if target.is_dir() {
             anyhow::bail!("Cannot export {name}: {} is a directory; choose a different receive folder", target.display());
@@ -608,7 +620,7 @@ fn to_windows_extended_path(path: PathBuf) -> PathBuf {
     path
 }
 
-fn validate_path_component(component: &str) -> anyhow::Result<()> {
+pub(super) fn validate_path_component(component: &str) -> anyhow::Result<()> {
     anyhow::ensure!(!component.is_empty(), "empty path component");
     anyhow::ensure!(!component.contains('/'), "contains /");
     anyhow::ensure!(!component.contains('\\'), "contains \\");

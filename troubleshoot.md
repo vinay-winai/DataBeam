@@ -21,6 +21,14 @@ DataBeam is verified running on Android via DroidDeck with the AArch64/ARM64 bui
 
 If an older Linux AppImage returns to the old version after updating, download and install v0.7.3 manually once. The updater restart fix then applies to future updates.
 
+## Sendme / EasySendMe shows Relay on the same Wi-Fi
+
+The connection can start as Direct and later fall back to Relay if its UDP path stops working. The relay is a valid transfer path, so the transfer can still finish, although speed may be lower. Croc public relay 3 availability is a separate issue.
+
+[Iroh issue #4555](https://github.com/n0-computer/iroh/issues/4555) documents failed UDP segmentation offload batches causing established connections to time out. Its discussion includes Samsung Android 16 with Iroh 1.4.1. [Upstream fix #4645](https://github.com/n0-computer/iroh/pull/4645) was still open when checked on 2026-11-14. Sendme also has an older [offload failure report #45](https://github.com/n0-computer/sendme/issues/45). This is a strong match for the phone-to-PC behavior reproduced during DataBeam testing.
+
+DataBeam retains upstream's normal transport settings and automatic Direct/Relay selection; it does not ship a local GSO workaround. Check the transfer's actual route indicator. Let a relayed transfer continue if its speed is acceptable, or use Croc for a different transfer engine.
+
 ## Transfer issues
 
 - If transfers are failing check if vpn or dns is causing this.

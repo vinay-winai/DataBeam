@@ -169,6 +169,7 @@ pub async fn start_share(
         check_cancelled(cancel.as_deref())?;
 
         let endpoint = builder.bind().await?;
+        let network_handle = super::network::watch_endpoint(endpoint.clone());
         setup_endpoint = Some(endpoint.clone());
         check_cancelled(cancel.as_deref())?;
 
@@ -187,7 +188,7 @@ pub async fn start_share(
                         ..EventMask::DEFAULT
                     },
                 ),
-            );
+            ).with_route_emitter(app_handle.clone());
 
             let import_result = import(
                 paths2,
@@ -230,6 +231,7 @@ pub async fn start_share(
                 blobs_data_dir2,
                 store,
                 progress_handle,
+                network_handle,
             ))
         };
 
@@ -248,6 +250,7 @@ pub async fn start_share(
         _blobs_data_dir,
         store,
         progress_handle,
+        network_handle,
     ) = match setup_result {
         Ok(v) => v,
         Err(e) => {
@@ -290,10 +293,11 @@ pub async fn start_share(
         blobs_data_dir,
         _progress_handle: progress_handle,
         _store: store,
+        _network_handle: network_handle,
     })
 }
 
-fn check_cancelled(cancel: Option<&AtomicBool>) -> anyhow::Result<()> {
+pub(super) fn check_cancelled(cancel: Option<&AtomicBool>) -> anyhow::Result<()> {
     anyhow::ensure!(
         !cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)),
         "Operation cancelled"
@@ -352,8 +356,11 @@ async fn import(
     cancel: Option<&AtomicBool>,
     app_handle: &AppHandle,
 ) -> anyhow::Result<(TempTag, u64, Collection, Vec<u64>)> {
+    let directories = super::directories::collect(&paths, cancel)?;
     let data_sources = build_virtual_data_sources(paths, &payload_root, cancel)?;
-    anyhow::ensure!(!data_sources.is_empty(), "no valid files to share");
+    anyhow::ensure!(!data_sources.is_empty() || !directories.is_empty(), "no valid files or folders to share");
+    let manifest_name = format!("{payload_root}/{}", super::directories::NAME);
+    anyhow::ensure!(!data_sources.iter().any(|(name, _)| name == &manifest_name), "{} is reserved for DataBeam folder metadata; rename that file before sharing", super::directories::NAME);
     let mut sized_sources = Vec::with_capacity(data_sources.len());
     let mut total = 0_u64;
     for (name, path) in data_sources {
@@ -445,6 +452,13 @@ async fn import(
         .into_iter()
         .collect::<anyhow::Result<Vec<_>>>()?;
 
+    if !directories.is_empty() {
+        check_cancelled(cancel)?;
+        let bytes = super::directories::encode(directories)?;
+        let size = bytes.len() as u64;
+        let tag = db.add_bytes(bytes).temp_tag().await?;
+        names_and_tags.push((manifest_name, tag, size));
+    }
     names_and_tags.sort_by(|(a, _, _), (b, _, _)| a.cmp(b));
     let size = names_and_tags.iter().map(|(_, _, size)| *size).sum::<u64>();
     let sizes = names_and_tags.iter().map(|(_, _, size)| *size).collect();

@@ -17,6 +17,48 @@ use std::{
 #[derive(Default)]
 struct Events(Mutex<Vec<(String, String)>>);
 
+#[tokio::test]
+async fn empty_directories_survive_network_and_cached_export() -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        for empty_only in [false, true] {
+            let dir = tempfile::tempdir()?;
+            let source = dir.path().join("folder");
+            std::fs::create_dir_all(source.join("nested/empty"))?;
+            if !empty_only {
+                std::fs::write(source.join("zero.txt"), b"")?;
+                std::fs::write(source.join("payload.txt"), b"keep payload")?;
+            }
+            let share = start_share(vec![source], "payload".into(), SendOptions {
+                relay_mode: RelayModeOption::Disabled,
+                magic_ipv4_addr: Some("127.0.0.1:0".parse()?),
+                blob_dir: Some(dir.path().join("sender")),
+                ..Default::default()
+            }, None).await?;
+            let address = EndpointAddr::new(share.router.endpoint().id()).with_ip_addr(
+                share.router.endpoint().bound_sockets().into_iter().find(|a| a.is_ipv4()).unwrap());
+            let ticket = BlobTicket::new(address, share.temp_tag.hash(), BlobFormat::HashSeq).to_string();
+            let cache = dir.path().join("cache");
+            let result = download(ticket.clone(), ReceiveOptions {
+                output_dir: Some(dir.path().join("received")),
+                blob_dir: Some(cache.clone()),
+                relay_mode: RelayModeOption::Disabled,
+                ..Default::default()
+            }, None).await?;
+            assert!(result.file_path.join("folder/nested/empty").is_dir());
+            assert!(!result.file_path.join(super::directories::NAME).exists());
+            if !empty_only {
+                assert_eq!(std::fs::read(result.file_path.join("folder/payload.txt"))?, b"keep payload");
+                assert_eq!(std::fs::metadata(result.file_path.join("folder/zero.txt"))?.len(), 0);
+            }
+            share.router.shutdown().await?;
+            let output = dir.path().join("offline");
+            assert!(super::receive::check_and_export_local_in(&ticket, Some(output.clone()), None, Some(cache), false, None).await?);
+            assert!(output.join("payload/folder/nested/empty").is_dir());
+        }
+        anyhow::Ok(())
+    }).await?
+}
+
 impl EventEmitter for Events {
     fn emit_event(&self, name: &str) -> Result<(), String> {
         self.0.lock().unwrap().push((name.into(), String::new()));
