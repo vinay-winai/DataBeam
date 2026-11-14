@@ -2,6 +2,8 @@ plugins { id("com.android.application") }
 android {
     namespace = "com.vinaywinai.databeam"
     compileSdk = 36
+    sourceSets.getByName("main").assets.srcDir(rootProject.file("../assets/wordlists"))
+    sourceSets.getByName("test").resources.srcDir(rootProject.file("../assets/wordlists"))
     defaultConfig {
         applicationId = "com.vinaywinai.databeam"
         minSdk = 26

@@ -33,6 +33,9 @@ object ShareEntryRegression {
             fun checkText(a:Activity){runner.runOnMainSync{
                 check(field(a,"tab")=="send");check((field(a,"mode") as Spinner).selectedItem=="Croc")
                 check((field(a,"message") as EditText).text.toString()==text)
+                check(field(a,"sendKind")=="text")
+                check((field(a,"fileSelectionPanel") as android.view.View).visibility==android.view.View.GONE)
+                check((field(a,"primary") as Button).text=="Send text")
             }}
             checkText(activity)
             var helpTarget:String?=null

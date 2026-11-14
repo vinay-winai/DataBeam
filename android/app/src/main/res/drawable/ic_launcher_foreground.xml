@@ -1,0 +1,3 @@
+<inset xmlns:android="http://schemas.android.com/apk/res/android" android:inset="18%">
+    <bitmap android:src="@drawable/databeam_logo" android:gravity="fill" />
+</inset>

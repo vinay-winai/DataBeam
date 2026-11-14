@@ -10,6 +10,18 @@ import java.util.concurrent.TimeUnit
 
 /** A TCP probe reports local reachability, not a global relay outage. */
 object RelayRecovery {
+    private val random=SecureRandom()
+    @Volatile private var words=emptyList<String>()
+    fun initializeWordList(text:String) {
+        val parsed=text.lineSequence().map{it.trim()}.filter{it.isNotEmpty()}.toList()
+        require(parsed.size==1296 && parsed.distinct().size==1296){"Invalid Croc word list"}
+        words=parsed
+    }
+    fun newCode():String {
+        val dictionary=words
+        check(dictionary.isNotEmpty()){"Croc word list is not loaded"}
+        return List(3){dictionary[random.nextInt(dictionary.size)]}.joinToString("-")
+    }
     val relays=(1..4).map{"$it.getcroc.com:9009"}
     fun relay(code:String):String {
         val hash=MessageDigest.getInstance("SHA-256").digest(code.toByteArray(Charsets.UTF_8))
@@ -46,10 +58,8 @@ object RelayRecovery {
         } finally {pool.shutdownNow()}
     }
     fun replacement(old:String,endpoint:String):String {
-        val random=SecureRandom()
         repeat(256){
-            val bytes=ByteArray(10);random.nextBytes(bytes)
-            val code=bytes.joinToString(""){"%02x".format(it)}
+            val code=newCode()
             if(code!=old && relay(code)==endpoint)return code
         }
         error("Could not generate a replacement code. Retry or use Sendme.")

@@ -3,19 +3,29 @@
 ## Current builds
 
 - Native ARM64 Rust JNI and pinned Croc builds passed. Android Croc uses `croc_no_tailcat`; classic LAN/public-relay transfers remain available. The optional Tailcat transport was excluded after its Linux netlink probe panicked inside the Android app sandbox.
-- Android debug/instrumentation APK builds passed; 17 JVM tests passed. Lint: zero errors, 50 warnings (including localization, SDK currency, ARM64-only packaging, synchronous persistence and test API use).
+- Android debug/instrumentation APK builds passed; 22 JVM tests passed. Lint: zero errors, 45 warnings (including localization, SDK currency, ARM64-only packaging, synchronous persistence and test API use).
 - Shared Sendme engine: 32 tests passed, one manual test ignored. Includes real loopback transfer, cache export, directory metadata validation, cached ranges and sender acknowledgement checks.
 - Desktop: 138 tests passed, eight manual/fixture checks ignored. Release build passed. Updated executable: `../dist/DataBeam-0.8.0-windows-x64.exe`.
 - Python test-driver syntax and tracked diff whitespace checks passed.
 - Prior alpha checks passed APK signature v2, zip/16 KiB ELF alignment, JNI symbols and license/native engine packaging. This is a debug alpha, not a signed distribution release.
 
-APK: `app/build/outputs/apk/debug/app-debug.apk`, 31,550,621 bytes.
-SHA-256: `f8251f737cc77480b4ecefcfb5704faf85fdd6a22a60c2be8d0dd63327b8b854`.
+APK: `app/build/outputs/apk/debug/app-debug.apk`, 31,550,942 bytes.
+SHA-256: `db8e21257cfd5deb3d6a0ee6d62a965f30f0a362a445426311b14d977fa2bc3d`.
 Version 0.8.0 is installed. Desktop and Android retain Croc 11.5.5 with the same local GUI progress reporting; the evaluated desktop 11.6.5 upgrade was deferred at the user's request. No Iroh GSO override is shipped.
 
 Desktop release revision (2026-11-15): the 11.6.5 release run was cancelled before publication. Desktop now reuses the validated 11.5.5 telemetry patch, with its normal desktop transport build. The EasySendMe ticket receiver owns a private temporary directory under the user's DataBeam cache until Croc exits; normal Croc receives use the app directory by default, matching the displayed save destination. The previous end-to-end handoff test supplied its own folder and missed this GUI path; it now calls the actual ticket receiver.
 
 Final revised desktop checks: 138 tests passed, eight fixture/manual checks ignored by the ordinary suite. Three real-transfer regressions also passed with `TEMP` and `TMP` set to `C:\Windows\Temp`: EasySendMe ticket/payload round trip, Croc text/file round trips, and Croc conflict/overwrite protection. A separate Croc 11.5.5 probe reproduced the original `open receive root: ... Access is denied` when run directly in that system Temp root. Android's shipped engine/APK is unchanged by this desktop correction.
+
+## Android UI revision — 2026-11-15
+
+- Orange arrow launcher/header branding, matching monochrome notification icon, OLED-black surfaces and version footer. Visuals were checked on the phone.
+- Device regression passed: named selections and individual removal, adding a folder without replacing existing selections, exclusive Croc Files/Text inputs and matching send label, live configuration/settings locking, exact shared EFF three-word codes, ongoing notification with a progress bar, stopped-sender restart for text and files. The file restart passed after the original generated MediaStore URI was deleted, using the already staged copy.
+- Share-sheet regression passed again, including selected Unicode text, files/multiple files, caption protection, activity recreation with Text mode retained, and the bottom troubleshoot redirect.
+- Sender/receiver state messages and recovery actions are covered by JVM tests. Content mismatch and invalid-ticket errors name the appropriate clear/new-receive action rather than always suggesting Resume.
+- The first live stop test exposed an uncaught `InterruptedIOException` in the Croc stderr reader. Reader failures now return to the transfer worker; expected closures during Stop do not crash the app, and readers are joined before a restart. Four subsequent stop/restart sessions passed.
+- That initial crash prevented restoration of the prior stopped sender card. The user was informed; saved files and other settings were preserved, the normal relay setting was restored, and the generated session was cleared. Repeat testing used an independent host backup as well as instrumentation cleanup.
+- No direct Android URI/descriptor sender adapter was added. The current staging-copy behavior and DashBeam comparison are documented in `../investigations/android-source-references.md`.
 
 ## Phone and configuration
 

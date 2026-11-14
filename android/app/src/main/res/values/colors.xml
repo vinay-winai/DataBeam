@@ -1,0 +1,4 @@
+<resources>
+    <color name="databeam_background">#000000</color>
+    <color name="databeam_accent">#FF4D00</color>
+</resources>

@@ -19,7 +19,7 @@ class TransferService : Service() {
             val prefs=c.getSharedPreferences("transfer",0)
             val saved=JSONObject(prefs.getString("state","{}")!!)
             if(!wasBusy && !busy.get() && (saved.optString("status") in listOf("running","stopping") || (saved.optString("status")=="paused" && saved.optBoolean("connectionRetained")))) {
-                saved.put("connectionRetained",false).put("status","interrupted").put("message","App restarted; saved data retained. Press Resume to reconnect.")
+                saved.put("connectionRetained",false).put("status","interrupted").put("message",TransferLabels.interruptedMessage(saved))
                 prefs.edit().putString("state",saved.toString()).commit()
             }
             return saved
@@ -32,12 +32,14 @@ class TransferService : Service() {
     }
     override fun onCreate() {
         super.onCreate();NativeBridge.initialize(applicationContext)
+        RelayRecovery.initializeWordList(assets.open("eff-short-wordlist-1.txt").bufferedReader().use{it.readText()})
         getSystemService(android.net.ConnectivityManager::class.java).registerDefaultNetworkCallback(networkCallback)
     }
     private val main = Handler(Looper.getMainLooper())
     private var process: java.lang.Process? = null
     @Volatile private var crocPid:Int?=null
     private val stopping = AtomicBoolean(false)
+    @Volatile private var backgroundTimedOut=false
     private var wake: PowerManager.WakeLock? = null
     private var multicast: android.net.wifi.WifiManager.MulticastLock? = null
     private var state = JSONObject()
@@ -101,6 +103,7 @@ class TransferService : Service() {
         }
         if(!busy.compareAndSet(false,true)) return START_NOT_STICKY
         stopping.set(false)
+        backgroundTimedOut=false
         NativeBridge.prepare()
         state=JSONObject(intent?.getStringExtra("config") ?: "{}")
         if(!state.has("saveFolder"))state.put("saveFolder",AppSettings.folder(this)).put("saveFolderLabel",AppSettings.folderLabel(this))
@@ -155,7 +158,7 @@ class TransferService : Service() {
                         if(ticket.isEmpty() || config.optBoolean("refresh")) {
                             val previous=ticket
                             ticket=croc(config,"receive",null).split(Regex("\\s+")).firstOrNull { NativeBridge.hash(it).isNotEmpty() } ?: error("Sender did not supply a valid Sendme ticket")
-                            require(previous.isEmpty() || NativeBridge.hash(previous)==NativeBridge.hash(ticket)){"This code now refers to different content. Start a new transfer."}
+                            require(previous.isEmpty() || NativeBridge.hash(previous)==NativeBridge.hash(ticket)){"This code now refers to different files. Clear the transfer card and start a new receive."}
                             require(ticket.startsWith("blob")) {"Sender did not supply a Sendme ticket"}
                         }
                         config.put("ticket",ticket)
@@ -180,8 +183,8 @@ class TransferService : Service() {
                     } else terminalMessage="Text received"
                 }
             } catch(e:Throwable) {
-                terminal=if(stopping.get()) if(state.optString("action")=="send")"stopped" else "paused" else "interrupted"
-                terminalMessage=if(stopping.get()) if(state.optString("action")=="send")"Sharing ended" else "Paused · received data retained" else (e.message ?: e.javaClass.simpleName)
+                terminal=if(backgroundTimedOut)"interrupted" else if(stopping.get()) if(state.optString("action")=="send")"stopped" else "paused" else "interrupted"
+                terminalMessage=if(backgroundTimedOut)"Android reached its background transfer time limit." else if(stopping.get()) if(state.optString("action")=="send")"Sharing ended" else "Paused · received data retained" else (e.message ?: e.javaClass.simpleName)
             } finally {
                 main.post {
                     main.removeCallbacks(poll)
@@ -227,8 +230,7 @@ class TransferService : Service() {
     }
     private fun crocAttempt(c:JSONObject,action:String,text:String?,allowRecovery:Boolean):String {
         val code=c.optString("code").ifEmpty {
-            val bytes=ByteArray(10);SecureRandom().nextBytes(bytes)
-            bytes.joinToString(""){"%02x".format(it)}.also { c.put("code",it);synchronized(this){state.put("code",it)};persist() }
+            RelayRecovery.newCode().also { c.put("code",it);synchronized(this){state.put("code",it)};persist() }
         }
         require(code.length>=7){"Code must have at least 7 characters"}
         val relay=c.optString("relay").ifEmpty { RelayRecovery.relay(code) }
@@ -266,14 +268,21 @@ class TransferService : Service() {
             synchronized(errors){errors.append(line).append('\n');if(errors.length>16000)errors.delete(0,errors.length-16000)}
             log(line)
         }
-        val err=Thread {p.errorStream.bufferedReader().useLines{lines->lines.forEach{observe(it)}}}.apply{start()}
+        val readFailure=java.util.concurrent.atomic.AtomicReference<Exception?>()
+        val err=Thread {
+            try{p.errorStream.bufferedReader().useLines{lines->lines.forEach{observe(it)}}}
+            catch(error:Exception){if(!stopping.get()){readFailure.compareAndSet(null,error);p.destroy()}}
+        }.apply{start()}
         val result=StringBuilder()
-        p.inputStream.bufferedReader().useLines{lines->lines.forEach{
+        try{p.inputStream.bufferedReader().useLines{lines->lines.forEach{
             if(it.startsWith("DATABEAM_CHILD_PID=")){crocPid=it.substringAfter('=').toInt();return@forEach}
             if(result.length+it.length<2*1024*1024)result.append(it).append('\n')
             observe(it)
-        }}
-        val exit=p.waitFor();err.join();process=null;crocPid=null
+        }}}
+        catch(error:Exception){if(!stopping.get())readFailure.compareAndSet(null,error);p.destroy()}
+        val exit=try{p.waitFor()}finally{err.join();process=null;crocPid=null}
+        check(!stopping.get()){"Stopped"}
+        readFailure.get()?.let{throw IllegalStateException("Could not read Croc transfer status: ${it.message}",it)}
         if(exit!=0 && allowRecovery && c.optString("relay").isEmpty() && !payloadStarted.get() && !stopping.get() && RelayRecovery.transportError(errors.toString())) {
             synchronized(this){state.put("relayNotice","Auto troubleshooting Croc public relays…").put("troubleshooting",true)}
             update("running","Auto troubleshooting Croc public relays…")
@@ -317,9 +326,9 @@ class TransferService : Service() {
         val preparing=snapshot.optBoolean("preparing")
         val total=snapshot.optLong(if(preparing)"prepTotal" else "total");val done=snapshot.optLong(if(preparing)"prepDone" else "done")
         val percentage=if(total>0 || snapshot.optInt("filesTotal")>0)ProgressEvents.percent(done,total,snapshot.optInt("filesDone"),snapshot.optInt("filesTotal")) else snapshot.optInt("percent")
-        val phase=snapshot.optString("phase",if(snapshot.optString("action")=="receive")"Receiving" else "Sharing")
+        val phase=TransferLabels.title(snapshot)
         val speed=snapshot.optDouble(if(preparing)"prepSpeed" else "speed").takeIf{it.isFinite() && it>0} ?: 0.0
-        val content=if(message.isNotEmpty())message else listOf(phase,
+        val content=if(message.isNotEmpty())TransferLabels.message(snapshot).ifEmpty{phase} else listOf(phase,
             if(total>0)"$percentage% · ${ProgressEvents.size(done)} / ${ProgressEvents.size(total)}" else if(snapshot.has("percent"))"$percentage%" else "",
             if(snapshot.optInt("filesTotal")>0)"${snapshot.optInt("filesDone")} / ${snapshot.optInt("filesTotal")} files" else "",
             if(speed>0 && snapshot.optString("status")=="running")"${ProgressEvents.size(speed.toLong())}/s"+(ProgressEvents.eta(done,total,speed)?.let{" · $it left"} ?: "") else "").filter{it.isNotEmpty()}.joinToString(" · ")
@@ -330,8 +339,9 @@ class TransferService : Service() {
             .setOnlyAlertOnce(true).setContentIntent(open).setOngoing(true).addAction(Notification.Action.Builder(null,"Stop",stop).build()).build()
     }
     override fun onTimeout(startId:Int,fgsType:Int) {
+        backgroundTimedOut=true
         stopping.set(true);runCatching{NativeBridge.cancel()};process?.destroy()
-        update("interrupted","Android background time limit reached; reopen DataBeam to resume")
+        update("interrupted","Android reached its background transfer time limit.")
         stopSelf()
     }
     override fun onDestroy() {

@@ -15,8 +15,15 @@ Requires Rust with `aarch64-linux-android`, Go (the recipe selects its toolchain
 ## Implemented
 
 - Native Kotlin Android UI; no WebView.
+- Orange arrow branding and an OLED-black theme. The footer shows the installed version and a troubleshoot shortcut.
+- Named file/folder selections with individual removal. Croc has separate Files and Text choices; only the selected input is shown.
+- Transfer configuration is locked while starting/running/stopping. Progress, copy/QR, pause and stop remain available as applicable.
+- Automatic Croc codes and relay-recovery replacements use three random words from the exact EFF word list shared with desktop.
+- Transfer-card and notification messages distinguish sender and receiver states. Interrupted receives offer Resume; stopped senders offer local Restart sharing. Clearing the card is labelled separately and explains its effect.
+- Restart sharing reuses the existing staged files or text, including a cached file after its original Android URI is unavailable. It starts a new sender session; Sendme publishes a new ticket.
 - Errors appear directly in transfer status. No visible log pane; received Croc text has a separate selectable view.
 - Manual transfer Resume/Retry only. No general automatic transfer retries or tray UI. Remote restart of stopped senders is deferred; public-relay recovery remains enabled.
+- Selected Android document/share URIs currently become private staging copies before sending; these are not filesystem symlinks. Restart reuses the existing staging copy. Direct URI/file-descriptor reading is not implemented in the current path-based engine bridge. See [the source-reference investigation](../investigations/android-source-references.md).
 - Embedded Rust Sendme engine from the same vendored source as desktop via JNI.
 - The pinned, SHA-256-verified, patched Croc CLI built as an Android PIE executable, packaged under jniLibs and executed from Android's installed native library directory (never extracted into a writable directory).
 - Android Croc uses upstream's `croc_no_tailcat` build tag: standard LAN Direct and public-relay transfers are available; the optional Tailcat/DERP transport is excluded because its Linux netlink-based probe crashes inside Android's app sandbox.

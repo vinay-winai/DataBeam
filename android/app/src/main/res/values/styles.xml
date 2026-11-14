@@ -1,0 +1,14 @@
+<resources>
+    <style name="DataBeamTheme" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:colorAccent">@color/databeam_accent</item>
+        <item name="android:colorBackground">@color/databeam_background</item>
+        <item name="android:windowBackground">@color/databeam_background</item>
+        <item name="android:colorBackgroundFloating">#0A0A0A</item>
+        <item name="android:colorButtonNormal">#1C1C1C</item>
+        <item name="android:textColorPrimary">#F5F5F5</item>
+        <item name="android:textColorSecondary">#B0B0B0</item>
+        <item name="android:statusBarColor">@color/databeam_background</item>
+        <item name="android:navigationBarColor">@color/databeam_background</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

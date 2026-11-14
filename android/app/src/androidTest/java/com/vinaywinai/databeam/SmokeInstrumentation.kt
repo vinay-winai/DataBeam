@@ -12,6 +12,7 @@ class SmokeInstrumentation:Instrumentation(){
  override fun onCreate(arguments:Bundle?){super.onCreate(arguments);args=arguments ?: Bundle();start()}
  override fun onStart(){
   try {
+   if(args.getString("ui_controls_test")=="true"){UiControlsRegression.run(this);return}
    if(args.getString("storage_test")=="true"){StorageRegression.run(this);return}
    if(args.getString("share_test")=="true"){ShareEntryRegression.run(this);return}
    if(args.getString("camera_decoder_test")=="true"){CameraQrRegression.run(this);return}
