@@ -71,7 +71,13 @@ object ShareEntryRegression {
             activity=open(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_STREAM,first).putExtra(Intent.EXTRA_TEXT,"caption must not replace the attachment"))
             runner.runOnMainSync{check((field(activity,"sources") as List<*>).size==1);check((field(activity,"message") as EditText).text.isEmpty());check(field(activity,"tab")=="send")}
             val staged=java.io.File(context.cacheDir,"share-entry-stage-${UUID.randomUUID()}").apply{mkdirs()}
-            check(Storage.stage(context,first,staged).readText()=="generated share fixture")
+            try {
+                OutgoingSources(context,staged,{false},{error("Accessible share attachment was copied")}).use{sources->
+                    val reference=sources.add(first)
+                    check(reference.readText()=="generated share fixture")
+                    check(sources.referenced==1 && sources.copied==0)
+                }
+            } finally{staged.delete()}
             activity=open(Intent(Intent.ACTION_SEND_MULTIPLE).setType("text/plain").putParcelableArrayListExtra(Intent.EXTRA_STREAM,arrayListOf(first,second,first)))
             runner.runOnMainSync{check((field(activity,"sources") as List<*>).size==2)}
             runner.runOnMainSync{runner.callActivityOnNewIntent(activity,Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT,text))}
@@ -81,7 +87,7 @@ object ShareEntryRegression {
             check(ProgressEvents.croc("DATABEAM_PREPARE_V1 {\"done\":50,\"total\":100,\"speed_bps\":20}")?.preparation?.done==50L)
             check(ProgressEvents.croc("DATABEAM_PREPARE_V1 {\"done\":200,\"total\":100,\"speed_bps\":20}")==null)
             check(ProgressEvents.croc("DATABEAM_RATE_V1 {\"speed_bps\":-1}")==null)
-            result.putString("result","PASS share target, selected text, files/multiple files, attachment caption protection, draft recreation and structured preparation progress")
+            result.putString("result","PASS share target, selected text, files/multiple files, referenced attachment bytes, caption protection, draft recreation and structured preparation progress")
         }catch(error:Throwable){resultCode=1;result.putString("error",error.stackTraceToString())}
         finally {
             runner.runOnMainSync{opened.forEach{it.finish()}}

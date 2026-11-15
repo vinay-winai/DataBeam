@@ -99,6 +99,7 @@ object UiControlsRegression {
                 check((field("pause") as View).isEnabled)
                 invoke("showSettings")
                 val controls=field("settingsConfiguration") as List<*>
+                check(controls.any{it is Button && it.text=="Review and clean transfer storage"}){"Storage cleanup setting missing"}
                 check(controls.all{!(it as View).isEnabled}){"Transfer settings could change while active"}
                 (field("settingsDialog") as AlertDialog).dismiss()
             }
@@ -129,20 +130,20 @@ object UiControlsRegression {
             }
             val fileSession=waitFor{it.optString("status")=="running" && it.optString("phase")=="Waiting for receiver" && it.optString("text").isEmpty()}
             sessions.add(fileSession.getString("id"))
-            check(fileSession.optJSONArray("paths")?.length()==1){"File was not staged"}
+            check(fileSession.optJSONArray("paths")?.length()==1 && fileSession.optInt("referencedFiles")==1 && fileSession.optInt("copiedFiles")==0){"Seekable file was not referenced"}
             main{(field("pause") as Button).performClick()}
             waitFor{it.optString("status")=="stopped" && it.optString("id")==fileSession.optString("id")}
-            c.contentResolver.delete(first,null,null)
             main{(field("restartSharing") as Button).performClick()}
             val fileRestart=waitFor{it.optString("status")=="running" && it.optString("phase")=="Waiting for receiver" && it.optString("id")!=fileSession.optString("id")}
             sessions.add(fileRestart.getString("id"))
-            check(fileRestart.getJSONArray("paths").toString()==fileSession.getJSONArray("paths").toString()){"Restart did not reuse the original file snapshot"}
+            check(fileRestart.optInt("referencedFiles")==1 && fileRestart.optInt("copiedFiles")==0){"Restart did not reopen the original URI"}
+            check(fileRestart.getJSONArray("paths").toString()!=fileSession.getJSONArray("paths").toString()){"Restart reused closed descriptor aliases"}
             main{(field("pause") as Button).performClick()}
             waitFor{it.optString("status")=="stopped" && it.optString("id")==fileRestart.optString("id")}
-            result.putString("result","PASS selection names/removal/add-folder, Files/Text isolation, version/logo, real transfer input/settings lock, three-word codes, ongoing notification progress, text restart and cached-file restart after original URI removal")
+            result.putString("result","PASS selection names/removal/add-folder, Files/Text isolation, version/logo, real transfer input/settings lock, three-word codes, ongoing notification progress, text restart and original-URI file restart without a staging copy")
         }catch(error:Throwable){code=1;result.putString("error",error.stackTraceToString())}
         finally {
-            if(TransferService.state(c).optString("text")==text && TransferService.state(c).optString("status") in listOf("running","stopping")){
+            if(TransferService.state(c).optString("id") in sessions && TransferService.state(c).optString("status") in listOf("running","stopping")){
                 c.startService(Intent(c,TransferService::class.java).setAction("stop"));runCatching{waitFor{it.optString("status") !in listOf("running","stopping")}}
             }
             main{activity?.finish()};runner.waitForIdleSync()
@@ -152,6 +153,8 @@ object UiControlsRegression {
             editor.commit();created.forEach{runCatching{c.contentResolver.delete(it,null,null)}};folder.delete()
             sessions.forEach{id->
                 UUID.fromString(id)
+                File(c.filesDir,"transfer-records/$id.json").delete()
+                File(c.filesDir,"transfer-records/$id.tmp").delete()
                 for(root in listOf("outgoing","received","blobs")){
                     val parent=File(c.filesDir,root).canonicalFile
                     val child=File(parent,id).canonicalFile

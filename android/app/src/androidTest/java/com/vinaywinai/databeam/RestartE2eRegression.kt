@@ -107,6 +107,13 @@ object RestartE2eRegression {
                     document("restart-$short.bin",args.optLong("mib",8)*1024*1024)
                     document("empty-$short.bin",0)
                     document("notes-$short-α.txt",0,"Generated restart fixture\nUnicode: αβγ\n")
+                } else if(kind=="provider") {
+                    c.contentResolver.delete(Uri.parse("content://${SourceAccessRegression.AUTHORITY}/reset"),null,null)
+                    uris.put(android.provider.DocumentsContract.buildTreeDocumentUri(SourceAccessRegression.AUTHORITY,"root").toString())
+                    val data=ByteArray(65536).also{java.util.Random(7).nextBytes(it)}
+                    val digest=MessageDigest.getInstance("SHA-256").digest(data).joinToString(""){"%02x".format(it)}
+                    for(name in listOf("source-folder/original-name.bin","source-folder/nested/stream.bin","source-folder/nested/bounded.bin"))files.put(name,JSONObject().put("sha256",digest).put("size",data.size))
+                    record.getJSONArray("directories").put("source-folder/empty directory")
                 } else {
                     val source=File(directory,"source").apply{mkdirs()};val folder=File(source,"folder-$short").apply{mkdirs()}
                     File(folder,"nested").mkdirs();File(folder,"empty directory").mkdirs()
@@ -128,12 +135,18 @@ object RestartE2eRegression {
                     c.startForegroundService(Intent(c,TransferService::class.java).putExtra("config",config.toString()))
                 } else {
                     main{
-                        if(kind=="flat")runner.callActivityOnNewIntent(activity,Intent(Intent.ACTION_SEND_MULTIPLE).setType("*/*").putParcelableArrayListExtra(Intent.EXTRA_STREAM,ArrayList((0 until uris.length()).map{Uri.parse(uris.getString(it))})))
+                        if(kind in listOf("flat","provider"))runner.callActivityOnNewIntent(activity,Intent(Intent.ACTION_SEND_MULTIPLE).setType("*/*").putParcelableArrayListExtra(Intent.EXTRA_STREAM,ArrayList((0 until uris.length()).map{Uri.parse(uris.getString(it))})))
                         else{(field("textChoice") as Button).performClick();(field("message") as EditText).setText(record.getString("text"))}
                         (field("sendCode") as EditText).setText("");(field("primary") as Button).performClick()
                     }
                 }
                 val first=ready()
+                if(kind=="flat"){
+                    check(first.optInt("referencedFiles")==3 && first.optInt("copiedFiles")==0){"Seekable file selections were copied instead of referenced"}
+                    check(TransferCleanup.size(File(c.filesDir,"outgoing/${first.getString("id")}"))==0L){"Outgoing payload copies consumed storage"}
+                    check(TransferCleanup.size(File(c.filesDir,"blobs/${first.getString("id")}"))<args.optLong("mib",8)*1024*1024/2){"Sender blob store duplicated the original payload"}
+                }
+                if(kind=="provider")check(first.optInt("referencedFiles")==0 && first.optInt("copiedFiles")==3){"Expected three safe provider fallbacks"}
                 if(mode!="Croc")record.put("first_hash",NativeBridge.hash(first.getString("ticket")))
                 emit("prepared",first)
             } else {
@@ -155,11 +168,13 @@ object RestartE2eRegression {
                     lastCommand=command.getInt("sequence")
                     when(command.getString("op")){
                         "restart"->{
+                            val direct=TransferService.state(c).optBoolean("referencedSources")
                             stop()
-                            if(record.getString("kind")=="flat"){
+                            if(record.getString("kind") in listOf("flat","provider") && !direct){
                                 val uris=record.getJSONArray("uris");for(i in 0 until uris.length())c.contentResolver.delete(Uri.parse(uris.getString(i)),null,null)
                                 record.put("originals_deleted",true)
                             }
+                            if(direct)record.put("originals_kept_for_reference",true)
                             emit("restarted",restart())
                         }
                         "finish"->{

@@ -482,6 +482,9 @@ fn build_virtual_data_sources(
 
     for source in paths {
         check_cancelled(cancel)?;
+        #[cfg(target_os = "android")]
+        let canonical = if android_fd_alias(&source) { std::path::absolute(&source)? } else { source.canonicalize()? };
+        #[cfg(not(target_os = "android"))]
         let canonical = source.canonicalize()?;
         anyhow::ensure!(
             canonical.exists(),
@@ -508,7 +511,10 @@ fn build_virtual_data_sources(
                     continue;
                 }
             };
-            if !entry.file_type().is_file() {
+            let regular = entry.file_type().is_file();
+            #[cfg(target_os = "android")]
+            let regular = regular || (android_fd_alias(entry.path()) && entry.path().is_file());
+            if !regular {
                 continue;
             }
             let path = entry.into_path();
@@ -531,6 +537,14 @@ fn build_virtual_data_sources(
     }
 
     Ok(data_sources)
+}
+
+#[cfg(target_os = "android")]
+pub(super) fn android_fd_alias(path: &Path) -> bool {
+    let Ok(target) = std::fs::read_link(path) else { return false; };
+    let prefix = format!("/proc/{}/fd/", std::process::id());
+    target.to_str().and_then(|target| target.strip_prefix(&prefix))
+        .is_some_and(|fd| !fd.is_empty() && fd.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 pub fn canonicalized_path_to_string(

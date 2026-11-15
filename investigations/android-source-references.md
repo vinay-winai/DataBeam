@@ -1,26 +1,47 @@
-# Android source references and staging
+# Android source access and measured storage behavior
 
-Checked on 2026-11-15.
+Checked on 2026-11-15. These changes apply to Android only.
 
-## DataBeam today
+## DataBeam source access
 
-Desktop passes the selected filesystem paths directly to Croc. The shared Sendme sender imports original paths with `ImportMode::TryReference` (`third_party/sendme/src/core/send.rs`). DataBeam does not create Android-style full staging copies on desktop. This is a reference import, not necessarily a filesystem symbolic link.
+Desktop passes original filesystem paths to Croc and imports Sendme paths with `ImportMode::TryReference`. Its behavior is unchanged.
 
-Android receives `content://` document/share URIs. `Storage.stage` currently reads them through `ContentResolver` into `filesDir/outgoing/<session>/` before calling the path-based engines. Folder selections are enumerated and copied. The current local sender-restart action reuses those staged paths; it does not stage the selection a second time. A device regression verified restarting a cached file after deleting the original generated MediaStore URI.
+Android opens selected Content URIs with `ContentResolver.openAssetFileDescriptor`. `OutgoingSources` holds accessible seekable, whole-file descriptors and creates named aliases under its private transfer tree pointing to `/proc/<app PID>/fd/<fd>`. Engines read original bytes through those aliases without a payload staging copy. Display filenames, folder hierarchy, zero-byte files and empty folders are preserved. Closing a sender removes aliases before releasing descriptors, preventing descriptor-number reuse from redirecting stale aliases.
 
-## What DashBeam does
+The Android-only Sendme adapter preserves descriptor aliases during import. A separately applied Android Croc patch recognizes aliases only beneath the declared private source tree, pointing to the parent app's numeric FD. Enumeration, hashing and source validation use regular target bytes. Desktop Croc's recipe is unchanged; both applications remain on 11.5.5.
 
-The latest release checked was [DashBeam v0.7.2](https://github.com/tonyantony300/dashbeam/releases/tag/v0.7.2). Its Android code also copies picker/share selections:
+A private copy remains necessary for nonseekable pipes, bounded asset slices, provider-private inodes that Android allows reading but forbids reopening, and selections beyond 256 held descriptors. Being a regular seekable FD is insufficient: an actual independent open must succeed. The bounded fallback uses the asset stream so bytes outside the permitted slice are excluded.
 
-- [NativeUtils.kt](https://github.com/tonyantony300/dashbeam/blob/v0.7.2/src-tauri/plugins/tauri-plugin-native-utils/android/src/main/java/com/dashbeam/plugin/native_utils/NativeUtils.kt#L529): `startUriCopy` creates a directory under `cacheDir/file_cache` and copies one or more selected URIs into it.
-- [CopyUtils.kt](https://github.com/tonyantony300/dashbeam/blob/v0.7.2/src-tauri/plugins/tauri-plugin-native-utils/android/src/main/java/com/dashbeam/plugin/native_utils/CopyUtils.kt#L87): `copyUri` reads the provider's input stream and writes an actual destination file. The folder variant repeats this for the selected tree's files.
+Restart reopens referenced original URIs. Originals must remain available and unchanged; temporary share grants may expire. An intact all-copy fallback snapshot can still be reused after its original is unavailable. This differs from the earlier always-copy implementation, which could restart every source from its private snapshot. No receiver remotely restarts a stopped sender.
 
-The same routines were present on main at `c5de16552fc946ec9d0ad3b3792875868e826a05`; the checked released copy utility had the same file SHA as main. This is evidence of Android staging, not of a direct URI-reference send path.
+## DashBeam 0.7.1: observed on the installed phone
 
-## Avoiding full copies
+These findings come from real share selection, transfers, Android per-UID storage statistics and received-file checksums. The installed package was `com.dashbeam.android`, version 0.7.1 (7001).
 
-Android can open an original URI as a file descriptor. Copying every selection is an implementation choice, not an Android requirement. A future direct-reference bridge needs to preserve names, permissions and descriptor lifetime, and support the transfer engines' file-access behavior. Croc runs in a separate process; the native Sendme engine runs through JNI. Passing a URI string to their existing filesystem-path interfaces is insufficient.
+| Stage | App data bytes | Cache bytes (included in data) |
+| --- | ---: | ---: |
+| Before selecting generated 64 MiB source | 10,018,816 | 1,363,968 |
+| After selection, before transfer | 77,242,368 | 68,587,520 |
+| After exiting/reopening the earlier share | 9,412,608 | 765,952 |
 
-[ContentResolver.openFileDescriptor](https://developer.android.com/reference/android/content/ContentResolver#openFileDescriptor(android.net.Uri,%20java.lang.String)) can return a regular file or a streaming pipe/socket. A direct reader must account for seekability and provider offsets/lengths rather than treating every descriptor as a whole ordinary file. Persistable grants should be retained where offered; temporary share grants can expire, and an original can be changed or removed. A staged fallback remains useful for unsupported providers and restart guarantees.
+Selection added approximately a full 64 MiB copy. That transfer exceeded the 240-second receiver deadline. The native receiver observed Direct briefly, then repeated Relay paths with roughly 14–16-second relay RTT. This explains slowness during this run, not every DashBeam transfer.
 
-No direct URI/descriptor send adapter is shipped by this UI revision.
+A separate generated 1 MiB phone-to-PC transfer completed with an exact SHA-256 match. Cache remained about 1,822,720 bytes after completion and pressing Done. The larger run's later reduction shows lifecycle cleanup can reclaim temporary copies; these measurements do not establish immediate cleanup on Stop or Done. No routing workaround was added to DataBeam.
+
+`DashBeamStorageProbe` reproduces the experiment and deletes its generated original MediaStore item afterward. Android's per-UID `dataBytes` includes cache; the columns must not be added. DashBeam's own data was not reset.
+
+## DataBeam cleanup
+
+At the user's request, all DataBeam private app data was reset before this revision's tests: 3,045,110 KiB fell to 4 KiB. The thirteen existing public Downloads files were preserved. Old pre-reset preferences are not restored.
+
+Publication records destination URIs and verifies lengths plus SHA-256 before deleting a private received working directory. A mismatch retains the work; re-publication creates a distinct name instead of replacing a changed public file. Legacy working copies are removed automatically only after matching their public saved bytes. Resume blob caches are separate from these exported working copies.
+
+While idle, cleanup offers Keep/Delete for unused transfer data and ages known non-current caches after seven days. Unknown legacy data is offered for deletion rather than silently expired. Current resume/restart sources and caches are protected. Cleanup confines deletion to validated private transfer roots, does not follow symlink targets, and never deletes public saved documents. Checks run at startup or from Settings, not at an exact scheduled time.
+
+## Other clients: source inspection on 2026-11-15
+
+These are source findings, not storage measurements on installed builds.
+
+- [FlCroc](https://github.com/576576/FlCroc/blob/ce94b4930ea208e85f7c6ef284ba17e839634c02/lib/views/send/send.dart#L204) uses `file_picker` for file selections; the checked Android plugin implementation's `FileUtils.openFileStream` copies URI bytes to its cache. Folder selection can return a real path and FlCroc passes that path directly. FlCroc also contains an explicit temporary-file branch for Content URI paths; its presence does not prove that branch successfully reads an Android URI using Dart's ordinary `File` API.
+- [Dking's croc-app](https://github.com/Dking08/croc-app/blob/037d93107311870e555fe0d7206ffae4b0002473/app/src/main/java/com/dking/crocapp/ui/send/SendViewModel.kt#L453) explicitly copies picked file bytes to `cacheDir/croc-send` before sending. Folder selection recursively copies to `croc-send-folder`. It calls staging cleanup after completion/cancellation and other session actions.
+- [bakirgdev's CrocApp](https://github.com/bakirgdev/CrocApp/blob/3f8902fe3d594df192d53b66820bc65403838d72/app/CrocApp/Views/SendView.swift#L270) passes in-app file/folder selections as URLs and holds security-scoped access while the engine sends them. Photos/videos and share-extension handoffs use staging copies. This distinction concerns app-created copies; it does not establish whether an OS/cloud file provider downloads or materializes a source itself.

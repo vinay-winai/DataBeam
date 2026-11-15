@@ -13,6 +13,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 class TransferService : Service() {
     companion object {
         private val busy = AtomicBoolean(false)
+        fun isBusy()=busy.get()
         const val CHANNEL = "transfers"
         fun state(c: Context): JSONObject {
             val wasBusy=busy.get()
@@ -47,6 +48,7 @@ class TransferService : Service() {
     private var job: Thread? = null
     private var lastProgressNotice=0L
     private var timing=TransferTiming()
+    private var outgoingSources:OutgoingSources?=null
     private val poll = object : Runnable {
         override fun run() {
             runCatching {
@@ -132,6 +134,7 @@ class TransferService : Service() {
         update("running","Preparing…")
         main.post(poll)
         job=Thread {
+            TransferCleanup.lock.lock()
             var terminal="complete"
             var terminalMessage="Complete"
             try {
@@ -192,6 +195,9 @@ class TransferService : Service() {
                         }){_,_->
                             synchronized(this){state.put("published",published)};persist()
                         }
+                        val receipt=synchronized(this){JSONObject(state.toString())}
+                        TransferCleanup.saved(this,receipt)
+                        synchronized(this){state.put("workingCleaned",true)};persist()
                         terminalMessage="Saved to ${config.optString("saveFolderLabel","Downloads / DataBeam")}"
                     } else terminalMessage="Text received"
                 }
@@ -199,6 +205,12 @@ class TransferService : Service() {
                 terminal=if(backgroundTimedOut)"interrupted" else if(stopping.get()) if(state.optString("action")=="send")"stopped" else "paused" else "interrupted"
                 terminalMessage=if(backgroundTimedOut)"Android reached its background transfer time limit." else if(stopping.get()) if(state.optString("action")=="send")"Sharing ended" else "Paused · received data retained" else (e.message ?: e.javaClass.simpleName)
             } finally {
+                runCatching{outgoingSources?.close()};outgoingSources=null
+                runCatching{
+                    TransferCleanup.record(this,synchronized(this){JSONObject(state.toString())},terminal)
+                    if(state.optString("action")=="send")TransferCleanup.remove(filesDir,"blobs/${state.getString("id")}")
+                }
+                TransferCleanup.lock.unlock()
                 main.post {
                     // Drain final JNI counters before freezing the completion summary.
                     poll.run()
@@ -217,19 +229,22 @@ class TransferService : Service() {
     private fun stageSources(c:JSONObject) {
         if(c.getString("action")!="send" || c.optString("text").isNotEmpty()) return
         val old=c.optJSONArray("paths")
-        if(old!=null && old.length()>0) {
+        if(old!=null && old.length()>0 && !c.optBoolean("referencedSources")) {
             for(i in 0 until old.length()) require(File(old.getString(i)).exists()) {"Original files are missing. Select them again."}
             return
         }
         val uris=c.optJSONArray("uris") ?: error("Select files or a folder")
-        synchronized(this){state.put("phase","Copying selected files").put("preparing",true).put("prepDone",0).put("prepTotal",0)};persist()
+        synchronized(this){state.put("phase","Opening selected files").put("preparing",true).put("prepDone",0).put("prepTotal",0)};persist()
         val folder=File(filesDir,"outgoing/${c.getString("id")}").apply{mkdirs()}
+        val sources=OutgoingSources(this,folder,{stopping.get()}){synchronized(this){state.put("phase","Copying provider file")};persist()}
+        outgoingSources=sources
         val paths=JSONArray()
         for(i in 0 until uris.length()) {
-            val file=Storage.stage(this,android.net.Uri.parse(uris.getString(i)),folder)
+            val file=sources.add(android.net.Uri.parse(uris.getString(i)))
             paths.put(file.absolutePath)
         }
-        require(paths.length()>0){"No files selected"};c.put("paths",paths)
+        require(paths.length()>0){"No files selected"};c.put("paths",paths).put("referencedSources",sources.referenced>0).put("sourceRoot",folder.absolutePath)
+        synchronized(this){state.put("referencedSources",sources.referenced>0).put("sourceRoot",folder.absolutePath).put("referencedFiles",sources.referenced).put("copiedFiles",sources.copied)};persist()
     }
     private fun runNative(c:JSONObject) {
         check(!stopping.get()){ "Stopped" }
@@ -250,7 +265,7 @@ class TransferService : Service() {
         }
         c.put("cache",cache.apply{mkdirs()}.absolutePath)
         c.put("output",File(filesDir,"received/${c.getString("id")}").apply{mkdirs()}.absolutePath)
-        synchronized(this){state.put("output",c.getString("output"))}
+        synchronized(this){state.put("output",c.getString("output")).put("cacheBase",c.getString("cache"))};TransferCleanup.record(this,synchronized(this){JSONObject(state.toString())})
         c.put("root","DataBeam_databeam")
         val result=JSONObject(NativeBridge.run(c.toString()))
         if(result.optString("status")=="error") error(result.optString("message"))
@@ -266,6 +281,7 @@ class TransferService : Service() {
         require(code.length>=7){"Code must have at least 7 characters"}
         val relay=c.optString("relay").ifEmpty { RelayRecovery.relay(code) }
         val output=File(filesDir,"received/${c.getString("id")}").apply{mkdirs()}
+        if(action=="receive"){synchronized(this){state.put("output",output.absolutePath)};persist()}
         val args=mutableListOf(File(applicationInfo.nativeLibraryDir,"libcroc.so").absolutePath,"--yes","--ignore-stdin","--relay",relay)
         if(action=="send") {
             args.add("send")
@@ -288,6 +304,7 @@ class TransferService : Service() {
         val command=listOf("/system/bin/sh","-c","echo DATABEAM_CHILD_PID=$$; exec \"$@\"","databeam-croc")+args
         val builder=ProcessBuilder(command).directory(output)
         builder.environment().putAll(mapOf("CROC_SECRET" to code,"HOME" to filesDir.absolutePath,"TMPDIR" to cacheDir.absolutePath,"DATABEAM_CROC_PROGRESS" to "1","CROC_NO_UPDATE_CHECK" to "1"))
+        if(action=="send" && c.optBoolean("referencedSources"))builder.environment()["DATABEAM_ANDROID_SOURCE_ROOT"]=c.getString("sourceRoot")
         val p=builder.start();process=p;if(stopping.get())p.destroy();p.outputStream.close()
         val errors=StringBuffer()
         val payloadStarted=AtomicBoolean(false)
@@ -357,6 +374,7 @@ class TransferService : Service() {
     }
     @Synchronized private fun update(status:String,message:String) {
         state.put("status",status).put("message",message);persist()
+        runCatching{TransferCleanup.record(this,JSONObject(state.toString()))}
         getSystemService(NotificationManager::class.java).notify(1,notification(message))
     }
     @Synchronized private fun persist() {getSharedPreferences("transfer",0).edit().putString("state",state.toString()).commit()}

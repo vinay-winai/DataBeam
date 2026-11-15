@@ -21,10 +21,12 @@ def main():
         if check and p.returncode:raise RuntimeError(p.stderr.decode(errors='replace'))
         return p.stdout
     def state():
-        xml=adb('exec-out','run-as',APP,'cat','shared_prefs/transfer.xml')
+        xml=adb('exec-out','run-as',APP,'cat','shared_prefs/transfer.xml',check=False)
+        if not xml.lstrip().startswith(b'<?xml'):return {}
         node=ET.fromstring(xml).find("string[@name='state']");return json.loads(node.text) if node is not None else {}
     assert state().get('status') not in ('running','stopping'),'A user transfer is active'
-    snapshots={name:adb('exec-out','run-as',APP,'cat','shared_prefs/'+name) for name in ('settings.xml','transfer.xml')}
+    snapshots={name:adb('exec-out','run-as',APP,'cat','shared_prefs/'+name,check=False) for name in ('settings.xml','transfer.xml')}
+    snapshots={name:data if data.lstrip().startswith(b'<?xml') else b'' for name,data in snapshots.items()}
     for name,data in snapshots.items():(work/name).write_bytes(data)
     procs=[];handles=[];sessions=[];records=[];results=[]
     def spawn(command,label,env=None):
@@ -56,7 +58,7 @@ def main():
             s=state()
             if s.get('id')==case:records.append(s);(work/(label+'-state.json')).write_text(json.dumps(s,indent=2,ensure_ascii=False),encoding='utf8')
         output=(work/(label+'-phone.out')).read_text(encoding='utf8',errors='replace')
-        assert 'INSTRUMENTATION_CODE: 0' in output,output[-2000:]
+        assert 'INSTRUMENTATION_CODE: 0' in output and 'shortMsg=' not in output and 'download_hash_' in output,output[-2000:]
         assert f'download_hash_{fixture.name}={expected}' in output,'Published SHA-256 mismatch'
         if options.get('pauseTest') or options.get('requireCachedResume'):
             found=re.search(r'INSTRUMENTATION_RESULT: resumed_from=(\d+)',output)
@@ -120,13 +122,18 @@ def main():
                 if re.fullmatch(r'content://media/(external|external_primary)/downloads/\d+',uri):adb('shell','content','delete','--uri',uri,check=False)
         for case in sessions:
             uuid.UUID(case)
+            adb('shell','run-as',APP,'rm','-f',f'files/transfer-records/{case}.json',f'files/transfer-records/{case}.tmp',check=False)
             for parent in ('blobs','received'):
                 path=f'files/{parent}/{case}'
                 real=adb('shell','run-as',APP,'readlink','-f',path,check=False).decode().strip()
                 base=adb('shell','run-as',APP,'readlink','-f','files/'+parent,check=False).decode().strip()
                 if real and base:
                     assert real==base+'/'+case;adb('shell','run-as',APP,'rm','-rf',path,check=False)
-        for name,data in snapshots.items():adb('shell','run-as',APP,'tee','shared_prefs/'+name,data=data)
+        for name,data in snapshots.items():
+            if data:
+                adb('shell','run-as',APP,'mkdir','-p','shared_prefs')
+                adb('shell','run-as',APP,'tee','shared_prefs/'+name,data=data)
+            else:adb('shell','run-as',APP,'rm','-f','shared_prefs/'+name,check=False)
         adb('shell','run-as',APP,'rm','-f','shared_prefs/transfer.xml.bak','shared_prefs/settings.xml.bak',check=False)
         for f in handles:f.close()
         print('Preferences restored; generated phone outputs removed.',flush=True)

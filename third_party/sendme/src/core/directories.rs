@@ -19,6 +19,8 @@ pub fn collect(paths: &[PathBuf], cancel: Option<&AtomicBool>) -> anyhow::Result
     let mut result = Vec::new();
     for source in paths {
         super::send::check_cancelled(cancel)?;
+        #[cfg(target_os = "android")]
+        if super::send::android_fd_alias(source) { continue; }
         let canonical = source.canonicalize()?;
         if !canonical.is_dir() {
             continue;

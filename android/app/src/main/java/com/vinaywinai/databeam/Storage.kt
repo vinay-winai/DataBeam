@@ -117,7 +117,7 @@ object Storage {
             check(!stopped()){ "Paused" }
             val relative=file.relativeTo(source).invariantSeparatorsPath
             val known=published.optString(relative)
-            if(known.isNotEmpty() && runCatching{c.contentResolver.openInputStream(Uri.parse(known))?.use{true} ?: false}.getOrDefault(false))return@forEach
+            if(known.isNotEmpty() && TransferCleanup.matches(c,file,Uri.parse(known)){check(!stopped()){"Paused"}})return@forEach
             if(folder.isNotEmpty()) {
                 val uri=publishTree(c,file,relative,Uri.parse(folder),stopped).toString()
                 published.put(relative,uri);record(relative,uri)

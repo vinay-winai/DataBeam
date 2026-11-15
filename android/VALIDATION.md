@@ -172,3 +172,38 @@ Final device storage and UI-controls regressions passed again, including existin
 - The device UI-controls test verified elapsed text in the ongoing notification. The final full suite also exposed and fixed a pre-existing flaky test: the EFF dictionary word `yo-yo` is one word, so counting hyphen separators cannot validate a three-word generated phrase. The production dictionary and code generator were unchanged.
 
 Timing APK SHA-256: `7547550a550376191b1404f04b1a459a62ed2ec32cf972805bd1a3928360d744` (31,586,204 bytes). Earlier APK hashes above identify their respective historical builds.
+
+## Android source references and cleanup — 2026-11-15
+
+This section supersedes earlier always-copy sender behavior described above. Changes apply to Android only. Croc remains 11.5.5; desktop filesystem handling and transport defaults are unchanged.
+
+- Accessible seekable, whole-file Content URI descriptors use named aliases and remain open until the engines stop. Android-only adapters preserve original names and treat the aliases as file bytes, including Croc hashing/source validation. Pipes, bounded assets, provider-private inodes that forbid reopening and descriptor-limit overflow use bounded, cancellable copy fallbacks.
+- Local sender restart reopens referenced original URIs. Originals/access must remain available. An intact all-copy fallback snapshot can still restart when original access is gone. Aliases are removed before descriptor numbers can be reused, and native sender stores shut down before their working cache is removed.
+- Completed receives verify destination lengths and SHA-256 before removing private received working files. Matching publication receipts are checked before reuse; changed public outputs receive a fresh protected name. Legacy migration requires matching filename, relative folder and bytes. Unknown zero-byte files, sparse files and empty-folder trees are not silently discarded merely because allocated payload bytes are zero.
+- Settings offers Keep/Delete for unused private transfer data. Known inactive caches expire after seven days when checked. Current resume/restart data and selected private sources are protected; public saved documents are never cleanup deletion targets. Unknown legacy caches require a deletion choice.
+
+| Check | Result |
+| --- | --- |
+| APK/test APK builds, JVM tests and Android lint | Passed: 31 JVM tests, zero failures; lint zero errors (45 warnings) |
+| Shared Sendme library regression suite | Passed: 33 tests, one manual test ignored |
+| Direct-source stop/restart; original filenames, zero-byte file, desktop SHA-256 | Passed in all three modes; three references, zero copies; no full payload duplicate in the sender blob store |
+| Referenced-source app/process death and restart | Passed in all three modes; original URIs reopened and desktop SHA-256 matched |
+| Folder-path app/process death and restart | Passed in all three modes; nested files/Unicode names/empty directories matched |
+| Provider-private, pipe and bounded-slice fallback folder; original access removed before restart | Passed in all three modes; exact bytes/layout/empty directory matched |
+| Mid-payload sender restart with desktop cache reuse | Passed in all three modes; Croc 128 MiB, native modes 1 MiB bounded repeats |
+| Croc Unicode text restart | Passed; exact text, no leaked file |
+| PC-to-phone Sendme/EasySendMe receive-cache suite | All ten checks passed: 256 MiB pause/continue, offline complete export, delete/redownload and unrelated-cache preservation; saved checksums and working-copy removal verified |
+| PC-to-phone native route evidence | Both 256 MiB checks transitioned Relay to Direct and completed Direct; this does not guarantee every future path |
+| Croc PC-to-phone app-close reconnect | Passed: 64 MiB SHA-256 matched, resumed from 16,809,984 bytes; saved working duplicate removed |
+| Final device source access, child descriptor read, cleanup, storage, share-sheet and UI-controls checks | All six passed; ongoing notification progress and configuration/storage-setting locking verified |
+| APK verification | v2 signature and 16 KiB alignment passed; installed package SHA-256 matched local APK |
+
+Sixteen distinct successful sender scenarios were verified across the generated-fixture runs. The first restricted host attempt could not open relay sockets; it was rerun with approved network access. A Croc text attempt returned EOF and passed on repeat. A 4 MiB Sendme upload exceeded 190 seconds while selected paths switched between Direct and Relay; the smaller repeat passed with 131,372 cached bytes reused. An initial EasySendMe test let the old receiver finish its cache before sender restart, so its new sender correctly saw no new receiver; the test now terminates the initial native receiver at the partial threshold. Both corrected native interruption cases passed with 131,372 bytes reused. These functional checks do not establish reliable large-upload throughput, and no transport workaround or general app retry was added.
+
+Drivers/artifacts (ignored): `direct-source-e2e-final`, `direct-source-network-repeat`, `source-fallback-restart-final`, `source-reference-app-death-final`, receive-cache run `e03e79bd-3f4d-49c7-a38a-09cf8c61653e`, Croc reconnect run `730f6bc6-d36a-4827-9c6d-52fe366642cf`, and `source-cleanup-final-device` under `android/.tools/smoke/`. Checked-in drivers are `restart_e2e.py`, `receive_cache_e2e.py` and the instrumentation regressions. Host drivers support absent preferences after a fresh reset and remove their own transfer receipts.
+
+At the user's request, DataBeam app data was reset before testing (3,045,110 KiB to 4 KiB). Final generated transfer data and screenshots were removed; the private directory measured 44 KiB after reopening. All thirteen pre-existing public Download files remained in the original inventory. Old pre-reset preferences were not restored. The instrumentation package, temporary local test relay and ADB reverse mappings were removed. DataBeam was reopened without a generated transfer card. DashBeam's own app data was not reset.
+
+Installed APK: 31,587,675 bytes, SHA-256 `49e1f5a85a356c1563c96fdb58af9384cc9c37f80f17786282c1d8f976b0f4a8`.
+
+Measured DashBeam 0.7.1 storage and source-inspected FlCroc/croc-app/iOS comparisons are in [the source-access investigation](../investigations/android-source-references.md). Iroh issue #4555 and proposed fix #4645 were rechecked on November 15: both remain open, the PR is unmerged, and the latest published Iroh is still 1.4.1. The existing documentation-only decision stands. Overnight Doze, network switching and additional devices remain explicitly excluded.

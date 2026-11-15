@@ -8,6 +8,8 @@ Upstream sources checked on 2026-11-14:
 - https://github.com/n0-computer/sendme/issues/45: earlier Sendme offload failures.
 - https://github.com/n0-computer/sendme/issues/162: separate Android JNI-context startup issue, relevant to correct native integration rather than this payload timeout.
 
+Rechecked 2026-11-15: issue #4555 is still open; PR #4645 is open with `merged=false` and no merge date. The latest published Iroh release is still [v1.4.1](https://github.com/n0-computer/iroh/releases/tag/v1.4.1), also used by this build. The proposed fix has not landed and inclusion in the next release is not confirmed.
+
 Controlled diagnostics: after adding Android’s required DNS context/network callbacks, five of six 64 MiB upload attempts still fell back from Direct to Relay; one completed Direct. A temporary experiment disabling segmentation offload passed three 64 MiB uploads, six further public-handoff 64 MiB uploads, and two public-handoff 512 MiB uploads, all with Direct route evidence and SHA-256 verification. This strongly supports the offload diagnosis, but is not a kernel-level proof for every device.
 
 **Shipping decision:** the user requested documentation instead of a workaround while upstream is tracking it and relay transfers remain functional. The experimental transport override was removed. The final Android build uses Iroh’s normal transport defaults and route selection. The proper application-context initialization and Android network callbacks remain. No local upstream transport patch, throwaway socket probe or general app retry loop is shipped.

@@ -1,0 +1,121 @@
+--- a/src/croc/croc.go
++++ b/src/croc/croc.go
+@@ -1141,7 +1141,7 @@
+ 		if err = ctx.Err(); err != nil {
+ 			return
+ 		}
+-		stat, errStat := os.Lstat(fpath)
++		stat, errStat := dataBeamSourceStat(fpath)
+ 
+ 		if errStat != nil {
+ 			err = errStat
+@@ -1201,6 +1201,10 @@
+ 					}
+ 					if err != nil {
+ 						return err
++					}
++					if info.Mode()&os.ModeSymlink != 0 {
++						info, err = dataBeamSourceStat(pathName)
++						if err != nil { return err }
+ 					}
+ 					absPathWithSeparator := filepath.Dir(absPath)
+ 					if !strings.HasSuffix(absPathWithSeparator, string(os.PathSeparator)) {
+--- a/src/croc/file_preparation.go
++++ b/src/croc/file_preparation.go
+@@ -49,7 +49,7 @@
+ 	}
+ 	fileInfo := c.FilesToTransfer[index]
+ 	fullPath := sourceFilePath(fileInfo)
+-	before, err := os.Lstat(fullPath)
++	before, err := dataBeamSourceStat(fullPath)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -74,7 +74,7 @@
+ 	if err != nil {
+ 		return err
+ 	}
+-	after, err := os.Lstat(fullPath)
++	after, err := dataBeamSourceStat(fullPath)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -160,7 +160,7 @@
+ 		return fmt.Errorf("invalid source index %d", index)
+ 	}
+ 	expected := c.sourceSnapshots[index]
+-	current, err := os.Lstat(sourceFilePath(c.FilesToTransfer[index]))
++	current, err := dataBeamSourceStat(sourceFilePath(c.FilesToTransfer[index]))
+ 	if err != nil {
+ 		return err
+ 	}
+--- a/src/utils/ctx.go
++++ b/src/utils/ctx.go
+@@ -98,7 +98,7 @@
+ 		return nil, err
+ 	}
+ 
+-	fstats, err := os.Lstat(fname)
++	fstats, err := DataBeamSourceStat(fname)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+--- a/src/utils/utils.go
++++ b/src/utils/utils.go
+@@ -194,7 +194,7 @@
+ 		doShowProgress = showProgress[0]
+ 	}
+ 	var fstats os.FileInfo
+-	fstats, err = os.Lstat(fname)
++	fstats, err = DataBeamSourceStat(fname)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+--- /dev/null
++++ b/src/utils/databeam_source_adapter.go
+@@ -0,0 +1,34 @@
++package utils
++
++import (
++    "os"
++    "path/filepath"
++    "runtime"
++    "strconv"
++    "strings"
++)
++
++// Only the Android recipe applies this adapter. Only named descriptors beneath
++// the declared private source tree represent regular bytes, not symlink text.
++func DataBeamSourceStat(path string) (os.FileInfo, error) {
++    if runtime.GOOS == "android" {
++        root := os.Getenv("DATABEAM_ANDROID_SOURCE_ROOT")
++        if filepath.IsAbs(root) {
++            abs, err := filepath.Abs(path)
++            rel, relErr := filepath.Rel(filepath.Clean(root), abs)
++            if err == nil && relErr == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
++                target, linkErr := os.Readlink(abs)
++                prefix := "/proc/"+strconv.Itoa(os.Getppid())+"/fd/"
++                if linkErr == nil && strings.HasPrefix(target, prefix) {
++                    fd, parseErr := strconv.Atoi(strings.TrimPrefix(target, prefix))
++                    if parseErr == nil && fd >= 0 {
++                        info, statErr := os.Stat(abs)
++                        if statErr != nil { return nil, statErr }
++                        if info.Mode().IsRegular() { return info, nil }
++                    }
++                }
++            }
++        }
++    }
++    return os.Lstat(path)
++}
+--- /dev/null
++++ b/src/croc/databeam_source_adapter.go
+@@ -0,0 +1,8 @@
++package croc
++
++import (
++    "os"
++    "github.com/schollz/croc/v11/src/utils"
++)
++
++func dataBeamSourceStat(path string) (os.FileInfo, error) { return utils.DataBeamSourceStat(path) }

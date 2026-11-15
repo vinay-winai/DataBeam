@@ -17,6 +17,9 @@ class MainActivity:ComponentActivity() {
     private var qrDialog:AlertDialog?=null
     private var settingsDialog:AlertDialog?=null
     private var cacheDialog:AlertDialog?=null
+    private var cleanupBusy=false
+    private var cleanupScanning=false
+    private var cleanupScanned=false
     private var settingsFolder:TextView?=null
     private var settingsBackground:TextView?=null
     private var batteryButton:Button?=null
@@ -222,7 +225,7 @@ class MainActivity:ComponentActivity() {
     private fun updatePrimaryLabel(){
         if(::primary.isInitialized)primary.text=if(tab=="receive")"Receive" else if(mode.selectedItem=="Croc" && sendKind=="text")"Send text" else "Send files"
     }
-    private fun configurationLocked()=pendingStartId.isNotEmpty() || TransferService.state(this).optString("status") in listOf("running","stopping")
+    private fun configurationLocked()=cleanupBusy || pendingStartId.isNotEmpty() || TransferService.state(this).optString("status") in listOf("running","stopping")
     private fun enableTree(view:View,enabled:Boolean){
         view.isEnabled=enabled
         if(view is ViewGroup)for(index in 0 until view.childCount)enableTree(view.getChildAt(index),enabled)
@@ -302,6 +305,9 @@ class MainActivity:ComponentActivity() {
         settingsConfiguration.add(button("Change folder…"){folderPicker.launch(AppSettings.folder(this).takeIf{it.isNotEmpty()}?.let(Uri::parse))})
         settingsConfiguration.add(button("Use Downloads / DataBeam"){AppSettings.setFolder(this,null);updateSaveLocation()})
         label("Applies to new transfers. Paused transfers keep their original folder.").textSize=12f
+        label("Transfer storage")
+        label("Saved working copies are verified and removed automatically. Known inactive caches expire after seven days when checked; current resume/restart data is kept.").textSize=12f
+        settingsConfiguration.add(button("Review and clean transfer storage"){showStorageCleanup(true)})
         label("Advanced options")
         val custom=EditText(this).apply{hint="Custom Croc relay (optional)";setSingleLine();setText(AppSettings.relay(this@MainActivity));panel.addView(this)};settingsConfiguration.add(custom)
         label("Leave empty to use Croc public relays. Relay recovery stays enabled.").textSize=12f
@@ -341,6 +347,39 @@ class MainActivity:ComponentActivity() {
             .setPositiveButton("Done"){_,_->if(!configurationLocked())AppSettings.setRelay(this,custom.text.toString())}.create().also{dialog->
                 dialog.setOnDismissListener{if(!configurationLocked())AppSettings.setRelay(this,custom.text.toString());settingsFolder=null;settingsBackground=null;batteryButton=null;notificationsButton=null;settingsDialog=null;settingsConfiguration.clear()};dialog.show();lockConfiguration(configurationLocked())
             }
+    }
+    private fun showStorageCleanup(manual:Boolean){
+        if(configurationLocked() || TransferService.isBusy()){
+            if(manual)alert("End the active or paused connection before cleaning transfer storage.");return
+        }
+        if(cleanupScanning)return
+        val extra=sources.filter{it.scheme=="file"}.mapNotNull{it.path}
+        cleanupScanning=true
+        if(manual)Toast.makeText(this,"Checking transfer storage…",Toast.LENGTH_SHORT).show()
+        Thread{
+            val result=runCatching{TransferCleanup.scan(this,extra)}
+            runOnUiThread{
+                cleanupScanning=false;if(isDestroyed || configurationLocked() || TransferService.isBusy())return@runOnUiThread
+                result.onFailure{if(manual)alert(it.message ?: "Could not check transfer storage")}.onSuccess{report->
+                    val candidates=if(manual)report.candidates else report.candidates.filter{it.bytes>1024*1024}
+                    val bytes=candidates.sumOf{it.bytes}
+                    if(!manual && candidates.isEmpty()){
+                        if(report.reclaimed>0)Toast.makeText(this,"Freed ${ProgressEvents.size(report.reclaimed)} of saved working copies",Toast.LENGTH_LONG).show()
+                        return@onSuccess
+                    }
+                    val message="Freed ${ProgressEvents.size(report.reclaimed)} automatically.\nUnused transfer data: ${ProgressEvents.size(bytes)}.\nKept for the current resume/restart: ${ProgressEvents.size(report.protectedBytes)}.\n\nDeleting unused data removes older transfer caches and temporary copies. Those older transfers will need their sources again. Files saved to Downloads or your chosen folder stay intact.\n\nTo remove the current transfer's saved resume data too, clear its transfer card first, then check storage again."
+                    val dialog=AlertDialog.Builder(this).setTitle("Transfer storage").setMessage(message).setNegativeButton("Keep",null)
+                    if(candidates.isNotEmpty())dialog.setPositiveButton("Delete unused data"){_,_->
+                        cleanupBusy=true;lockConfiguration(true)
+                        Thread{
+                            val removed=runCatching{TransferCleanup.deleteUnused(this,candidates,extra)}
+                            runOnUiThread{cleanupBusy=false;if(!isDestroyed){lockConfiguration(configurationLocked());removed.onSuccess{alert("Freed ${ProgressEvents.size(it)}. Saved files and current resume/restart data were kept.")}.onFailure{alert(it.message ?: "Cleanup could not finish")}}}
+                        }.start()
+                    }
+                    dialog.show()
+                }
+            }
+        }.start()
     }
     private fun selectTab(value:String){tab=value;updatePanels()}
     private fun updatePanels(){
@@ -416,7 +455,7 @@ class MainActivity:ComponentActivity() {
         val text=if(selected=="Croc")saved.optString("text") else ""
         val uris=saved.optJSONArray("uris") ?: JSONArray()
         val cached=saved.optJSONArray("paths")
-        val reusable=cached!=null && cached.length()>0 && (0 until cached.length()).all{File(cached.getString(it)).exists()}
+        val reusable=!saved.optBoolean("referencedSources") && cached!=null && cached.length()>0 && (0 until cached.length()).all{File(cached.getString(it)).exists()}
         if(uris.length()==0 && text.isBlank())saved.optJSONArray("paths")?.let{paths->
             for(index in 0 until paths.length()){
                 val file=File(paths.getString(index))
@@ -584,7 +623,7 @@ class MainActivity:ComponentActivity() {
         renderedSession=TransferService.state(this).optString("id")
         acceptShare(intent)
     }
-    override fun onResume(){super.onResume();updateBackgroundStatus();handler.post(ticker)}
+    override fun onResume(){super.onResume();updateBackgroundStatus();handler.post(ticker);if(!cleanupScanned){cleanupScanned=true;showStorageCleanup(false)}}
     override fun onPause(){handler.removeCallbacks(ticker);super.onPause()}
     override fun onDestroy(){cacheDialog?.dismiss();cacheDialog=null;super.onDestroy()}
 }

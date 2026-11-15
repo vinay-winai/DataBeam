@@ -137,6 +137,7 @@ fn run(c: Config) -> anyhow::Result<Value> {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             share.router.shutdown().await?;
+            share._store.shutdown().await?;
             Ok(json!({"status":"stopped"}))
         } else {
             anyhow::ensure!(c.action == "receive", "Unknown action");

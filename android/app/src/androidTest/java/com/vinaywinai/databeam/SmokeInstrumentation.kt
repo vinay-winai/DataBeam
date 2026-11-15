@@ -12,6 +12,10 @@ class SmokeInstrumentation:Instrumentation(){
  override fun onCreate(arguments:Bundle?){super.onCreate(arguments);args=arguments ?: Bundle();start()}
  override fun onStart(){
   try {
+   if(args.getString("source_access_test")=="true"){SourceAccessRegression.run(this);return}
+   if(args.getString("cleanup_test")=="true"){CleanupRegression.run(this);return}
+   if(args.getString("reference_probe")=="true"){ReferenceSourceProbe.run(this);return}
+   args.getString("dashbeam_probe")?.let{DashBeamStorageProbe.run(this,JSONObject(String(Base64.decode(it,Base64.DEFAULT))));return}
    args.getString("restart_e2e")?.let{RestartE2eRegression.run(this,JSONObject(String(Base64.decode(it,Base64.DEFAULT))));return}
    if(args.getString("ui_controls_test")=="true"){UiControlsRegression.run(this);return}
    if(args.getString("storage_test")=="true"){StorageRegression.run(this);return}
@@ -144,8 +148,14 @@ class SmokeInstrumentation:Instrumentation(){
         while(keys.hasNext()){
             val name=keys.next();val hash=MessageDigest.getInstance("SHA-256")
             c.contentResolver.openInputStream(android.net.Uri.parse(saved.getString(name)))!!.use{input->val buffer=ByteArray(65536);while(true){val n=input.read(buffer);if(n<0)break;hash.update(buffer,0,n)}}
-            out.putString("download_hash_${name.substringAfterLast('/')}",hash.digest().joinToString(""){"%02x".format(it)})
+            val digest=hash.digest().joinToString(""){"%02x".format(it)}
+            out.putString("download_hash_${name.substringAfterLast('/')}",digest)
+            if(s.optBoolean("workingCleaned"))out.putString("hash_${name.substringAfterLast('/')}",digest)
         }
+     }
+     if(config.getString("action")=="receive" && s.optString("status")=="complete" && s.optJSONObject("published")?.length()?.let{it>0}==true){
+        check(s.optBoolean("workingCleaned")){"Completed working files were not cleaned"}
+        check(!File(s.getString("output")).exists()){"Private received-file duplicates remain"}
      }
      val path=s.optString("output")
      if(path.isNotEmpty()) File(path).walkTopDown().filter{it.isFile}.forEach {f->

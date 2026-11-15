@@ -44,6 +44,13 @@ def main():
         run(['git','-c','safe.directory='+ROOT.as_posix(),'apply','--directory='+source.relative_to(ROOT).as_posix(),patch],cwd=ROOT)
         stamp.write_text(digest)
     elif stamp.read_text()!=digest:raise SystemExit('Croc patch changed; remove android/.tools/croc and rebuild')
+    source_patch=ROOT/'patches'/recipe['source_patch']
+    source_stamp=source/'.databeam-source-patch'
+    source_digest=hashlib.sha256(source_patch.read_bytes()).hexdigest()
+    if not source_stamp.exists():
+        run(['git','-c','safe.directory='+ROOT.as_posix(),'apply','--directory='+source.relative_to(ROOT).as_posix(),source_patch],cwd=ROOT)
+        source_stamp.write_text(source_digest)
+    elif source_stamp.read_text()!=source_digest:raise SystemExit('Android source adapter changed; rebuild from fresh pinned Croc source')
     env.update(GOOS='android',GOARCH='arm64',CGO_ENABLED='1',CC=str(clang),GOTOOLCHAIN='go'+recipe['go_version'])
     # Android satisfies Go's linux tag, but cannot use Tailcat's Linux netlink
     # monitor. Its optional netcheck panics with a nil InterfaceState. Upstream's

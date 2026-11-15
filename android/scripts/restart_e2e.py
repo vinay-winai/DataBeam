@@ -18,6 +18,8 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--serial',default='RZCT9012X2V')
     parser.add_argument('--case',action='append',help='MODE:SCENARIO, e.g. Sendme:stop')
+    parser.add_argument('--kind',choices=('flat','folder','provider'),help='Override fixture: references, folder paths, or private/stream/bounded provider fallbacks')
+    parser.add_argument('--mib',type=int,help='Override generated payload size for a bounded network repeat')
     parser.add_argument('--work',type=Path)
     parser.add_argument('--relay',default='1.getcroc.com:9009',help='Croc rendezvous endpoint shared by phone and desktop')
     args=parser.parse_args()
@@ -32,7 +34,7 @@ def main():
     def shell(command,**kwargs):return adb('shell',command,**kwargs)
     def state():
         xml=adb('exec-out','run-as',APP,'cat','shared_prefs/transfer.xml',check=False)
-        if not xml:return {}
+        if not xml.lstrip().startswith(b'<?xml'):return {}
         node=ET.fromstring(xml).find("string[@name='state']")
         return json.loads(node.text) if node is not None else {}
     assert state().get('status') not in ('running','stopping'),'A user transfer is active'
@@ -40,11 +42,15 @@ def main():
     for name in ('settings.xml','transfer.xml'):
         # Reuse an earlier pre-install backup when this directory was prepared already.
         backup=work/name
-        if not backup.exists():backup.write_bytes(adb('exec-out','run-as',APP,'cat','shared_prefs/'+name))
-        snapshots[name]=backup.read_bytes()
+        if not backup.exists():backup.write_bytes(adb('exec-out','run-as',APP,'cat','shared_prefs/'+name,check=False))
+        snapshots[name]=backup.read_bytes() if backup.read_bytes().lstrip().startswith(b'<?xml') else b''
     def restore():
         adb('shell','am','force-stop',APP,check=False)
-        for name,data in snapshots.items():adb('shell','run-as',APP,'tee','shared_prefs/'+name,data=data)
+        for name,data in snapshots.items():
+            if data:
+                adb('shell','run-as',APP,'mkdir','-p','shared_prefs')
+                adb('shell','run-as',APP,'tee','shared_prefs/'+name,data=data)
+            else:adb('shell','run-as',APP,'rm','-f','shared_prefs/'+name,check=False)
         adb('shell','run-as',APP,'rm','-f','shared_prefs/settings.xml.bak','shared_prefs/transfer.xml.bak',check=False)
     def spawn(command,name,env=None):
         out=(work/(name+'.out')).open('wb');err=(work/(name+'.err')).open('wb');handles.extend([out,err])
@@ -126,10 +132,11 @@ def main():
         if record:(work/(case+'-record.json')).write_text(json.dumps(record,indent=2,ensure_ascii=False),encoding='utf8')
         adb('shell','am','force-stop',APP,check=False)
         for uri in record.get('uris',[]):
-            assert re.fullmatch(r'content://media/(external|external_primary)/downloads/\d+',uri),uri
-            shell('content delete --uri '+uri,check=False)
+            if re.fullmatch(r'content://media/(external|external_primary)/downloads/\d+',uri):shell('content delete --uri '+uri,check=False)
+            else:assert uri=='content://com.vinaywinai.databeam.test.sourcefixture/tree/root',uri
         for session in record.get('sessions',[]):
             uuid.UUID(session)
+            adb('shell','run-as',APP,'rm','-f',f'files/transfer-records/{session}.json',f'files/transfer-records/{session}.tmp',check=False)
             for parent in ('outgoing','received','blobs'):
                 path=f'files/{parent}/{session}'
                 real=shell(f'run-as {APP} readlink -f {path}',check=False).decode().strip()
@@ -152,11 +159,11 @@ def main():
         for mode,scenario in cases:
             assert mode in ('Croc','Sendme','EasySendMe') and scenario in ('stop','closed','text','mid')
             case=str(uuid.uuid4());case_ids.append(case);started=time.monotonic();case_procs=len(procs)
-            kind='text' if scenario=='text' else 'folder' if scenario=='closed' else 'flat'
+            kind='text' if scenario=='text' else args.kind or ('folder' if scenario=='closed' else 'flat')
             print('START',mode,scenario,flush=True)
-            record=dict(mode=mode,scenario=scenario,run=case,status='FAIL')
+            record=dict(mode=mode,scenario=scenario,kind=kind,run=case,status='FAIL')
             try:
-                phone=instrument(case,mode,scenario,kind,mib=(128 if mode=='Croc' else 4) if scenario=='mid' else 1)
+                phone=instrument(case,mode,scenario,kind,mib=args.mib or ((128 if mode=='Croc' else 4) if scenario=='mid' else 1))
                 first=wait_record(case,'prepared');initial=first['prepared']
                 destination=work/(case+'-received');cache=work/(case+'-receiver-cache')
                 partial_bytes=None
@@ -170,6 +177,10 @@ def main():
                         if pc.poll() is not None:raise AssertionError('Initial receiver ended before a partial transfer')
                         time.sleep(.05)
                     else:raise AssertionError('No partial payload progress')
+                    # A native sender remains open after a completed download.
+                    # Stop the receiver immediately so it cannot finish filling
+                    # its cache while the phone processes the restart command.
+                    if mode!='Croc':terminate(pc)
                     command(case,'restart',1)
                     next_record=wait_record(case,'restarted')
                     try:pc.wait(timeout=3)
