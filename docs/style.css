@@ -362,7 +362,7 @@ strong {
     font-weight: 500;
 }
 
-.comparison-table .highlight a {
+.comparison-table .comparison-download {
     color: inherit;
     text-underline-offset: 3px;
 }
