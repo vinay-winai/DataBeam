@@ -6,10 +6,7 @@ The native DataBeam Android app is now available as **v0.8.0-beta.1** for **Andr
 
 [Download the Android beta APK](https://github.com/vinay-winai/DataBeam/releases/download/android-v0.8.0-beta.1/DataBeam_android-arm64_beta.apk) · [Android beta release notes](https://github.com/vinay-winai/DataBeam/releases/tag/android-v0.8.0-beta.1)
 
-- Send and receive with Croc, Sendme and EasySendMe; generate and scan transfer QR codes.
-- Share files or text to DataBeam from other Android apps, with background transfer notifications.
-- Follow the latest Direct/Relay path, payload progress and elapsed time; open the saved folder after receiving.
-- Public relay checks, Croc relay recovery and clear file re-selection guidance after a failed send.
+- almost feature parity with the desktop app with additional mobile specific features.
 
 The Linux AArch64 AppImage also runs through DroidDeck on Android; it is separate from the native APK.
 
