@@ -2,7 +2,16 @@
 
 First native Android beta for Android 8.0+ ARM64 phones and tablets.
 
-APK refresh — build 801:
+APK refresh — build 802:
+
+- Fix EasySendMe Resume repeating a consumed ticket handoff or using an unrelated main-input code. Matching partial data now continues automatically on Receive and Resume.
+- Resume explains when a normal desktop sender has ended and provides New code / New ticket for the exact same files. A still-sharing session, such as Broadcast, can reuse its current ticket.
+- Settings can hide either Sendme or Croc and its related main-screen options. At least one engine must remain enabled; EasySendMe requires both.
+- Check local Croc data ports before switching away from a usable public connection. Local-port failures no longer produce a misleading public-relay outage warning. Croc remains pinned to 11.5.5.
+- Refresh troubleshooting news on foreground entry and keep its unread badge visible above the button.
+- Request file-manager window reuse when opening the save folder. File managers that force new document windows, including Google Files on the tested phone, retain control of that behavior.
+
+Retained from build 801:
 
 - Match desktop Sendme/EasySendMe folder naming; Croc retains original names.
 - Automatically remove successful sender copies, clear failed sender copies on the next app opening, and remove receive blobs after verified export while retaining partial receives.
