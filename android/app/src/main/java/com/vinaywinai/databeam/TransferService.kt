@@ -312,7 +312,10 @@ class TransferService : Service() {
         c.put("cache",cache.apply{mkdirs()}.absolutePath)
         c.put("output",File(filesDir,"received/${c.getString("id")}").apply{mkdirs()}.absolutePath)
         synchronized(this){state.put("output",c.getString("output")).put("cacheBase",c.getString("cache"))};TransferCleanup.record(this,synchronized(this){JSONObject(state.toString())})
-        c.put("root","DataBeam_databeam")
+        if(c.optString("action")=="send"){
+            val paths=c.getJSONArray("paths")
+            c.put("root",PayloadNaming.root((0 until paths.length()).map{File(paths.getString(it))}){stopping.get()})
+        }
         val result=JSONObject(NativeBridge.run(c.toString()))
         if(result.optString("status")=="error") error(result.optString("message"))
         synchronized(this) { state.put("output",c.getString("output")) }

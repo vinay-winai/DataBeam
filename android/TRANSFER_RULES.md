@@ -67,4 +67,8 @@ No general transfer auto-retry or remote restart of a stopped sender. Croc publi
 
 - Success ends a sender session and removes its outgoing fallback copies after descriptors are closed. Failure retains those copies only until the next app foreground entry, when inactive outgoing snapshots and sender blobs are deleted without a Keep/Delete prompt. Broadcast remains active until explicitly ended. Original provider files and public downloads are never sender-cleanup targets.
 - Sender blobs are removed when the native session closes. Verified receive export removes its working directory and receive blob store immediately; failed or paused receive caches remain available for Resume.
-- File Clear all is a compact left-aligned control visible only with a non-empty selection. Received text has Copy text. A newly shown transfer card scrolls into view at the bottom after layout. Relay results display decoded URL strings, not JSON-escaped strings.
+- File Clear all is a compact right-aligned control visible only with a non-empty selection. Received text has Copy text. A newly shown transfer card scrolls into view at the bottom after layout. Relay results display decoded URL strings, not JSON-escaped strings.
+
+Android Sendme/EasySendMe senders derive the same wrapper as desktop: first 20 Unicode code points of the largest selected item by total file bytes, `_and_more` for multiple selections, then `_databeam`. Equal sizes retain selection order. Folder trees keep their original children. This changes newly created sender tickets; existing ticket/cache contents are not renamed. Croc has no added wrapper.
+
+A valid Sendme ticket in received text exposes an explicit Receive with Sendme action. It switches the receive engine, passes the validated ticket and starts a normal receive; other text does not show the action.

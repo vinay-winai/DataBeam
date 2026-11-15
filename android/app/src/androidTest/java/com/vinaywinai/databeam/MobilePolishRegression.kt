@@ -34,8 +34,12 @@ object MobilePolishRegression {
             r.waitForIdleSync()
             if(args.getString("polish_file")=="true"){
                 AppSettings.setFolder(c,null)
-                main{(field("mode") as Spinner).setSelection(1)};r.waitForIdleSync()
-                main{(field("receiveTab") as Button).performClick();(field("code") as EditText).setText(args.getString("ticket"));(field("primary") as Button).performClick()}
+                render(JSONObject().put("id",id).put("action","receive").put("mode","Croc").put("status","complete").put("text",args.getString("ticket")))
+                r.waitForIdleSync()
+                main{
+                    check((field("receiveTextTicket") as View).visibility==View.VISIBLE)
+                    (field("receiveTextTicket") as Button).performClick()
+                }
                 val deadline=System.currentTimeMillis()+60000
                 while(System.currentTimeMillis()<deadline){
                     val s=TransferService.state(c)
@@ -135,6 +139,7 @@ object MobilePolishRegression {
                 s.put("text","generated clipboard text");render(s)
                 main{
                     check((field("copyReceivedText") as View).visibility==View.VISIBLE)
+                    check((field("receiveTextTicket") as View).visibility==View.GONE)
                     (field("copyReceivedText") as Button).performClick()
                     check((c.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).primaryClip!!.getItemAt(0).text.toString()=="generated clipboard text")
                     check((field("clearFiles") as View).visibility==View.GONE)

@@ -64,6 +64,8 @@ class MainActivity:ComponentActivity() {
     private lateinit var selection:TextView
     private lateinit var clearFiles:Button
     private lateinit var copyReceivedText:Button
+    private lateinit var receiveTextTicket:Button
+    private var detectedTextTicket=""
     private lateinit var screenScroll:ScrollView
     private var scrolledTransfer=""
     private lateinit var selectionList:LinearLayout
@@ -181,7 +183,7 @@ class MainActivity:ComponentActivity() {
         fileSelectionPanel=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL;sendPanel.addView(this)}
         selection=label(fileSelectionPanel,"No files selected")
         clearFiles=button(fileSelectionPanel,"Clear all"){sources.clear();restartedNames.clear();refreshSelection()}.apply{
-            textSize=12f;layoutParams=LinearLayout.LayoutParams(-2,dp(36)).apply{gravity=Gravity.START;bottomMargin=dp(6)}
+            textSize=12f;layoutParams=LinearLayout.LayoutParams(-2,dp(36)).apply{gravity=Gravity.END;bottomMargin=dp(6)}
         }
         selectionList=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL;fileSelectionPanel.addView(this)}
         val pick=row(fileSelectionPanel)
@@ -242,6 +244,11 @@ class MainActivity:ComponentActivity() {
         copyReceivedText=button(transfer,"Copy text"){
             (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("Received text",receivedText.text))
             Toast.makeText(this,"Text copied",Toast.LENGTH_SHORT).show()
+        }
+        receiveTextTicket=button(transfer,"Receive with Sendme",true){
+            require(detectedTextTicket.isNotEmpty()){"No valid Sendme ticket in this text"}
+            val value=detectedTextTicket
+            mode.setSelection(1);selectTab("receive");code.setText(value);launch("receive")
         }
         val helpRow=row(screen).apply{gravity=Gravity.CENTER_VERTICAL;setPadding(dp(20),dp(4),dp(20),dp(8))}
         @Suppress("DEPRECATION") val version=packageManager.getPackageInfo(packageName,0).versionName.orEmpty()
@@ -715,6 +722,8 @@ class MainActivity:ComponentActivity() {
         openReceived.visibility=if(receiving && s.optString("status")=="complete" && ((s.optJSONObject("published")?.length() ?: 0)>0 || (s.optJSONObject("publishedDirectories")?.length() ?: 0)>0))View.VISIBLE else View.GONE
         receivedText.text=if(receiving)s.optString("text") else "";receivedText.visibility=if(receivedText.text.isEmpty())View.GONE else View.VISIBLE;receivedTextTitle.visibility=receivedText.visibility
         copyReceivedText.visibility=receivedText.visibility
+        detectedTextTicket=if(receiving)s.optString("text").splitToSequence(Regex("\\s+")).map{it.trim('"','\'','`')}.firstOrNull{it.startsWith("blob") && NativeBridge.hash(it).isNotEmpty()}.orEmpty() else ""
+        receiveTextTicket.visibility=if(detectedTextTicket.isNotEmpty() && !running && !stopping)View.VISIBLE else View.GONE
     }
     private fun relayResultColors(value:CharSequence):CharSequence {
         val colored=android.text.SpannableString(value)
