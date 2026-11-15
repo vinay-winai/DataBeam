@@ -4,6 +4,12 @@ import org.junit.Test
 import org.junit.Before
 
 class RelayRecoveryTest {
+    @Test fun localDataPortTimeoutIsNotAPublicRelayOutage(){
+        val error="relay connection failed: could not connect transfer ports: dial tcp 192.168.1.64:9010: i/o timeout"
+        assertTrue(RelayRecovery.localChannelFailure(error))
+        assertFalse(RelayRecovery.transportError(error))
+        assertTrue(RelayRecovery.transportError(error.replace("192.168.1.64","142.132.189.179")))
+    }
     private lateinit var words:Set<String>
     private fun isPhrase(value:String,count:Int=3):Boolean=if(count==1)value in words else
         value.indices.any{index->value[index]=='-' && value.take(index) in words && isPhrase(value.substring(index+1),count-1)}

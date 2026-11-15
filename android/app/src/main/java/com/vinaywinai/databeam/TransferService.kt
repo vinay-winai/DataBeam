@@ -410,6 +410,11 @@ class TransferService : Service() {
         // payload text; inspect it as an error only after a failed exit.
         if(exit!=0)synchronized(errors){errors.append('\n').append(result.takeLast(16000))}
         readFailure.get()?.let{throw IllegalStateException("Could not read Croc transfer status: ${it.message}",it)}
+        if(exit!=0){
+            val failure=RelayRecovery.failureMessage(errors.toString(),exit)
+            synchronized(this){state.put("crocExit",exit).put("crocFailure",failure).put("crocStdoutLength",result.length)}
+            log("Croc failure: $failure")
+        }
         if(exit!=0 && allowRecovery && c.optString("relay").isEmpty() && !payloadStarted.get() && !stopping.get() && RelayRecovery.transportError(errors.toString())) {
             synchronized(this){state.put("relayNotice","Auto troubleshooting Croc public relays…").put("troubleshooting",true)}
             update("running","Auto troubleshooting Croc public relays…")

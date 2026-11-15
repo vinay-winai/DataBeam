@@ -29,10 +29,18 @@ object RelayRecovery {
     }
     fun transportError(error:String):Boolean {
         val text=error.lowercase()
+        if(localChannelFailure(text))return false
         if(listOf("password","passphrase","pake","room ","lookup ","permission denied","decompress","corrupt input").any{text.contains(it)})return false
         return text.contains("relay connection failed") ||
             (text.contains("could not connect to ") &&
             listOf("i/o timeout","timed out","connection refused","connection reset","network is unreachable","no route to host","relay closed","lookup ").any{text.contains(it)})
+    }
+    fun localChannelFailure(error:String):Boolean {
+        if(!error.contains("could not connect transfer ports",ignoreCase=true))return false
+        return Regex("dial tcp ([0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+):").findAll(error).any{match->
+            val p=match.groupValues[1].split('.').mapNotNull{it.toIntOrNull()}
+            p.size==4 && p.all{it in 0..255} && (p[0]==10 || p[0]==127 || (p[0]==192 && p[1]==168) || (p[0]==172 && p[1] in 16..31) || (p[0]==169 && p[1]==254) || (p[0]==100 && p[1] in 64..127))
+        } || Regex("dial tcp \\[(?:fe[89ab]|f[cd]|::1)[^]]*]",RegexOption.IGNORE_CASE).containsMatchIn(error)
     }
     fun failureMessage(output:String,exit:Int):String {
         val ansi=Regex("\u001B\\[[0-?]*[ -/]*[@-~]")

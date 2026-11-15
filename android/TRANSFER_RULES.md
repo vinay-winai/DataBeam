@@ -51,7 +51,7 @@ No general transfer auto-retry or remote restart of a stopped sender. Croc publi
 ## Quick actions and guidance
 
 - Top Quick actions: Send text selects Croc Text; Broadcast selects Sendme with Broadcast enabled; Send to browser selects Croc Files and shows the getcroc.com receiver link. These change configuration only; they never start sending automatically and are locked while a session is active.
-- The ? button shows an unread badge when the remote troubleshooting guide/news revision differs from the last read revision. Opening the guide successfully acknowledges the latest known revision. Checks run off the UI thread, at startup/resume when due, then at 30-minute intervals (five-minute retry on failure). Offline failures preserve unread state. The bundled guide is initially considered read, matching desktop. GuideNewsTest, GuideBadgeRegression and UiControlsRegression cover these rules.
+- The ? button shows an unread badge when the remote troubleshooting guide/news revision differs from the last read revision. Opening the guide successfully acknowledges the latest known revision. Checks run off the UI thread; each foreground resume requests a fresh check, coalescing any in-flight request. Ordinary checks use a 30-minute cooldown (five-minute retry on failure). Offline failures preserve unread state. The bundled guide is initially considered read, matching desktop. GuideNewsTest, GuideBadgeRegression and UiControlsRegression cover these rules.
 
 ## Timing, route and payload presentation
 
@@ -76,3 +76,9 @@ A valid Sendme ticket in received text exposes an explicit Receive with Sendme a
 ## Guide badge refresh and rendering
 
 Each Activity resume requests a fresh guide check, bypassing the ordinary cooldown while coalescing an existing in-flight request. Requests disable HTTP caches and use a unique query. The read baseline is saved once and survives APK bundle updates; legacy installs use their last checked revision when no seen revision exists. The badge is explicitly above the button, whose elevation animator is disabled. Device regression checks both Z ordering and orange screenshot pixels before testing read acknowledgement.
+
+## Croc local route admission
+
+Android receivers check a private/local control endpoint's advertised data ports before joining the sender's real room. The check authenticates a separate disposable room, then probes the advertised ports concurrently within a 1.5-second overall deadline. Reachable local routes remain eligible; an unusable local candidate is rejected before replacing the public connection. This applies to initial local discovery and the later encrypted local-IP upgrade. It does not restart the transfer or change its code. Public relay endpoints and desktop engines are unchanged.
+
+A terminal `could not connect transfer ports` error naming a private/local address is not treated as a public relay outage. Genuine public-relay transport failures still use the existing bounded pre-payload recovery. Preserve the engine's terminal cause in diagnostics before recovery messaging replaces it.

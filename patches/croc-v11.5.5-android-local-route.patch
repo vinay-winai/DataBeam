@@ -1,0 +1,81 @@
+--- a/src/croc/relay_dial.go
++++ b/src/croc/relay_dial.go
+@@ -117,6 +117,10 @@
+ 	connection, address, err := raceRelayTCP(ctx, addresses, 5*time.Second, relayHappyEyeballsDelay)
+ 	if err != nil {
+ 		return relayControlResult{}, err
++	}
++	if !c.Options.IsSender && !dataBeamLocalRouteUsable(ctx, address, c.Options.RelayPassword) {
++		connection.Close()
++		return relayControlResult{}, fmt.Errorf("local transfer ports unreachable on %s", address)
+ 	}
+ 	stopClose := context.AfterFunc(ctx, connection.Close)
+ 	banner, externalIP, capability, err := tcp.HandshakeTCPServerCapability(connection, c.Options.RelayPassword, c.Options.RoomName)
+--- a/src/croc/croc.go
++++ b/src/croc/croc.go
+@@ -2173,6 +2173,7 @@
+ 				// }
+ 
+ 				serverTry := net.JoinHostPort(ip, port)
++				if !dataBeamLocalRouteUsable(c.stop.ctx, serverTry, c.Options.RelayPassword) { continue }
+ 				conn, banner2, externalIP, _, errConn := tcp.ConnectToTCPServerControlContext(c.stop.ctx, serverTry, c.Options.RelayPassword, c.Options.RoomName, 500*time.Millisecond)
+ 				if errConn != nil {
+ 					log.Debug(c.redactError(errConn))
+--- /dev/null
++++ b/src/croc/databeam_android_local_route.go
+@@ -0,0 +1,44 @@
++package croc
++
++import (
++ "context"
++ "crypto/rand"
++ "fmt"
++ "net"
++ "runtime"
++ "strings"
++ "time"
++ "github.com/schollz/croc/v11/src/tcp"
++)
++
++// Probe a separate disposable room before joining the sender's real local room.
++// Closing a failed real-room attempt can otherwise terminate its sender.
++func dataBeamLocalRouteUsable(ctx context.Context, address, password string) bool {
++ if runtime.GOOS != "android" { return true }
++ host, _, err := net.SplitHostPort(address)
++ if err != nil { return true }
++ ip := net.ParseIP(strings.Split(host, "%")[0])
++ if ip == nil || !(ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast()) { return true }
++ probeCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
++ defer cancel()
++ nonce := make([]byte, 12)
++ if _, err := rand.Read(nonce); err != nil { return false }
++ conn, banner, _, _, err := tcp.ConnectToTCPServerControlContext(probeCtx, address, password, fmt.Sprintf("databeam-probe-%x", nonce), time.Second)
++ if err != nil { return false }
++ defer conn.Close()
++ return dataBeamProbePorts(probeCtx, host, strings.Split(banner, ","), func(ctx context.Context, address string) error {
++  conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", address)
++  if err == nil { conn.Close() }
++  return err
++ })
++}
++
++func dataBeamProbePorts(ctx context.Context, host string, ports []string, dial func(context.Context,string)error) bool {
++ if len(ports)==0 || len(ports)>8 { return false }
++ ctx,cancel:=context.WithTimeout(ctx,time.Second)
++ defer cancel()
++ results:=make(chan error,len(ports))
++ for _,port:=range ports { go func(p string){results<-dial(ctx,net.JoinHostPort(host,p))}(port) }
++ for range ports { select { case err:=<-results: if err!=nil{return false};case <-ctx.Done():return false } }
++ return true
++}
+--- /dev/null
++++ b/src/croc/databeam_android_local_route_test.go
+@@ -0,0 +1,8 @@
++package croc
++import("context";"errors";"testing";"time")
++func TestDataBeamProbePortsRejectsPartialLocalConnectivity(t *testing.T){
++ if dataBeamProbePorts(context.Background(),"192.168.1.64",[]string{"9010","9011"},func(_ context.Context,a string)error{if a=="192.168.1.64:9011"{return errors.New("blocked")};return nil}){t.Fatal("accepted blocked data port")}
++ if !dataBeamProbePorts(context.Background(),"192.168.1.64",[]string{"9010","9011"},func(context.Context,string)error{return nil}){t.Fatal("rejected reachable data ports")}
++ ctx,cancel:=context.WithCancel(context.Background());cancel()
++ start:=time.Now();if dataBeamProbePorts(ctx,"127.0.0.1",[]string{"9010"},func(c context.Context,_ string)error{<-c.Done();return c.Err()}){t.Fatal("ignored cancel")};if time.Since(start)>time.Second{t.Fatal("unbounded check")}
++}

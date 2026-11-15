@@ -45,7 +45,7 @@ object MobilePolishRegression {
                     val s=TransferService.state(c)
                     if(s.optString("action")!="receive" || s.optString("ticket")!=args.getString("ticket")){Thread.sleep(100);continue}
                     session=s.optString("id")
-                    if(s.optString("status")=="interrupted")error(s.optString("message"))
+                    if(s.optString("status")=="interrupted")error(s.optString("crocFailure",s.optString("message")))
                     if(s.optString("status")=="complete" && !TransferService.isBusy()){
                         val saved=s.getJSONObject("published");check(saved.length()==1)
                         val uri=saved.getString(saved.keys().next());published.add(uri)
@@ -90,7 +90,7 @@ object MobilePolishRegression {
                         check(s.getJSONObject("timing").getLong("elapsedMs")==0L){"Waiting counted as transfer time"}
                         marker.writeText(JSONObject().put("code",s.getString("code")).put("expected",text).put("id",session).toString());waitingChecked=true
                     }
-                    if(s.optString("status")=="interrupted")error(s.optString("message"))
+                    if(s.optString("status")=="interrupted")error(s.optString("crocFailure",s.optString("message")))
                     if(s.optString("status")=="complete" && !TransferService.isBusy()){
                         if(receiving){
                             check(s.optString("text")==text){"Received text changed or was truncated"}

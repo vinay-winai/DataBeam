@@ -12,7 +12,7 @@ Android Studio: `X:/as`, SDK: `X:/asproj`. `local.properties` is local and ignor
 .\scripts\build-apk.ps1
 ```
 
-Requires Rust with `aarch64-linux-android`, Go (the recipe selects its toolchain), SDK API 36, and NDK 28.2.13676358. This initial APK targets ARM64 phones. Android Croc is independently pinned in `croc-engine.json` to the previously validated 11.5.5 base plus local GUI telemetry. Desktop 0.8.0 also retains Croc 11.5.5 and reuses this telemetry patch. The evaluated 11.6.5 bundle publication required hard links that failed in the Android app sandbox; that upgrade is deferred. The build refuses to package missing native engines. Native libraries and tool downloads are ignored by Git. Gradle and Android tooling may require accepting their licenses in SDK Manager.
+Requires Rust with `aarch64-linux-android`, Go (the recipe selects its toolchain), SDK API 36, and NDK 28.2.13676358. This initial APK targets ARM64 phones. Android Croc is independently pinned in `croc-engine.json` to the previously validated 11.5.5 base plus local GUI telemetry, source adapters and an Android-only local-data-port admission check. Desktop 0.8.0 also retains Croc 11.5.5 and reuses the telemetry patch; its route selection is unchanged. The evaluated 11.6.5 bundle publication required hard links that failed in the Android app sandbox; that upgrade is deferred. The build refuses to package missing native engines. Native libraries and tool downloads are ignored by Git. Gradle and Android tooling may require accepting their licenses in SDK Manager.
 
 ## Implemented
 
