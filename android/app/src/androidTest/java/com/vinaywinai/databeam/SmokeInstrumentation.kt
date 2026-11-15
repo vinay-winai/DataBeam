@@ -12,6 +12,7 @@ class SmokeInstrumentation:Instrumentation(){
  override fun onCreate(arguments:Bundle?){super.onCreate(arguments);args=arguments ?: Bundle();start()}
  override fun onStart(){
   try {
+   if(args.getString("guide_badge_test")=="true"){GuideBadgeRegression.run(this);return}
    if(args.getString("sender_state_test")=="true"){SenderClosureRegression.run(this);return}
    if(args.getString("source_access_test")=="true"){SourceAccessRegression.run(this);return}
    if(args.getString("cleanup_test")=="true"){CleanupRegression.run(this);return}

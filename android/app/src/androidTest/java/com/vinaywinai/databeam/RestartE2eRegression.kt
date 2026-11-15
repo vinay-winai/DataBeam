@@ -128,10 +128,13 @@ object RestartE2eRegression {
                 AppSettings.setRelay(c,args.getString("relay"))
                 activity=runner.startActivitySync(Intent(c,MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                 runner.waitForIdleSync()
-                main{(field("mode") as Spinner).setSelection(listOf("EasySendMe","Sendme","Croc").indexOf(mode))}
+                main{
+                    (field("mode") as Spinner).setSelection(listOf("EasySendMe","Sendme","Croc").indexOf(mode))
+                    (field("broadcastChoice") as CheckBox).isChecked=args.optBoolean("broadcast") && mode=="Sendme"
+                }
                 runner.waitForIdleSync()
                 if(kind=="folder"){
-                    val config=JSONObject().put("id",UUID.randomUUID().toString()).put("mode",mode).put("action","send").put("code","").put("text","").put("uris",JSONArray()).put("paths",paths).put("relay",args.getString("relay"))
+                    val config=JSONObject().put("id",UUID.randomUUID().toString()).put("mode",mode).put("action","send").put("code","").put("text","").put("uris",JSONArray()).put("paths",paths).put("relay",args.getString("relay")).put("broadcast",args.optBoolean("broadcast") && mode=="Sendme")
                     c.startForegroundService(Intent(c,TransferService::class.java).putExtra("config",config.toString()))
                 } else {
                     main{
@@ -181,11 +184,18 @@ object RestartE2eRegression {
                             check(command.optBoolean("verified")){"Host did not verify the received payload"}
                             if(record.getString("mode")=="Croc")waitFor{it.optString("status")=="complete"}
                             else{
-                                val sent=waitFor{TransferLabels.sentAndSharing(it)}
+                                val broadcast=args.optBoolean("broadcast") && record.getString("mode")=="Sendme"
+                                val sent=waitFor{if(broadcast)TransferLabels.sentAndSharing(it) else it.optString("status")=="complete" && !TransferService.isBusy()}
                                 val elapsed=TransferTiming.elapsedText(sent);Thread.sleep(1800)
                                 check(TransferTiming.elapsedText(TransferService.state(c))==elapsed){"Completed elapsed time kept counting idle sharing"}
-                                val notice=c.getSystemService(NotificationManager::class.java).activeNotifications.firstOrNull{it.id==1}?.notification ?: error("Sharing notification missing")
-                                check(notice.extras.getCharSequence(Notification.EXTRA_TEXT).toString().contains("Sent")){"Notification still reports waiting after completion"}
+                                val notice=c.getSystemService(NotificationManager::class.java).activeNotifications.firstOrNull{it.id==1}?.notification
+                                if(broadcast){
+                                    check(notice!=null && notice.extras.getCharSequence(Notification.EXTRA_TEXT).toString().contains("Sent")){"Broadcast notification missing"}
+                                    check(TransferService.isBusy()){"Broadcast ended after one receiver"}
+                                }else{
+                                    check(notice==null){"Normal send left an active notification"}
+                                    check(!TransferService.isBusy()){"Normal send kept the engine running"}
+                                }
                                 main{activity?.finish()}
                                 activity=runner.startActivitySync(Intent(c,MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                                 runner.waitForIdleSync()
@@ -197,8 +207,9 @@ object RestartE2eRegression {
                                     check(path.startsWith("Connection used") && (path.contains("Direct") || path.contains("Relay"))){"Last transfer path disappeared: $path"}
                                     val count=record.getJSONArray("uris").length().takeIf{it>0} ?: record.getJSONArray("paths").length()
                                     check((field("sources") as List<*>).size==count){"Reopened activity lost the shared file list"}
+                                    check((field("mode") as View).isEnabled==!broadcast){"Configuration lock does not match session availability"}
                                 }
-                                stop()
+                                if(broadcast)stop()
                                 check(TransferService.state(c).optString("status")=="complete"){"Ending successful sharing erased completion"}
                             }
                             if(record.getString("kind")!="text") {

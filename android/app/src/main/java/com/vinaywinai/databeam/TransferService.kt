@@ -44,6 +44,7 @@ class TransferService : Service() {
     private var process: java.lang.Process? = null
     @Volatile private var crocPid:Int?=null
     private val stopping = AtomicBoolean(false)
+    private val sentSuccessfully=AtomicBoolean(false)
     private val cacheChoice=java.util.concurrent.atomic.AtomicReference<String?>()
     @Volatile private var backgroundTimedOut=false
     private var wake: PowerManager.WakeLock? = null
@@ -82,7 +83,10 @@ class TransferService : Service() {
                     if(kind=="receive-started")synchronized(this@TransferService){state.put("phase","Connecting").put("message","")}
                     if(kind=="receive-progress")synchronized(this@TransferService){state.put("message","")}
                     if(kind=="transfer-started")synchronized(this@TransferService){timing.beginPayload(SystemClock.elapsedRealtime());timing.save(state)}
-                    if(kind=="transfer-completed")synchronized(this@TransferService){timing.finishPayload(SystemClock.elapsedRealtime());timing.save(state)}
+                    if(kind=="transfer-completed"){
+                        val end=synchronized(this@TransferService){timing.finishPayload(SystemClock.elapsedRealtime());timing.save(state);TransferLabels.autoEnd(state)}
+                        if(end){sentSuccessfully.set(true);NativeBridge.cancel();process?.destroy()}
+                    }
                     log("$kind $payload")
                 }
                 val now=SystemClock.elapsedRealtime()
@@ -115,6 +119,7 @@ class TransferService : Service() {
         }
         if(!busy.compareAndSet(false,true)) return START_NOT_STICKY
         stopping.set(false)
+        sentSuccessfully.set(false)
         backgroundTimedOut=false
         NativeBridge.prepare()
         state=JSONObject(intent?.getStringExtra("config") ?: "{}")
@@ -156,11 +161,11 @@ class TransferService : Service() {
                         val native=Thread { try { runNative(config) } catch(e:Throwable){nativeError=e} }
                         native.start()
                         try {
-                            while(native.isAlive && !stopping.get()) {
+                            while(native.isAlive && !stopping.get() && !sentSuccessfully.get()) {
                                 val ticket=synchronized(this){state.optString("ticket")}
                                 if(ticket.isNotEmpty() && !advertised) {
                                     croc(config,"send",ticket);advertised=true
-                                    update("running","Sharing; receiver can reconnect while this session stays open")
+                                    if(!sentSuccessfully.get())update("running","Waiting for receiver")
                                 }
                                 Thread.sleep(100)
                             }
@@ -219,6 +224,7 @@ class TransferService : Service() {
                     // Drain final JNI counters before freezing the completion summary.
                     poll.run()
                     main.removeCallbacks(poll)
+                    if(sentSuccessfully.get()){terminal="complete";terminalMessage="Files sent successfully. Sharing ended automatically."}
                     synchronized(this){if(terminal=="complete")timing.finishPayload(SystemClock.elapsedRealtime());timing.pause(SystemClock.elapsedRealtime());timing.save(state)}
                     wake?.let { if(it.isHeld) it.release() };multicast?.let{if(it.isHeld)it.release()}
                     update(terminal,terminalMessage)

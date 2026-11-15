@@ -121,6 +121,12 @@ pub async fn start_share(
         .secret_key(secret_key)
         .relay_mode(relay_mode.clone());
 
+    // Android-only workaround for iroh #4555 (Samsung Android 16 direct-path
+    // stalls). Reassess when updating iroh/sendme after upstream #4645 lands.
+    // Keep desktop transport defaults unchanged.
+    #[cfg(target_os = "android")]
+    { builder = builder.transport_config(iroh::endpoint::QuicTransportConfig::builder().enable_segmentation_offload(false).build()); }
+
     if options.ticket_type == AddrInfoOptions::Id {
         builder = builder.address_lookup(PkarrPublisher::n0_dns());
     }

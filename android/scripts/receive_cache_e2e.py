@@ -25,8 +25,14 @@ def main():
         if not xml.lstrip().startswith(b'<?xml'):return {}
         node=ET.fromstring(xml).find("string[@name='state']");return json.loads(node.text) if node is not None else {}
     assert state().get('status') not in ('running','stopping'),'A user transfer is active'
-    snapshots={name:adb('exec-out','run-as',APP,'cat','shared_prefs/'+name,check=False) for name in ('settings.xml','transfer.xml')}
-    snapshots={name:data if data.lstrip().startswith(b'<?xml') else b'' for name,data in snapshots.items()}
+    snapshots={}
+    for name in ('settings.xml','transfer.xml'):
+        read=subprocess.run([ADB,'exec-out','run-as',APP,'cat','shared_prefs/'+name],capture_output=True,timeout=30)
+        if read.returncode:
+            error=(read.stdout+read.stderr).decode(errors='replace')
+            if 'No such file or directory' not in error:raise RuntimeError(error)
+            snapshots[name]=b''
+        else:ET.fromstring(read.stdout);snapshots[name]=read.stdout
     for name,data in snapshots.items():(work/name).write_bytes(data)
     procs=[];handles=[];sessions=[];records=[];results=[]
     def spawn(command,label,env=None):

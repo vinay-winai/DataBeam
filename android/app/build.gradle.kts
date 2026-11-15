@@ -1,4 +1,15 @@
 plugins { id("com.android.application") }
+abstract class BundleGuideAsset : DefaultTask() {
+    @get:InputFile abstract val sourceFile:org.gradle.api.file.RegularFileProperty
+    @get:OutputDirectory abstract val outputDirectory:org.gradle.api.file.DirectoryProperty
+    @TaskAction fun generate(){
+        val directory=outputDirectory.get().asFile;directory.mkdirs()
+        sourceFile.get().asFile.copyTo(directory.resolve("troubleshoot.md"),overwrite=true)
+    }
+}
+val bundleGuide=tasks.register<BundleGuideAsset>("bundleGuide") {
+    sourceFile.set(rootProject.file("../troubleshoot.md"));outputDirectory.set(layout.buildDirectory.dir("generated/guideAssets"))
+}
 android {
     namespace = "com.vinaywinai.databeam"
     compileSdk = 36
@@ -16,6 +27,7 @@ android {
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     packaging { jniLibs { useLegacyPackaging = true } }
 }
+androidComponents.onVariants {variant->variant.sources.assets?.addGeneratedSourceDirectory(bundleGuide,BundleGuideAsset::outputDirectory)}
 // Fail before packaging an APK whose transfer engines would be missing.
 val verifyEngines = tasks.register("verifyEngines") {
     doLast {
@@ -24,7 +36,7 @@ val verifyEngines = tasks.register("verifyEngines") {
         }
     }
 }
-tasks.matching { it.name == "preBuild" }.configureEach { dependsOn(verifyEngines) }
+tasks.matching { it.name == "preBuild" }.configureEach { dependsOn(verifyEngines,bundleGuide) }
 
 dependencies {
     implementation("org.rustls:rustls-platform-verifier:0.2.0")

@@ -17,6 +17,8 @@ Requires Rust with `aarch64-linux-android`, Go (the recipe selects its toolchain
 ## Implemented
 
 - Native Kotlin Android UI; no WebView.
+- Top Quick actions dropdown for Croc text, Sendme Broadcast and browser receiving with getcroc.com instructions. Actions prepare the form without starting a transfer.
+- The footer troubleshoot button shows an unread guide/release-news badge, matching desktop. Opening the guide clears it; offline failures retain unread state.
 - Orange arrow branding and an OLED-black theme. The footer shows the installed version and a troubleshoot shortcut.
 - Named file/folder selections with individual removal. Croc has separate Files and Text choices; only the selected input is shown.
 - Transfer configuration is locked while starting/running/stopping. Progress, copy/QR, pause and stop remain available as applicable.
@@ -33,7 +35,7 @@ Requires Rust with `aarch64-linux-android`, Go (the recipe selects its toolchain
 - Fresh CameraX + bundled ML Kit receiver scanner (full portrait camera frames, rotation/lifecycle handling, tap focus, pinch zoom and torch). Sender QR generation for codes/tickets, with stale QR dialogs closed on relay recovery. Receiver camera scanning is embedded in the app and fills the code field without automatically starting a transfer; camera permission is requested when scanning.
 - Native system file and folder pickers, “Send with DataBeam” in Android’s share sheet and selected-text menu, background source preparation, and automatic publication to Downloads/DataBeam after receipt. Sharing files keeps attachments rather than treating their captions as transfer text. Croc keeps its existing file layout; no extra DataBeam wrapper is added.
 - Ongoing foreground transfer notification with phase, progress and live rate, Stop and tap-to-return. It is removed after completion/stop. Preparation and payload progress are separate; all modes show selection-wide byte totals and ETA when known. Croc includes completed-file counts and explicit verification reporting. Cooperative Sendme cancellation retains partial caches; the wake lock is bounded to six hours.
-- Elapsed time appears in the transfer card and ongoing notification. It includes active preparation/waiting/saving, excludes pauses and app downtime, and freezes when stopped/completed. Completion average uses newly transferred payload bytes and active payload-through-saving time; cached bytes do not inflate it. Fully cached exports show no download average. A native sender keeps its Sent heading, completed progress, elapsed time, average and last connection path while sharing stays open. A new receiver starts a fresh timing summary; concurrent-receiver aggregate averages are omitted because the existing counters follow the latest receiver.
+- Elapsed time appears in the transfer card and ongoing notification. It includes active preparation/waiting/saving, excludes pauses and app downtime, and freezes when stopped/completed. Completion average uses newly transferred payload bytes and active payload-through-saving time; cached bytes do not inflate it. Fully cached exports show no download average. A native sender keeps its Sent heading, completed progress, elapsed time, average and last connection path after successful completion. Normal sends close automatically; explicit Sendme Broadcast keeps sharing open. A new receiver starts a fresh timing summary; concurrent-receiver aggregate averages are omitted because the existing counters follow the latest receiver.
 - Public Croc relay recovery: bounded background diagnostics, visible auto-troubleshooting status, sender replacement codes with a warning to reshare, and a Sendme fallback when no public relay is reachable. Receiver codes and explicit custom-relay settings are preserved; payloads are not automatically replayed.
 - Separate Send and Receive screens, engine descriptions, contextual sharing controls, and a single progress card.
 - Settings cog for advanced Croc relay configuration, a persistent download-folder picker, and manual Croc/Sendme public-relay checks. Croc checks TCP reachability of all four public endpoints; Sendme establishes an Iroh relay connection. These are checks from this device, not global service-health guarantees.
@@ -43,7 +45,7 @@ Requires Rust with `aarch64-linux-android`, Go (the recipe selects its toolchain
 - Saved transfer state with Pause/Resume and replacement-code/ticket controls. A replacement ticket must have the original collection hash. One interrupted session is retained; starting a new transfer replaces its card.
 - Sendme/EasySendMe check private receive stores by content hash before downloading. Matching partial or complete data shows its names and verified cached bytes, with Continue, Delete and start over, and Cancel. This also finds matching data after the old card has been cleared. Deletion targets only that content hash; other transfers and published files remain intact.
 - Transfer storage cleanup verifies saved output bytes before removing private received working copies. Settings offers Keep/Delete for unused private data; known inactive caches expire after seven days when checked. Active transfers, current resume/restart data and selected private sources are protected. Public Downloads and chosen destinations are never deletion targets.
-- Sender stays available until Stop, including after a receiver disconnects. EasySendMe performs one Croc ticket handoff per share session; a replacement short-code exchange requires Share again on the sender.
+- Normal Sendme and EasySendMe senders close automatically after confirmed success and remove their ongoing notification. Sendme offers an explicit Broadcast checkbox (off by default) to remain available for multiple receivers until Stop. Before success, an interrupted receiver can reconnect to the live sender. EasySendMe performs one Croc ticket handoff per session; a replacement exchange requires a new share.
 
 ## Resume behavior
 
@@ -70,3 +72,8 @@ DataBeam and the vendored Sendme engine are AGPL-3.0. Croc is MIT. See the repos
 ## Known Iroh routing limitation
 
 The phone can lose a Direct UDP path and continue through an Iroh relay. Upstream [iroh#4555](https://github.com/n0-computer/iroh/issues/4555) includes a matching Samsung Android 16/Iroh 1.4.1 report; its fix PR [#4645](https://github.com/n0-computer/iroh/pull/4645) remains open as of 2026-11-14. Per the user’s decision, no local UDP-offload workaround is shipped. Normal relay fallback is retained. Android application-context initialization and platform network callbacks are integrated as required by Iroh’s Android API.
+
+
+## Temporary Android UDP GSO workaround
+
+Android Sendme/EasySendMe sender and receiver endpoints temporarily disable UDP segmentation offload to avoid the documented direct-path timeout. Desktop defaults and Croc are unchanged. When upgrading Iroh or Sendme, check whether the released dependency contains the upstream fix, then reassess/remove this workaround using small Direct-transfer checksum checks. See [the upgrade review note](../investigations/sendme-android-direct-relay.md#required-review-when-updating-iroh-or-sendme).

@@ -51,6 +51,23 @@ object UiControlsRegression {
             activity=runner.startActivitySync(Intent(c,MainActivity::class.java).setAction(Intent.ACTION_SEND_MULTIPLE).setType("text/plain").putParcelableArrayListExtra(Intent.EXTRA_STREAM,arrayListOf(first,second)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
             runner.waitForIdleSync()
             main {
+                fun quick(id:Int){
+                    (field("quickActions") as Button).performClick()
+                    val popup=field("quickMenu") as PopupMenu
+                    check(popup.menu.size()==3);check(popup.menu.performIdentifierAction(id,0));popup.dismiss()
+                }
+                quick(1)
+                check((field("mode") as Spinner).selectedItem=="Croc" && (field("message") as View).visibility==View.VISIBLE)
+                quick(2)
+                check((field("mode") as Spinner).selectedItem=="Sendme" && (field("broadcastChoice") as CheckBox).isChecked)
+                quick(3)
+                check((field("mode") as Spinner).selectedItem=="Croc" && (field("browserGuidance") as View).visibility==View.VISIBLE)
+                check((field("browserGuidance") as TextView).text.contains("https://getcroc.com"))
+                quick(1)
+                check((field("browserGuidance") as View).visibility==View.GONE)
+                (field("filesChoice") as Button).performClick()
+            }
+            main {
                 check((field("selectionList") as LinearLayout).childCount==2)
                 val root=activity!!.window.decorView
                 check(find(root){it is TextView && it.text.toString()==firstName}!=null){"Selected name missing"}
@@ -93,6 +110,7 @@ object UiControlsRegression {
             check(phrase(firstSession.optString("code"),3)){"Generated code did not use the desktop word list"}
             main {
                 check(!(field("mode") as View).isEnabled)
+                check(!(field("quickActions") as View).isEnabled)
                 check(!(field("message") as View).isEnabled)
                 check(!(field("sendCode") as View).isEnabled)
                 check(!(field("receiveTab") as View).isEnabled)

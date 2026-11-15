@@ -80,6 +80,11 @@ pub async fn download(
         .secret_key(secret_key)
         .relay_mode(options.relay_mode.clone().into());
 
+    // Android-only workaround for iroh #4555. Reassess with iroh/sendme
+    // upgrades after upstream #4645; desktop keeps its normal GSO defaults.
+    #[cfg(target_os = "android")]
+    { builder = builder.transport_config(iroh::endpoint::QuicTransportConfig::builder().enable_segmentation_offload(false).build()); }
+
     if ticket.addr().relay_urls().count() == 0 && ticket.addr().ip_addrs().count() == 0 {
         builder = builder.address_lookup(DnsAddressLookup::n0_dns());
     }

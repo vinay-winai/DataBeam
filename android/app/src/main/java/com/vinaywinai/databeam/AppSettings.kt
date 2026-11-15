@@ -9,6 +9,8 @@ object AppSettings {
     private fun prefs(c:Context)=c.getSharedPreferences("settings",Context.MODE_PRIVATE)
     fun relay(c:Context)=prefs(c).getString("relay","")!!
     fun setRelay(c:Context,value:String){prefs(c).edit().putString("relay",value.trim()).apply()}
+    fun broadcast(c:Context)=prefs(c).getBoolean("sendmeBroadcast",false)
+    fun setBroadcast(c:Context,value:Boolean){prefs(c).edit().putBoolean("sendmeBroadcast",value).apply()}
     fun folder(c:Context)=prefs(c).getString("saveFolder","")!!
     fun folderLabel(c:Context)=prefs(c).getString("saveFolderLabel","Downloads / DataBeam")!!
     fun setFolder(c:Context,uri:Uri?,label:String="Downloads / DataBeam"){

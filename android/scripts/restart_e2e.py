@@ -20,6 +20,7 @@ def main():
     parser.add_argument('--case',action='append',help='MODE:SCENARIO, e.g. Sendme:stop')
     parser.add_argument('--kind',choices=('flat','folder','provider'),help='Override fixture: references, folder paths, or private/stream/bounded provider fallbacks')
     parser.add_argument('--mib',type=int,help='Override generated payload size for a bounded network repeat')
+    parser.add_argument('--broadcast',action='store_true',help='Sendme only: verify two real receivers and retain sharing until Stop')
     parser.add_argument('--work',type=Path)
     parser.add_argument('--relay',default='1.getcroc.com:9009',help='Croc rendezvous endpoint shared by phone and desktop')
     args=parser.parse_args()
@@ -40,10 +41,17 @@ def main():
     assert state().get('status') not in ('running','stopping'),'A user transfer is active'
     snapshots={}
     for name in ('settings.xml','transfer.xml'):
-        # Reuse an earlier pre-install backup when this directory was prepared already.
         backup=work/name
-        if not backup.exists():backup.write_bytes(adb('exec-out','run-as',APP,'cat','shared_prefs/'+name,check=False))
-        snapshots[name]=backup.read_bytes() if backup.read_bytes().lstrip().startswith(b'<?xml') else b''
+        # A disconnected device is not an absent preference file. Never reuse
+        # an empty snapshot produced by an earlier interrupted invocation.
+        read=subprocess.run([ADB,'-s',args.serial,'exec-out','run-as',APP,'cat','shared_prefs/'+name],capture_output=True,timeout=30)
+        if read.returncode:
+            error=(read.stdout+read.stderr).decode(errors='replace')
+            if 'No such file or directory' not in error:raise RuntimeError(error)
+            data=b''
+        else:
+            data=read.stdout;ET.fromstring(data)
+        backup.write_bytes(data);snapshots[name]=data
     def restore():
         adb('shell','am','force-stop',APP,check=False)
         for name,data in snapshots.items():
@@ -79,7 +87,7 @@ def main():
         adb('shell','run-as',APP,'tee',path+'.tmp',data=json.dumps(dict(op=op,sequence=sequence,**extra)).encode())
         adb('shell','run-as',APP,'mv',path+'.tmp',path+'.json')
     def instrument(case,mode,scenario,kind,stage='start',mib=8):
-        config=dict(run=case,mode=mode,scenario=scenario,kind=kind,stage=stage,mib=mib,relay=args.relay)
+        config=dict(run=case,mode=mode,scenario=scenario,kind=kind,stage=stage,mib=mib,relay=args.relay,broadcast=args.broadcast)
         payload=base64.b64encode(json.dumps(config).encode()).decode()
         return spawn([ADB,'-s',args.serial,'shell','am','instrument','-w','-e','restart_e2e',payload,RUNNER],case+'-phone-'+stage)
     def croc_env(code):
@@ -158,6 +166,7 @@ def main():
         cases=[tuple(c.split(':',1)) for c in args.case] if args.case else defaults
         for mode,scenario in cases:
             assert mode in ('Croc','Sendme','EasySendMe') and scenario in ('stop','closed','text','mid')
+            assert not args.broadcast or mode=='Sendme','Broadcast is supported for Sendme tickets'
             case=str(uuid.uuid4());case_ids.append(case);started=time.monotonic();case_procs=len(procs)
             kind='text' if scenario=='text' else args.kind or ('folder' if scenario=='closed' else 'flat')
             print('START',mode,scenario,flush=True)
@@ -206,6 +215,19 @@ def main():
                 pc=receiver(case,mode,restarted,'restarted',destination,cache)
                 pc.wait(timeout=190);assert pc.returncode==0,'Restarted receiver failed; inspect its log'
                 total=verify(case,mode,next_record,destination,'restarted')
+                if args.broadcast:
+                    assert state().get('status')=='running' and state().get('broadcast'),'Broadcast closed after its first receiver'
+                    until=time.monotonic()+25
+                    while time.monotonic()<until:
+                        s=state()
+                        if s.get('timing',{}).get('complete') and not s.get('senderRoutes'):break
+                        time.sleep(.1)
+                    else:raise AssertionError('First broadcast receiver never reached acknowledged idle completion')
+                    second_destination=work/(case+'-second-received')
+                    second=receiver(case,mode,restarted,'second',second_destination,work/(case+'-second-cache'))
+                    second.wait(timeout=190);assert second.returncode==0,'Second broadcast receiver failed'
+                    assert verify(case,mode,next_record,second_destination,'second')==total
+                    assert state().get('status')=='running','Broadcast closed after its second receiver'
                 samples=progress(case,'restarted',mode)
                 if scenario=='mid':
                     assert samples and samples[0]>=64*1024,f'Receiver restarted at zero rather than cached bytes: {samples[:3]}'

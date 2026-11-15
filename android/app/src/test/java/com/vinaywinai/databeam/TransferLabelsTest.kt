@@ -5,16 +5,25 @@ import org.junit.Test
 
 class TransferLabelsTest {
     @Test fun acknowledgedSenderStaysSentWhileTheShareRemainsAvailable(){
-        val s=state("send","running","Waiting for receiver").put("timing",JSONObject().put("complete",true))
+        val s=state("send","running","Waiting for receiver").put("mode","Sendme").put("broadcast",true).put("timing",JSONObject().put("complete",true))
         assertEquals("Sent",TransferLabels.title(s))
         assertTrue(TransferLabels.message(s).contains("Files sent successfully"))
-        assertTrue(TransferLabels.message(s).contains("this receiver can reconnect"))
-        s.put("mode","Sendme")
-        assertTrue(TransferLabels.message(s).contains("another receiver"))
+        assertTrue(TransferLabels.message(s).contains("Broadcast stays open"))
         s.put("senderRoutes",JSONObject().put("next","direct"))
         assertFalse(TransferLabels.sentAndSharing(s))
         s.put("senderRoutes",JSONObject()).put("timing",JSONObject().put("complete",false)).put("done",100).put("total",100)
         assertEquals("Waiting for a receiver",TransferLabels.title(s)) // Byte totals alone are not an acknowledgement.
+    }
+    @Test fun onlyExplicitSendmeBroadcastKeepsTheSenderOpenAfterAcknowledgement(){
+        val s=state("send","running","Waiting for receiver").put("done",100).put("total",100)
+        assertFalse(TransferLabels.autoEnd(s))
+        s.put("timing",JSONObject().put("complete",true))
+        assertTrue(TransferLabels.autoEnd(s)) // EasySendMe defaults to one recipient.
+        s.put("mode","Sendme");assertTrue(TransferLabels.autoEnd(s))
+        s.put("broadcast",true);assertFalse(TransferLabels.autoEnd(s));assertTrue(TransferLabels.broadcast(s))
+        s.put("mode","EasySendMe");assertTrue(TransferLabels.autoEnd(s)) // Ignore an inapplicable saved flag.
+        s.put("mode","Croc");assertFalse(TransferLabels.autoEnd(s))
+        s.put("mode","Sendme").put("action","receive");assertFalse(TransferLabels.autoEnd(s))
     }
     private fun state(action:String,status:String,phase:String="")=JSONObject().put("action",action).put("status",status).put("phase",phase).put("mode","EasySendMe")
     @Test fun closedWaitingSenderOffersRestartAndNeverResume(){
