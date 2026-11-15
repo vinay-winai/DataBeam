@@ -45,7 +45,6 @@ class TransferService : Service() {
     @Volatile private var crocPid:Int?=null
     private val stopping = AtomicBoolean(false)
     private val sentSuccessfully=AtomicBoolean(false)
-    private val cacheChoice=java.util.concurrent.atomic.AtomicReference<String?>()
     @Volatile private var backgroundTimedOut=false
     private var wake: PowerManager.WakeLock? = null
     private var multicast: android.net.wifi.WifiManager.MulticastLock? = null
@@ -102,10 +101,6 @@ class TransferService : Service() {
     }
     override fun onBind(i: Intent?) = null
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if(intent?.action in listOf("continue-cache","delete-cache")) {
-            if(state.optBoolean("awaitingCacheChoice") && intent?.getStringExtra("id")==state.optString("id"))cacheChoice.compareAndSet(null,intent.action)
-            return START_NOT_STICKY
-        }
         if(intent?.action=="resume" && state.optString("status")=="paused" && process!=null && crocPid!=null) {
             android.system.Os.kill(crocPid!!,android.system.OsConstants.SIGCONT)
             synchronized(this){timing.resume(SystemClock.elapsedRealtime());timing.save(state);state.put("connectionRetained",false)};update("running","Continuing transfer…");return START_NOT_STICKY
@@ -156,7 +151,7 @@ class TransferService : Service() {
         if(state.optString("mode")=="Croc"){for(key in listOf("overallProgress","done","total","filesDone","filesTotal"))state.remove(key)}
         if(state.optString("action")=="send") state.remove("ticket")
         state.put("connectionRetained",false);state.remove("phase");state.remove("relayNotice");state.remove("suggestSendme");state.remove("troubleshooting");state.remove("codeRevision")
-        state.remove("cacheInfo");state.remove("awaitingCacheChoice");cacheChoice.set(null)
+        state.remove("cacheInfo");state.remove("awaitingCacheChoice");state.remove("cachedReceiveBytes")
         wake=(getSystemService(POWER_SERVICE) as PowerManager).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,"DataBeam:transfer").apply { acquire(6*60*60*1000L) }
         update("running","Preparing…")
         main.post(poll)
@@ -198,17 +193,15 @@ class TransferService : Service() {
                         }
                         nativeError?.let { throw it }
                     } else {
-                        // Prefer a saved ticket for an intact live sender. On failure the user
-                        // can refresh it via the short code without discarding cached chunks.
+                        // A Croc ticket handoff is one-shot. Resume the saved native
+                        // ticket unless the user explicitly requests a new handoff.
                         var ticket=config.optString("ticket")
-                        if(ticket.isEmpty() || config.optBoolean("refresh")) {
-                            val previous=ticket
+                        if(EasyReceive.needsLookup(config)) {
+                            synchronized(this){state.put("phase","Getting sender ticket")};persist()
                             ticket=croc(config,"receive",null).split(Regex("\\s+")).firstOrNull { NativeBridge.hash(it).isNotEmpty() } ?: error("Sender did not supply a valid Sendme ticket")
-                            require(previous.isEmpty() || NativeBridge.hash(previous)==NativeBridge.hash(ticket)){"This code now refers to different files. Clear the transfer card and start a new receive."}
-                            require(ticket.startsWith("blob")) {"Sender did not supply a Sendme ticket"}
                         }
-                        config.put("ticket",ticket)
-                        synchronized(this){state.put("ticket",ticket)}
+                        EasyReceive.accept(config,ticket,NativeBridge::hash)
+                        synchronized(this){state.put("ticket",ticket).put("ticketCode",config.getString("ticketCode"));state.remove("refresh")};persist()
                         runNative(config)
                     }
                 } else runNative(config)
@@ -299,15 +292,10 @@ class TransferService : Service() {
             synchronized(this){state.put("phase","Checking saved data").put("message","")};persist()
             val root=File(filesDir,"blobs")
             ReceiveCache.inspect(root,c.getString("ticket"))?.let{info->
-                synchronized(this){state.put("cacheInfo",info).put("awaitingCacheChoice",true).put("phase","Saved receive data found").put("message","Open DataBeam to continue with saved data or delete it.").put("done",info.optLong("bytes")).put("speed",0)};persist()
-                while(cacheChoice.get()==null && !stopping.get())Thread.sleep(100)
-                check(!stopping.get()){"Paused"}
-                if(cacheChoice.get()=="delete-cache") {
-                    ReceiveCache.delete(root,c.getString("ticket"))
-                    synchronized(this){state.put("done",0).put("percent",0);state.remove("progress")}
-                } else cache=File(info.getString("base"))
-                synchronized(this){state.remove("awaitingCacheChoice");state.remove("cacheInfo");state.put("message","").put("phase","Connecting")};persist()
+                cache=File(info.getString("base"))
+                synchronized(this){state.put("cachedReceiveBytes",info.optLong("bytes")).put("done",info.optLong("bytes")).put("speed",0)};persist()
             }
+            synchronized(this){state.put("message","").put("phase",if(c.optString("mode")=="EasySendMe" && c.optString("status") in listOf("paused","interrupted"))"Reconnecting to sender" else "Connecting")};persist()
         }
         c.put("cache",cache.apply{mkdirs()}.absolutePath)
         c.put("output",File(filesDir,"received/${c.getString("id")}").apply{mkdirs()}.absolutePath)

@@ -7,6 +7,12 @@ import org.json.JSONArray
 /** Defaults for new transfers. A running/paused transfer retains its own destination. */
 object AppSettings {
     private fun prefs(c:Context)=c.getSharedPreferences("settings",Context.MODE_PRIVATE)
+    fun disabledEngine(c:Context)=prefs(c).getString("disabledEngine","").orEmpty().takeIf{it in listOf("Sendme","Croc")} ?: ""
+    fun modes(c:Context)=EngineOptions.modes(disabledEngine(c))
+    fun engineEnabled(c:Context,engine:String)=engine in modes(c)
+    @Synchronized fun setEngineEnabled(c:Context,engine:String,enabled:Boolean){
+        prefs(c).edit().putString("disabledEngine",EngineOptions.change(disabledEngine(c),engine,enabled)).commit()
+    }
     fun relay(c:Context)=prefs(c).getString("relay","")!!
     fun setRelay(c:Context,value:String){prefs(c).edit().putString("relay",value.trim()).apply()}
     fun broadcast(c:Context)=prefs(c).getBoolean("sendmeBroadcast",false)

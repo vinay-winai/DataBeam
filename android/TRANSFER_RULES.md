@@ -39,13 +39,15 @@ Broadcast is off by default and is available only for Sendme ticket sharing, as 
 
 | Branch | Rule | Coverage |
 | --- | --- | --- |
-| Matching partial/full native cache | Offer Continue / Delete and start over / Cancel; Continue reuses verified bytes | receive-cache E2E |
+| Matching partial/full native cache | Automatically reuse matching verified data on Receive and Resume; no confirmation prompt | receive-cache E2E, EasySendMe UI resume E2E |
 | Receiver paused or interrupted | Preserve current data; manual Resume requires a sharing sender | receive-cache E2E, Croc reconnect E2E |
 | Source/reference restart | No file Restart button. Freshly reselected originals issue a new native ticket with the same hash for unchanged content; expired grants are never silently reused | source/restart E2E |
 | Saving completed files | Protect existing destination files, verify publication, then remove private working duplicates | storage/cleanup regressions, receive-cache E2E |
 | Idle storage cleanup | Preserve current resume/restart data; ask before deleting unknown orphan data; expire eligible known inactive data after seven days when checked | `CleanupRegression`, `TransferCleanupTest` |
 
 No general transfer auto-retry or remote restart of a stopped sender. Croc public-relay recovery remains enabled. Android temporarily disables UDP GSO in Sendme send/receive endpoints at the user's request; desktop defaults are unchanged. Reassess this workaround when upgrading Iroh/Sendme, following `../investigations/sendme-android-direct-relay.md`.
+
+Native card Resume belongs to its saved transfer and ignores unrelated text in the main receive input. It shows a sender-session choice, not a cache confirmation. Pausing the desktop non-broadcast sender can end its one-shot session. The primary New code (EasySendMe) / New ticket (Sendme) action explains that the sender must share the exact same files again. EasySendMe can resolve a replacement ticket even when the short code stayed unchanged. The replacement must have the original content hash. Sender still sharing is the alternative for a live original session, such as Broadcast; it reuses the resolved ticket without repeating the one-shot Croc handoff. Successful lookup consumes the refresh flag and binds the saved ticket to its code. Main Receive uses its entered code/ticket; matching native cached data is automatically discovered even for a new transfer card. Complete local data can be exported without a live sender when a resolved matching ticket is available.
 
 
 ## Quick actions and guidance
@@ -76,6 +78,12 @@ A valid Sendme ticket in received text exposes an explicit Receive with Sendme a
 ## Guide badge refresh and rendering
 
 Each Activity resume requests a fresh guide check, bypassing the ordinary cooldown while coalescing an existing in-flight request. Requests disable HTTP caches and use a unique query. The read baseline is saved once and survives APK bundle updates; legacy installs use their last checked revision when no seen revision exists. The badge is explicitly above the button, whose elevation animator is disabled. Device regression checks both Z ordering and orange screenshot pixels before testing read acknowledgement.
+
+## Engine visibility and folder navigation
+
+Settings stores at most one disabled engine. Disabling Sendme leaves Croc; disabling Croc leaves Sendme; EasySendMe requires both. Hiding an engine filters the main mode selector, Quick actions, related controls, native-ticket actions and its old transfer card. QR/paste/share entry points cannot silently select a disabled engine. The settings cog retains both toggles and advanced options. At least one engine must remain enabled, and changes are blocked during active/retained transfers. Hidden transfer data is retained, not deleted.
+
+Settings Open and transfer-card Open folder share the same folder intent. It requests an existing file-manager task/activity with NEW_TASK, CLEAR_TOP and SINGLE_TOP, forwards read access only for user-granted tree folders, and applies the same reuse flags to the Downloads fallback. Actual reuse is subject to the chosen file manager's activity handling.
 
 ## Croc local route admission
 

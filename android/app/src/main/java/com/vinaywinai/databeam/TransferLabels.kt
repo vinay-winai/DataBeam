@@ -19,7 +19,7 @@ object TransferLabels {
         if(s.optString("action")=="send")return if(s.optString("phase")=="Waiting for receiver")
             "App closed while waiting for a receiver. ${senderRetry(s)}"
         else "Sharing stopped when the app closed. ${senderRetry(s)}"
-        return "Receiving stopped when the app closed. Partial data is kept. Keep the sender sharing, then tap Resume."
+        return "Receiving stopped when the app closed. ${receiveRetry(s)}"
     }
     fun title(s:JSONObject):String {
         val receiving=s.optString("action")=="receive"
@@ -43,13 +43,13 @@ object TransferLabels {
         val receiving=s.optString("action")=="receive"
         val raw=s.optString("message")
         return when(s.optString("status")) {
-            "paused"->if(receiving)"Partial data is kept. Keep the sender sharing, then tap Resume." else senderRetry(s)
+            "paused"->if(receiving)receiveRetry(s) else senderRetry(s)
             "stopped"->senderRetry(s)
             "interrupted"->when {
                 raw.startsWith("App restarted") || raw.startsWith("App closed") || raw.isBlank()->interruptedMessage(s)
                 raw.contains("Clear the transfer card",ignoreCase=true)->raw
                 receiving && (raw.contains("invalid ticket",ignoreCase=true) || raw.contains("did not supply",ignoreCase=true))->"$raw\nConfirm both devices use ${s.optString("mode")}. Paste the correct code or ticket, then tap Receive."
-                receiving->"$raw\nKeep the sender sharing, then tap Resume. If its code or ticket changed, paste the new one first."
+                receiving->"$raw\n${receiveRetry(s)}"
                 else->"$raw\n${senderRetry(s)}"
             }
             "complete"->if(receiving)if(raw in listOf("Complete",""))"Received successfully." else raw else "Sent successfully."
@@ -59,6 +59,8 @@ object TransferLabels {
                 else "Files sent successfully. Ending sharing automatically."
                 s.optString("phase")=="Waiting for receiver"->"On the receiving device, select ${s.optString("mode")}, choose Receive and enter this ${if(s.optString("mode")=="Sendme")"ticket" else "code"}."
                 s.optString("phase")=="Connecting"->"Keep the sender sharing while the devices connect."
+                s.optString("phase")=="Getting sender ticket"->"Getting the file ticket through Croc. Keep the sender sharing this code."
+                s.optString("phase")=="Reconnecting to sender"->"Continuing with the saved ticket and data. If sharing ended or the sender restarted, tap Pause, then Resume → New code."
                 s.optString("phase") in listOf("Verifying files","Verifying and saving","Saving files")->"Finishing file checks and saving. Wait for the saved location before opening the files."
                 raw in listOf("Preparing…","Complete")->""
                 else->raw
@@ -67,4 +69,8 @@ object TransferLabels {
             else->raw
         }
     }
+    private fun receiveRetry(s:JSONObject)=if(s.optString("mode")=="EasySendMe")
+        "Saved data is kept. Tap Resume. Use the current session if the sender is still sharing, or New code if they shared the same files again."
+        else if(s.optString("mode")=="Sendme")"Saved data is kept. Tap Resume. Use the current session while it is still sharing, or New ticket after the sender shares the same files again."
+        else "Partial data is kept. Keep the sender sharing, then tap Resume. If its code or ticket changed, paste the new one first."
 }

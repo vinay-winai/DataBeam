@@ -16,7 +16,8 @@ import java.util.UUID
 class MainActivity:ComponentActivity() {
     private var qrDialog:AlertDialog?=null
     private var settingsDialog:AlertDialog?=null
-    private var cacheDialog:AlertDialog?=null
+    private var reconnectDialog:AlertDialog?=null
+    private var resumeDialog:AlertDialog?=null
     private var cleanupBusy=false
     private var cleanupScanning=false
     private var cleanupScanned=false
@@ -24,6 +25,8 @@ class MainActivity:ComponentActivity() {
     private var settingsBackground:TextView?=null
     private var batteryButton:Button?=null
     private var notificationsButton:Button?=null
+    private var sendmeEngineToggle:Switch?=null
+    private var crocEngineToggle:Switch?=null
     private lateinit var backgroundNotice:TextView
     private val folderPicker=registerForActivityResult(ActivityResultContracts.OpenDocumentTree()){uri->
         if(uri!=null && !configurationLocked())runCatching {
@@ -36,15 +39,12 @@ class MainActivity:ComponentActivity() {
     }
     private val scanner=registerForActivityResult(ActivityResultContracts.StartActivityForResult()){result->
         if(result.resultCode==RESULT_OK)result.data?.getStringExtra(QrScannerActivity.RESULT_CODE)?.let{raw->runCatching{
-            val parsed=QrSharing.parse(raw)
-            selectTab("receive");code.setText(parsed.value)
-            if(NativeBridge.hash(parsed.value).isNotEmpty()){mode.setSelection(1)}
-            else if(parsed.crocLink){mode.setSelection(2)}
-            else AlertDialog.Builder(this).setTitle("Sender’s transfer mode").setItems(arrayOf("EasySendMe","Croc")){_,which->mode.setSelection(if(which==0)0 else 2)}.setNegativeButton("Cancel",null).show()
+            acceptScannedCode(raw)
         }.onFailure{alert(it.message ?: "Could not read this QR")}}
     }
     private lateinit var mode:Spinner
     private lateinit var code:EditText
+    private lateinit var receiveInputTitle:TextView
     private lateinit var sendCode:EditText
     private lateinit var sendCodeActions:LinearLayout
     private lateinit var sendRecent:Button
@@ -172,8 +172,9 @@ class MainActivity:ComponentActivity() {
         val tabs=row(layout)
         sendTab=button(tabs,"Send"){selectTab("send")};receiveTab=button(tabs,"Receive"){selectTab("receive")}
         val engine=card(layout);enginePanel=engine;label(engine,"Transfer engine",12f)
-        mode=Spinner(this).apply{adapter=ArrayAdapter(this@MainActivity,android.R.layout.simple_spinner_dropdown_item,listOf("EasySendMe","Sendme","Croc"));engine.addView(this)}
-        mode.setSelection(savedInstanceState?.getInt("mode") ?: listOf("EasySendMe","Sendme","Croc").indexOf(current.optString("mode","EasySendMe")).coerceAtLeast(0))
+        val available=AppSettings.modes(this)
+        mode=Spinner(this).apply{adapter=ArrayAdapter(this@MainActivity,android.R.layout.simple_spinner_dropdown_item,available);engine.addView(this)}
+        mode.setSelection(available.indexOf(savedInstanceState?.getString("modeName") ?: current.optString("mode","EasySendMe")).coerceAtLeast(0))
         engineDescription=label(engine,"Short code · resumable transfer",12f).apply{setTextColor(Color.LTGRAY)}
         sendPanel=card(layout)
         label(sendPanel,"1 · Choose what to send",17f)
@@ -209,9 +210,9 @@ class MainActivity:ComponentActivity() {
             sendPanel.addView(this)
         }
         receivePanel=card(layout)
-        label(receivePanel,"1 · Enter the sender’s code",17f)
+        receiveInputTitle=label(receivePanel,"1 · Enter the sender’s code",17f)
         code=input(receivePanel,"Paste a code or Sendme ticket")
-        code.setText(savedInstanceState?.getString("code") ?: if(tab=="receive")current.optString(if(current.optString("mode")=="Sendme")"ticket" else "code") else "")
+        code.setText(if(savedInstanceState?.getString("modeName")==mode.selectedItem)savedInstanceState.getString("code") else if(tab=="receive" && current.optString("mode")==mode.selectedItem)current.optString(if(current.optString("mode")=="Sendme")"ticket" else "code") else "")
         val receiveActions=row(receivePanel)
         button(receiveActions,"Paste"){val clipboard=getSystemService(CLIPBOARD_SERVICE) as ClipboardManager;code.setText(clipboard.primaryClip?.getItemAt(0)?.coerceToText(this));normalizeInput()}
         button(receiveActions,"Scan QR"){scan()}
@@ -232,13 +233,13 @@ class MainActivity:ComponentActivity() {
         button(sharing,"Copy code"){val value=shareValue();(getSystemService(CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("DataBeam",value));Toast.makeText(this,"Copied",Toast.LENGTH_SHORT).show()}
         button(sharing,"Show QR"){showQr()}
         pause=button(transfer,"Pause"){startService(Intent(this,TransferService::class.java).setAction(if(TransferService.state(this).optString("action")=="receive")"pause" else "stop"))}
-        resumeButton=button(transfer,"Resume",true){resume(false)}
+        resumeButton=button(transfer,"Resume",true){showResume()}
         restartSharing=button(transfer,"Restart sharing",true){restartSender()}
         openReceived=button(transfer,"Open folder",true){openReceivedFolder()}
         endPaused=button(transfer,"End transfer"){startService(Intent(this,TransferService::class.java).setAction("stop"))}
         newTransfer=button(transfer,"Clear transfer card"){val saved=TransferService.state(this);require(saved.optString("status") !in listOf("running","stopping") && !saved.optBoolean("connectionRetained")){"End the current transfer first"};getSharedPreferences("transfer",0).edit().remove("state").apply();previous="";renderedSession="";code.setText("");render()}
         clearTransferNote=label(transfer,"Clears this card. Saved files remain.",12f).apply{setTextColor(Color.LTGRAY)}
-        sendmeFallback=button(transfer,"Use Sendme instead"){mode.setSelection(1);code.setText("");alert("Sendme selected. Ask the sender for its ticket, or select files and press Send.")}
+        sendmeFallback=button(transfer,"Use Sendme instead"){selectMode("Sendme");code.setText("");alert("Sendme selected. Ask the sender for its ticket, or select files and press Send.")}
         receivedTextTitle=label(transfer,"Received text",12f)
         receivedText=label(transfer,"").apply{setTextIsSelectable(true)}
         copyReceivedText=button(transfer,"Copy text"){
@@ -248,7 +249,7 @@ class MainActivity:ComponentActivity() {
         receiveTextTicket=button(transfer,"Receive with Sendme",true){
             require(detectedTextTicket.isNotEmpty()){"No valid Sendme ticket in this text"}
             val value=detectedTextTicket
-            mode.setSelection(1);selectTab("receive");code.setText(value);launch("receive")
+            selectMode("Sendme");selectTab("receive");code.setText(value);launch("receive")
         }
         val helpRow=row(screen).apply{gravity=Gravity.CENTER_VERTICAL;setPadding(dp(20),dp(4),dp(20),dp(8))}
         @Suppress("DEPRECATION") val version=packageManager.getPackageInfo(packageName,0).versionName.orEmpty()
@@ -315,6 +316,7 @@ class MainActivity:ComponentActivity() {
         sendTab.isEnabled=!locked;receiveTab.isEnabled=!locked
         primary.isEnabled=!locked;primary.alpha=if(locked).45f else 1f
         settingsConfiguration.forEach{enableTree(it,!locked);it.alpha=if(locked).45f else 1f}
+        listOfNotNull(sendmeEngineToggle,crocEngineToggle).forEach{it.isEnabled=!locked && !TransferService.isBusy()}
     }
     private fun sourceName(uri:Uri):String=restartedNames[uri] ?: runCatching{
         if(uri.scheme=="file")File(uri.path.orEmpty()).name else {
@@ -365,6 +367,26 @@ class MainActivity:ComponentActivity() {
         val panel=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL;setPadding(dp(22),dp(8),dp(22),dp(16))}
         fun label(value:String)=TextView(this).apply{text=value;setTextColor(ink);setPadding(0,dp(10),0,dp(8));panel.addView(this)}
         fun button(value:String,action:()->Unit)=Button(this).apply{text=value;isAllCaps=false;panel.addView(this);setOnClickListener{runCatching(action).onFailure{alert(it.message ?: "Operation failed")}}}
+        label("Transfer engines")
+        label("Keep at least one enabled. EasySendMe needs both engines. Hidden engines can be enabled again here.").textSize=12f
+        var updatingEngines=false
+        fun toggle(engine:String)=Switch(this).apply{
+            text="$engine enabled";isChecked=AppSettings.engineEnabled(this@MainActivity,engine);setTextColor(ink);panel.addView(this)
+            setOnCheckedChangeListener{_,enabled->
+                if(!updatingEngines){
+                    runCatching{
+                        require(!configurationLocked() && !TransferService.isBusy()){"End the current transfer before changing engines"}
+                        AppSettings.setEngineEnabled(this@MainActivity,engine,enabled)
+                        refreshEngines()
+                    }.onFailure{Toast.makeText(this@MainActivity,it.message ?: "Keep at least one engine enabled",Toast.LENGTH_LONG).show()}
+                    updatingEngines=true
+                    sendmeEngineToggle?.isChecked=AppSettings.engineEnabled(this@MainActivity,"Sendme")
+                    crocEngineToggle?.isChecked=AppSettings.engineEnabled(this@MainActivity,"Croc")
+                    updatingEngines=false
+                }
+            }
+        }
+        sendmeEngineToggle=toggle("Sendme");crocEngineToggle=toggle("Croc")
         label("Background transfers")
         settingsBackground=label("").apply{setTextColor(accent)}
         batteryButton=button("Battery settings"){
@@ -434,7 +456,7 @@ class MainActivity:ComponentActivity() {
         }
         settingsDialog=AlertDialog.Builder(this).setTitle("Settings").setView(ScrollView(this).apply{addView(panel)})
             .setPositiveButton("Done"){_,_->if(!configurationLocked())AppSettings.setRelay(this,custom.text.toString())}.create().also{dialog->
-                dialog.setOnDismissListener{if(!configurationLocked())AppSettings.setRelay(this,custom.text.toString());settingsFolder=null;settingsBackground=null;batteryButton=null;notificationsButton=null;settingsDialog=null;settingsConfiguration.clear()};dialog.show();lockConfiguration(configurationLocked())
+                dialog.setOnDismissListener{if(!configurationLocked())AppSettings.setRelay(this,custom.text.toString());settingsFolder=null;settingsBackground=null;batteryButton=null;notificationsButton=null;sendmeEngineToggle=null;crocEngineToggle=null;settingsDialog=null;settingsConfiguration.clear()};dialog.show();lockConfiguration(configurationLocked())
             }
     }
     private fun showStorageCleanup(manual:Boolean){
@@ -471,6 +493,30 @@ class MainActivity:ComponentActivity() {
         }.start()
     }
     private fun selectTab(value:String){tab=value;updatePanels()}
+    private fun selectMode(value:String){
+        val available=AppSettings.modes(this)
+        require(value in available){"Enable ${if(value=="EasySendMe")"both engines" else value} in Settings to use this feature"}
+        mode.setSelection(available.indexOf(value))
+    }
+    private fun refreshEngines(){
+        val previousMode=mode.selectedItem?.toString().orEmpty();val available=AppSettings.modes(this)
+        mode.adapter=ArrayAdapter(this,android.R.layout.simple_spinner_dropdown_item,available)
+        mode.setSelection(available.indexOf(previousMode).coerceAtLeast(0))
+        if(previousMode !in available)code.setText("")
+        quickMenu?.dismiss();updatePanels();previous="";render()
+    }
+    private fun acceptScannedCode(raw:String){
+        val parsed=QrSharing.parse(raw)
+        if(NativeBridge.hash(parsed.value).isNotEmpty())selectMode("Sendme")
+        else if(parsed.crocLink)selectMode("Croc")
+        else {
+            val choices=AppSettings.modes(this).filter{it in listOf("EasySendMe","Croc")}
+            require(choices.isNotEmpty()){"Enable Croc in Settings to receive short codes"}
+            if(choices.size==1)selectMode(choices.first())
+            else AlertDialog.Builder(this).setTitle("Sender’s transfer mode").setItems(choices.toTypedArray()){_,which->selectMode(choices[which])}.setNegativeButton("Cancel",null).show()
+        }
+        selectTab("receive");code.setText(parsed.value)
+    }
     private fun updatePanels(){
         val selected=mode.selectedItem.toString()
         if(selected!="Croc")browserSend=false
@@ -480,7 +526,9 @@ class MainActivity:ComponentActivity() {
         }
         sendTab.background=rounded(if(tab=="send")accent else Color.rgb(28,28,28));sendTab.setTextColor(if(tab=="send")Color.BLACK else ink)
         receiveTab.background=rounded(if(tab=="receive")accent else Color.rgb(28,28,28));receiveTab.setTextColor(if(tab=="receive")Color.BLACK else ink)
-        engineDescription.text=when(mode.selectedItem){"Croc"->"Short code · files, text and browser sharing";"Sendme"->"Ticket · resumable · multiple receivers";else->"Short code · fast, resumable transfer"}
+        engineDescription.text=when(mode.selectedItem){"Croc"->"Short code · files, text and browser sharing";"Sendme"->"Ticket · resumable · optional Broadcast";else->"Short code · fast, resumable transfer"}
+        receiveInputTitle.text=if(selected=="Sendme")"1 · Enter the sender’s ticket" else "1 · Enter the sender’s code"
+        code.hint=if(selected=="Sendme")"Paste a Sendme ticket" else "Paste a $selected code"
         broadcastChoice.visibility=if(mode.selectedItem=="Sendme")View.VISIBLE else View.GONE
         sendPanel.visibility=if(tab=="send")View.VISIBLE else View.GONE
         receivePanel.visibility=if(tab=="receive")View.VISIBLE else View.GONE
@@ -502,7 +550,10 @@ class MainActivity:ComponentActivity() {
         if(configurationLocked())return
         quickMenu?.dismiss()
         quickMenu=PopupMenu(this,quickActions).apply{
-            menu.add(0,1,0,"Send text");menu.add(0,2,1,"Broadcast");menu.add(0,3,2,"Send to browser")
+            val allowed=EngineOptions.quickActions(AppSettings.disabledEngine(this@MainActivity))
+            if(1 in allowed)menu.add(0,1,0,"Send text")
+            if(2 in allowed)menu.add(0,2,1,"Broadcast")
+            if(3 in allowed)menu.add(0,3,2,"Send to browser")
             setOnMenuItemClickListener{item->runCatching{quickAction(item.itemId)}.onFailure{alert(it.message ?: "Cannot change the active transfer")};true}
             setOnDismissListener{quickMenu=null}
             show()
@@ -511,9 +562,9 @@ class MainActivity:ComponentActivity() {
     private fun quickAction(action:Int){
         require(!configurationLocked()){"Finish or stop the active transfer first"}
         when(action){
-            1->{mode.setSelection(2);sendKind="text";browserSend=false}
-            2->{mode.setSelection(1);sendKind="files";browserSend=false;broadcastChoice.isChecked=true}
-            3->{mode.setSelection(2);sendKind="files";browserSend=true}
+            1->{selectMode("Croc");sendKind="text";browserSend=false}
+            2->{selectMode("Sendme");sendKind="files";browserSend=false;broadcastChoice.isChecked=true}
+            3->{selectMode("Croc");sendKind="files";browserSend=true}
             else->error("Unknown quick action")
         }
         selectTab("send")
@@ -529,8 +580,8 @@ class MainActivity:ComponentActivity() {
     }
     private fun normalizeInput(){
         val value=code.text.toString().trim()
-        if(NativeBridge.hash(value).isNotEmpty()){mode.setSelection(1);code.setText(value)}
-        else if(value.contains("://")){val parsed=QrSharing.parse(value);code.setText(parsed.value);if(parsed.crocLink)mode.setSelection(2)}
+        if(NativeBridge.hash(value).isNotEmpty()){selectMode("Sendme");code.setText(value)}
+        else if(value.contains("://")){val parsed=QrSharing.parse(value);if(parsed.crocLink)selectMode("Croc");code.setText(parsed.value)}
     }
     private fun shareValue():String {
         val saved=TransferService.state(this)
@@ -543,7 +594,7 @@ class MainActivity:ComponentActivity() {
         val image=ImageView(this).apply{setImageBitmap(Bitmap.createBitmap(pixels,matrix.width,matrix.height,Bitmap.Config.ARGB_8888));adjustViewBounds=true;setPadding(dp(12),dp(12),dp(12),dp(12));setBackgroundColor(Color.WHITE)}
         qrDialog?.dismiss();qrDialog=AlertDialog.Builder(this).setTitle("${TransferService.state(this).optString("mode")} sharing QR").setView(image).setPositiveButton("Close",null).show()
     }
-    override fun onSaveInstanceState(out:Bundle){out.putString("clearedPayloadSession",clearedPayloadSession);out.putBoolean("browserSend",browserSend);out.putBoolean("broadcast",broadcastChoice.isChecked);out.putString("sendKind",sendKind);out.putString("tab",tab);out.putInt("mode",mode.selectedItemPosition);out.putString("message",message.text.toString());out.putString("code",code.text.toString());out.putStringArrayList("sources",ArrayList(sources.map{it.toString()}));super.onSaveInstanceState(out)}
+    override fun onSaveInstanceState(out:Bundle){out.putString("clearedPayloadSession",clearedPayloadSession);out.putBoolean("browserSend",browserSend);out.putBoolean("broadcast",broadcastChoice.isChecked);out.putString("sendKind",sendKind);out.putString("tab",tab);out.putString("modeName",mode.selectedItem.toString());out.putString("message",message.text.toString());out.putString("code",code.text.toString());out.putStringArrayList("sources",ArrayList(sources.map{it.toString()}));super.onSaveInstanceState(out)}
     private fun launch(action:String) {
         val state=TransferService.state(this)
         require(!configurationLocked()){"Stop or pause the active transfer first"}
@@ -593,42 +644,51 @@ class MainActivity:ComponentActivity() {
         restartedNames.clear()
         if(reusable && cached!!.length()==sources.size)sources.forEachIndexed{index,uri->restartedNames[uri]=File(cached.getString(index)).name}
         sendKind=if(text.isNotBlank())"text" else "files"
-        mode.setSelection(listOf("EasySendMe","Sendme","Croc").indexOf(selected).coerceAtLeast(0))
+        selectMode(selected)
         broadcastChoice.isChecked=next.optBoolean("broadcast")
         message.setText(text);sendCode.setText(next.optString("code"));refreshSelection();selectTab("send")
         start(next)
+    }
+    private fun showResume(){
+        val saved=TransferService.state(this)
+        if(saved.optString("mode")=="Croc"){resume(false);return}
+        val ticketMode=saved.optString("mode")=="Sendme"
+        resumeDialog=AlertDialog.Builder(this).setTitle("Resume ${saved.optString("mode")}")
+            .setMessage("Pausing a normal desktop send ends its sharing session. Ask the sender to share the exact same files again, then choose ${if(ticketMode)"New ticket" else "New code"}. Matching saved data continues automatically.\n\nIf the sender is still sharing the original session, such as Sendme Broadcast, choose Sender still sharing to use its current ticket.")
+            .setPositiveButton(if(ticketMode)"New ticket" else "New code"){_,_->resume(true)}
+            .setNeutralButton("Sender still sharing"){_,_->resume(false)}
+            .setNegativeButton("Cancel",null).create().also{dialog->dialog.setOnDismissListener{resumeDialog=null};dialog.show()}
     }
     private fun resume(replace:Boolean) {
         val c=TransferService.state(this)
         require(c.has("id")){"No interrupted transfer"}
         require(c.optString("status") !in listOf("running","stopping")){"Transfer is still running"}
         if(replace) {
-            val entry=EditText(this).apply{hint=if(c.optString("mode")=="Sendme")"New ticket" else "New short code";setText(code.text)}
-            AlertDialog.Builder(this).setTitle("Reconnect saved transfer").setMessage("Use a new ticket only for the same original files. A different transfer keeps a separate cache.").setView(entry).setNegativeButton("Cancel",null).setPositiveButton("Reconnect"){_,_->
+            val ticketMode=c.optString("mode")=="Sendme"
+            val entry=EditText(this).apply{hint=if(ticketMode)"Paste the sender’s new ticket" else "Sender’s current EasySendMe code";if(!ticketMode)setText(c.optString("code"))}
+            reconnectDialog=AlertDialog.Builder(this).setTitle(if(ticketMode)"New Sendme ticket" else "Current EasySendMe code").setMessage("Ask the sender to share the exact same files again, then enter their ${if(ticketMode)"new ticket" else "current code (it can be unchanged)"}. Matching saved data continues automatically.").setView(entry).setNegativeButton("Cancel",null).setPositiveButton("Receive"){_,_->
                 if(entry.text.isNotBlank()) {
-                    if(c.optString("mode")=="Sendme") {
-                        val next=entry.text.toString().trim()
-                        if(NativeBridge.hash(next).isEmpty() || NativeBridge.hash(next)!=NativeBridge.hash(c.optString("ticket"))) {alert("This ticket is invalid or belongs to different files. Clear the transfer card and start a new receive.");return@setPositiveButton}
+                    val next=entry.text.toString().trim()
+                    if(ticketMode){
+                        if(NativeBridge.hash(next).isEmpty() || NativeBridge.hash(next)!=NativeBridge.hash(c.optString("ticket"))){alert("This ticket is invalid or belongs to different files. Start a new receive for different files.");return@setPositiveButton}
                         c.put("ticket",next)
-                    } else c.put("code",entry.text.toString().trim()).put("refresh",true)
+                    }else c.put("code",next).put("refresh",true)
+                    if(mode.selectedItem==c.optString("mode"))code.setText(next)
                     start(c)
                 }
-            }.show()
+            }.create().also{dialog->dialog.setOnDismissListener{reconnectDialog=null};dialog.show()}
         } else {
             val entered=code.text.toString().trim()
             if(c.optString("action")=="receive" && entered.isNotEmpty()){
-                if(c.optString("mode")=="Sendme" && NativeBridge.hash(entered).isNotEmpty()){
-                    require(NativeBridge.hash(entered)==NativeBridge.hash(c.optString("ticket"))){"This ticket is for different files. Clear the transfer card and start a new receive."};c.put("ticket",entered)
-                } else if(c.optString("mode") in listOf("EasySendMe","Croc") && entered!=c.optString("code")){
-                    require(c.optString("mode")!="Croc"){"Use the original Croc code to resume. For a different code, tap Receive to start a new transfer."}
-                    c.put("code",entered)
-                    if(c.optString("mode")=="EasySendMe")c.put("refresh",true)
+                if(c.optString("mode")=="Croc" && entered!=c.optString("code")){
+                    error("Use the original Croc code to resume. For a different code, tap Receive to start a new transfer.")
                 }
             }
             start(c)
         }
     }
     private fun start(c:JSONObject){
+        require(c.optString("mode") in AppSettings.modes(this)){"Enable this transfer’s engines in Settings to continue"}
         if(c.optString("action")=="send" && c.optString("mode")=="Croc")c.put("browserSend",browserSend)
         val current=TransferService.state(this)
         if(current.optBoolean("connectionRetained") && c.optString("mode")=="Croc" && current.optString("id")==c.optString("id") && current.optString("status")=="paused"){
@@ -648,29 +708,17 @@ class MainActivity:ComponentActivity() {
     }
     private fun render() {
         val s=TransferService.state(this);val value=s.toString();if(value==previous)return;previous=value
-        if(s.optBoolean("awaitingCacheChoice") && s.optString("status")=="running") {
-            if(cacheDialog==null) {
-                val info=s.getJSONObject("cacheInfo")
-                val names=info.optJSONArray("names")?.let{a->(0 until a.length()).map{a.getString(it)}.joinToString("\n")}?.takeIf{it.isNotBlank()} ?: "Transfer ${NativeBridge.hash(s.optString("ticket")).take(12)}"
-                val complete=info.optBoolean("complete")
-                fun choose(action:String){startService(Intent(this,TransferService::class.java).setAction(action).putExtra("id",s.optString("id")))}
-                cacheDialog=AlertDialog.Builder(this).setTitle(if(complete)"Complete transfer data available" else "Partial transfer data available")
-                    .setMessage("$names\n\n${ProgressEvents.size(info.optLong("bytes"))} saved on this phone. "+(if(complete)"Continue to verify and save these files without downloading them again." else "Continue to download only the missing data. Keep the sender sharing.")+"\n\nDeleting saved data starts the download over. Files already saved to Downloads or your chosen folder are kept.")
-                    .setPositiveButton("Continue"){_,_->choose("continue-cache")}
-                    .setNeutralButton("Delete and start over"){_,_->choose("delete-cache")}
-                    .setNegativeButton("Cancel"){_,_->startService(Intent(this,TransferService::class.java).setAction("pause"))}
-                    .setCancelable(false).create().also{dialog->dialog.setOnDismissListener{cacheDialog=null};dialog.show()}
-            }
-        } else {cacheDialog?.dismiss();cacheDialog=null}
         if(s.optString("id")==pendingStartId)pendingStartId=""
-        transferPanel.visibility=if(s.optString("id").isNotEmpty())View.VISIBLE else View.GONE
+        transferPanel.visibility=if(s.optString("id").isNotEmpty() && s.optString("mode") in AppSettings.modes(this))View.VISIBLE else View.GONE
         if(s.optString("id").isNotEmpty() && scrolledTransfer!=s.optString("id")){
             scrolledTransfer=s.optString("id");screenScroll.postDelayed({screenScroll.fullScroll(View.FOCUS_DOWN)},150)
         }
         if(s.optString("id").isNotEmpty() && s.optString("id")!=renderedSession){
             renderedSession=s.optString("id");tab=s.optString("action","send")
-            mode.setSelection(listOf("EasySendMe","Sendme","Croc").indexOf(s.optString("mode")).coerceAtLeast(0))
-            if(tab=="receive")code.setText(s.optString(if(s.optString("mode")=="Sendme")"ticket" else "code"))
+            if(s.optString("mode") in AppSettings.modes(this)){
+                selectMode(s.optString("mode"))
+                if(tab=="receive")code.setText(s.optString(if(s.optString("mode")=="Sendme")"ticket" else "code"))
+            }
             updatePanels()
         }
         val running=s.optString("status")=="running";val stopping=s.optString("status")=="stopping"
@@ -723,14 +771,14 @@ class MainActivity:ComponentActivity() {
         sharing.visibility=if(running && !receiving)View.VISIBLE else View.GONE
         if(s.optBoolean("troubleshooting")){qrDialog?.dismiss()}
         relayNotice.text=s.optString("relayNotice");relayNotice.visibility=if(relayNotice.text.isEmpty())View.GONE else View.VISIBLE
-        sendmeFallback.visibility=if(s.optBoolean("suggestSendme"))View.VISIBLE else View.GONE;sendmeFallback.isEnabled=!configurationLocked()
+        sendmeFallback.visibility=if(s.optBoolean("suggestSendme") && AppSettings.engineEnabled(this,"Sendme"))View.VISIBLE else View.GONE;sendmeFallback.isEnabled=!configurationLocked()
         val replacement=s.optString("codeRevision");if(replacement.isNotEmpty() && replacement!=lastReplacement){qrDialog?.dismiss();sendCode.setText(replacement);lastReplacement=replacement}
         ticket.text=if(running && !receiving && !s.optBoolean("troubleshooting"))if(s.optString("mode")=="Sendme")s.optString("ticket") else s.optString("code") else ""
         openReceived.visibility=if(receiving && s.optString("status")=="complete" && ((s.optJSONObject("published")?.length() ?: 0)>0 || (s.optJSONObject("publishedDirectories")?.length() ?: 0)>0))View.VISIBLE else View.GONE
         receivedText.text=if(receiving)s.optString("text") else "";receivedText.visibility=if(receivedText.text.isEmpty())View.GONE else View.VISIBLE;receivedTextTitle.visibility=receivedText.visibility
         copyReceivedText.visibility=receivedText.visibility
         detectedTextTicket=if(receiving)s.optString("text").splitToSequence(Regex("\\s+")).map{it.trim('"','\'','`')}.firstOrNull{it.startsWith("blob") && NativeBridge.hash(it).isNotEmpty()}.orEmpty() else ""
-        receiveTextTicket.visibility=if(detectedTextTicket.isNotEmpty() && !running && !stopping)View.VISIBLE else View.GONE
+        receiveTextTicket.visibility=if(detectedTextTicket.isNotEmpty() && AppSettings.engineEnabled(this,"Sendme") && !running && !stopping)View.VISIBLE else View.GONE
     }
     private fun relayResultColors(value:CharSequence):CharSequence {
         val colored=android.text.SpannableString(value)
@@ -746,8 +794,10 @@ class MainActivity:ComponentActivity() {
     private fun openDownloadFolder(folder:String){
         val uri=if(folder.isNotEmpty())android.provider.DocumentsContract.buildDocumentUriUsingTree(Uri.parse(folder),android.provider.DocumentsContract.getTreeDocumentId(Uri.parse(folder)))
             else android.provider.DocumentsContract.buildDocumentUri("com.android.externalstorage.documents","primary:Download/DataBeam")
-        try{startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri,android.provider.DocumentsContract.Document.MIME_TYPE_DIR))}
-        catch(_:ActivityNotFoundException){startActivity(Intent(android.app.DownloadManager.ACTION_VIEW_DOWNLOADS))}
+        val reuse=Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+        val grant=if(folder.isNotEmpty())Intent.FLAG_GRANT_READ_URI_PERMISSION else 0
+        try{startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri,android.provider.DocumentsContract.Document.MIME_TYPE_DIR).addFlags(reuse or grant))}
+        catch(_:ActivityNotFoundException){startActivity(Intent(android.app.DownloadManager.ACTION_VIEW_DOWNLOADS).addFlags(reuse))}
     }
     private fun alert(s:String){AlertDialog.Builder(this).setMessage(s).setPositiveButton("OK",null).show()}
     @Deprecated("Legacy result API") override fun onActivityResult(request:Int,result:Int,data:Intent?){
@@ -772,10 +822,11 @@ class MainActivity:ComponentActivity() {
             ?: if(incoming.isEmpty())i.clipData?.getItemAt(0)?.text?.toString().orEmpty() else ""
         if(incoming.isEmpty() && text.isBlank())return
         if(configurationLocked()){Toast.makeText(this,"Finish or pause the transfer before changing files",Toast.LENGTH_LONG).show();return}
+        if(incoming.isEmpty() && !AppSettings.engineEnabled(this,"Croc")){alert("Enable Croc in Settings to send text");return}
         sources.clear();sources.addAll(incoming.distinct())
         restartedNames.clear()
         if(sources.isEmpty()){
-            sendKind="text";mode.setSelection(2);message.setText(text)
+            sendKind="text";selectMode("Croc");message.setText(text)
         } else {
             // Some apps attach a caption too. Sending files must not silently switch to text.
             sendKind="files";message.setText("")
@@ -789,5 +840,5 @@ class MainActivity:ComponentActivity() {
     }
     override fun onResume(){super.onResume();Thread{runCatching{TransferCleanup.clearInactiveSenders(applicationContext)}}.start();updateBackgroundStatus();handler.post(ticker);updateTroubleshootBadge();TroubleshootNews.check(applicationContext,force=true){runOnUiThread{if(!isDestroyed)updateTroubleshootBadge()}};if(!cleanupScanned){cleanupScanned=true;showStorageCleanup(false)}}
     override fun onPause(){handler.removeCallbacks(ticker);super.onPause()}
-    override fun onDestroy(){quickMenu?.dismiss();quickMenu=null;cacheDialog?.dismiss();cacheDialog=null;super.onDestroy()}
+    override fun onDestroy(){quickMenu?.dismiss();quickMenu=null;resumeDialog?.dismiss();resumeDialog=null;reconnectDialog?.dismiss();reconnectDialog=null;super.onDestroy()}
 }

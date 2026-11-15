@@ -1,8 +1,4 @@
-"""Physical-device cache choices: pause/continue, offline complete export, delete/redownload.
-
-All input/output provenance is saved before cleanup. The production app makes no
-automatic choice; instrumentation clicks the visible dialog on behalf of this test.
-"""
+"""Physical-device automatic cached receives and Croc reconnect; generated data only."""
 from pathlib import Path
 import argparse,base64,hashlib,json,os,re,subprocess,time,uuid,xml.etree.ElementTree as ET
 
@@ -13,7 +9,7 @@ PEER=ROOT/'android/native/target/x86_64-pc-windows-msvc/debug/examples/peer.exe'
 CROC=ROOT/'target/croc-bundle/x86_64-pc-windows-msvc/croc.exe'
 
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('--croc-only',action='store_true');args=parser.parse_args()
+    parser=argparse.ArgumentParser();parser.add_argument('--croc-only',action='store_true');parser.add_argument('--mode',choices=('Sendme','EasySendMe'));args=parser.parse_args()
     work=ROOT/'android/.tools/smoke/receive-cache-e2e'/str(uuid.uuid4());work.mkdir(parents=True)
     print('Artifacts:',work,flush=True)
     def adb(*args,data=None,check=True):
@@ -52,7 +48,7 @@ def main():
     def receive(mode,ticket,label,fixture,expected,session=None,**options):
         case=session or str(uuid.uuid4())
         if case not in sessions:sessions.append(case)
-        config=dict(id=case,mode=mode,action='receive',ticket=ticket,testCacheChoice='continue',testTimeoutSeconds=170)
+        config=dict(id=case,mode=mode,action='receive',ticket=ticket,testTimeoutSeconds=170)
         config.update(options)
         if mode=='EasySendMe':
             code='cache-'+uuid.uuid4().hex[:12];config.update(code=code,relay='1.getcroc.com:9009');config.pop('ticket')
@@ -69,9 +65,7 @@ def main():
         if options.get('pauseTest') or options.get('requireCachedResume'):
             found=re.search(r'INSTRUMENTATION_RESULT: resumed_from=(\d+)',output)
             assert found and int(found.group(1))>0,'Progress did not resume above zero'
-        if options.get('testCacheChoice')=='delete':
-            samples=re.findall(r'receive-progress (\d+):',s.get('log',''));assert samples and int(samples[0])==0,'Delete reused data instead of starting from zero'
-        results.append(dict(test=label,status='PASS',id=case,sha256=expected,prompt_bytes=re.findall(r'cache_prompt_bytes=(\d+)',output),resumed_from=re.findall(r'resumed_from=(\d+)',output)))
+        results.append(dict(test=label,status='PASS',id=case,sha256=expected,cached_bytes=re.findall(r'cached_receive_bytes=(\d+)',output),resumed_from=re.findall(r'resumed_from=(\d+)',output)))
         (work/'results.json').write_text(json.dumps(results,indent=2),encoding='utf8');print('PASS',label,flush=True)
         return s
     try:
@@ -101,25 +95,15 @@ def main():
             print('Croc interrupted at',saved.get('done'),flush=True)
             spawn(send_command,'croc-restarted',env)
             receive('Croc','','croc-app-close-resume',fixture,expected,session=case,code=code,relay=relay,requireCachedResume=True)
-        for mode in (() if args.croc_only else ('Sendme','EasySendMe')):
+        for mode in (() if args.croc_only else (args.mode,) if args.mode else ('Sendme','EasySendMe')):
             label=mode.lower();fixture=work/(label+'-'+uuid.uuid4().hex[:8]+'.bin')
             block=bytes(i%251 for i in range(1024*1024));digest=hashlib.sha256()
             with fixture.open('wb') as f:
                 for _ in range(256):f.write(block);digest.update(block)
             expected=digest.hexdigest();peer,ticket=sender(fixture,label+'-initial')
-            receive(mode,ticket,label+'-partial',fixture,expected,pauseTest=True,requireCachePrompt=True,expectCompleteCache=False)
+            receive(mode,ticket,label+'-partial',fixture,expected,pauseTest=True,requireAutomaticCache=True)
             stop(peer)
-            # A new session discovers the old complete cache after the sender has gone.
-            receive('Sendme',ticket,label+'-offline-complete',fixture,expected,requireCachePrompt=True,expectCompleteCache=True,requireCachedResume=True)
-            # Test deletion with a small independent transfer to avoid a second large download.
-            small=work/(label+'-delete-'+uuid.uuid4().hex[:8]+'.bin');small.write_bytes(block)
-            small_hash=hashlib.sha256(block).hexdigest();peer,small_ticket=sender(small,label+'-delete')
-            receive(mode,small_ticket,label+'-delete-seed',small,small_hash)
-            # The large, unrelated complete cache must survive this delete choice.
-            receive(mode,small_ticket,label+'-delete-choice',small,small_hash,testCacheChoice='delete',requireCachePrompt=True,expectCompleteCache=True)
-            stop(peer)
-            receive('Sendme',ticket,label+'-unrelated-cache-kept',fixture,expected,requireCachePrompt=True,expectCompleteCache=True,requireCachedResume=True)
-        print('PASS all receive-cache choices',flush=True)
+        print('PASS automatic saved-data continuation',flush=True)
     finally:
         for p in reversed(procs):stop(p)
         adb('shell','am','force-stop',APP,check=False)

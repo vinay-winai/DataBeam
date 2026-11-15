@@ -14,6 +14,8 @@ class SmokeInstrumentation:Instrumentation(){
   try {
    if(args.getString("polish_test")=="true" || args.getString("polish_text")!=null || args.getString("polish_file")=="true"){MobilePolishRegression.run(this,args);return}
    if(args.getString("guide_badge_test")=="true"){GuideBadgeRegression.run(this);return}
+   if(args.getString("easy_resume_test")=="true"){EasyResumeRegression.run(this,args);return}
+   if(args.getString("settings_flow_test")=="true"){SettingsFlowRegression.run(this,args);return}
    if(args.getString("sender_state_test")=="true"){SenderClosureRegression.run(this);return}
    if(args.getString("source_access_test")=="true"){SourceAccessRegression.run(this);return}
    if(args.getString("cleanup_test")=="true"){CleanupRegression.run(this);return}
@@ -59,23 +61,14 @@ class SmokeInstrumentation:Instrumentation(){
    var lastNotice=""
    var backgroundAt=0L
    var backgroundBytes=0L
-   var cachePrompts=0
+   var cacheReuses=0
    while(System.currentTimeMillis()<end){
     Thread.sleep(300)
     val s=TransferService.state(c)
     if(s.optString("id")!=config.getString("id"))continue
-    if(s.optBoolean("awaitingCacheChoice") && config.optString("testCacheChoice").isNotEmpty()) {
-        val info=s.getJSONObject("cacheInfo")
-        if(config.has("expectCompleteCache"))check(info.optBoolean("complete")==config.getBoolean("expectCompleteCache")){"Wrong cache completeness"}
-        check(info.optLong("bytes")>0){"Saved-data prompt reported no cached bytes"}
-        var clicked=false
-        runOnMainSync {
-            val field=MainActivity::class.java.getDeclaredField("cacheDialog").apply{isAccessible=true}
-            val dialog=field.get(activity) as? android.app.AlertDialog
-            if(dialog!=null && dialog.isShowing){dialog.getButton(if(config.getString("testCacheChoice")=="delete")android.content.DialogInterface.BUTTON_NEUTRAL else android.content.DialogInterface.BUTTON_POSITIVE).performClick();clicked=true}
-        }
-        if(clicked){cachePrompts++;sendStatus(1,Bundle().apply{putString("cache_prompt_bytes",info.getLong("bytes").toString());putString("cache_prompt_complete",info.getBoolean("complete").toString());putString("cache_prompt_choice",config.getString("testCacheChoice"))})}
-        continue
+    check(!s.optBoolean("awaitingCacheChoice")){"Receive unexpectedly asked for cache confirmation"}
+    if(s.optLong("cachedReceiveBytes")>0 && cacheReuses==0){
+        cacheReuses++;sendStatus(1,Bundle().apply{putString("cached_receive_bytes",s.getLong("cachedReceiveBytes").toString())})
     }
     val currentPercent=if(s.has("total"))ProgressEvents.percent(s.optLong("done"),s.optLong("total"),s.optInt("filesDone"),s.optInt("filesTotal")) else s.optInt("percent")
     if(config.optBoolean("backgroundTest") && backgroundAt==0L && (s.optLong("done")>=config.optLong("backgroundThreshold",8*1024*1024L) || s.optInt("percent")>=5)){
@@ -133,7 +126,7 @@ class SmokeInstrumentation:Instrumentation(){
             check(!detail.text.contains("Share again")){"Completed card offered an expired payload"}
         }
      }
-     if(config.optBoolean("requireCachePrompt"))check(cachePrompts>0){"Saved-data prompt was not shown and clicked"}
+     if(config.optBoolean("requireAutomaticCache"))check(cacheReuses>0){"Saved data was not automatically reused"}
      if(config.optBoolean("pauseTest")){check(didPause){"Transfer finished before test pause"};check(resumedFrom>0){"Resume downloaded from zero: $resumedFrom"}}
      if(config.optBoolean("requireCachedResume"))check(resumedFrom>0){"Restart did not reuse cached data: $resumedFrom"}
      val out=Bundle();out.putString("state",s.toString());out.putString("resumed_from",resumedFrom.toString())

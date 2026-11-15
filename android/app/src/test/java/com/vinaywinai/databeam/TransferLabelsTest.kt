@@ -38,7 +38,7 @@ class TransferLabelsTest {
         assertEquals("Sending",TransferLabels.title(state("send","running","Transferring")))
         assertTrue(TransferLabels.message(state("receive","paused")).contains("Resume"))
         assertTrue(TransferLabels.message(state("send","stopped")).contains("reselect the exact same files"))
-        assertTrue(TransferLabels.message(state("receive","interrupted").put("message","Network disconnected")).contains("paste the new one"))
+        assertTrue(TransferLabels.message(state("receive","interrupted").put("message","Network disconnected")).contains("New code"))
     }
     @Test fun completeAndVerificationDoNotClaimTheSameThing(){
         assertEquals("Received",TransferLabels.title(state("receive","complete")))
