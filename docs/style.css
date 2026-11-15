@@ -362,6 +362,11 @@ strong {
     font-weight: 500;
 }
 
+.comparison-table .highlight a {
+    color: inherit;
+    text-underline-offset: 3px;
+}
+
 .comparison-table .dim {
     color: var(--text-muted);
 }
