@@ -62,3 +62,9 @@ No general transfer auto-retry or remote restart of a stopped sender. Croc publi
 - A bare public-relay connection failure enables bounded relay troubleshooting before payload begins; authentication, file and payload errors do not generate replacement codes. No general auto-retry is enabled.
 
 - Large text configurations stay off Binder and are consumed/deleted from a private handoff file. Foreground status is established before loading the configuration. Android 13+ requests notifications once on first launch; denial is respected.
+
+## Automatic private storage lifecycle
+
+- Success ends a sender session and removes its outgoing fallback copies after descriptors are closed. Failure retains those copies only until the next app foreground entry, when inactive outgoing snapshots and sender blobs are deleted without a Keep/Delete prompt. Broadcast remains active until explicitly ended. Original provider files and public downloads are never sender-cleanup targets.
+- Sender blobs are removed when the native session closes. Verified receive export removes its working directory and receive blob store immediately; failed or paused receive caches remain available for Resume.
+- File Clear all is a compact left-aligned control visible only with a non-empty selection. Received text has Copy text. A newly shown transfer card scrolls into view at the bottom after layout. Relay results display decoded URL strings, not JSON-escaped strings.

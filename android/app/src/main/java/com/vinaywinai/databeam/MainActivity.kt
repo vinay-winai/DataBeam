@@ -62,6 +62,10 @@ class MainActivity:ComponentActivity() {
     private lateinit var receivedText:TextView
     private lateinit var receivedTextTitle:TextView
     private lateinit var selection:TextView
+    private lateinit var clearFiles:Button
+    private lateinit var copyReceivedText:Button
+    private lateinit var screenScroll:ScrollView
+    private var scrolledTransfer=""
     private lateinit var selectionList:LinearLayout
     private lateinit var enginePanel:LinearLayout
     private lateinit var fileSelectionPanel:LinearLayout
@@ -123,6 +127,7 @@ class MainActivity:ComponentActivity() {
         renderedSession=current.optString("id")
         tab=savedInstanceState?.getString("tab") ?: current.optString("action","send")
         val scroll=ScrollView(this).apply{setBackgroundColor(Color.BLACK);isFillViewport=true}
+        screenScroll=scroll
         val screen=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL;setBackgroundColor(Color.BLACK)}
         val layout=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL;setPadding(dp(20),dp(12),dp(20),dp(24))}
         scroll.addView(layout);screen.addView(scroll,LinearLayout.LayoutParams(-1,0,1f));setContentView(screen)
@@ -175,7 +180,9 @@ class MainActivity:ComponentActivity() {
         textChoice=button(contentSwitch,"Text"){sendKind="text";browserSend=false;updatePanels()}
         fileSelectionPanel=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL;sendPanel.addView(this)}
         selection=label(fileSelectionPanel,"No files selected")
-        button(fileSelectionPanel,"Clear all"){sources.clear();restartedNames.clear();refreshSelection()}
+        clearFiles=button(fileSelectionPanel,"Clear all"){sources.clear();restartedNames.clear();refreshSelection()}.apply{
+            textSize=12f;layoutParams=LinearLayout.LayoutParams(-2,dp(36)).apply{gravity=Gravity.START;bottomMargin=dp(6)}
+        }
         selectionList=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL;fileSelectionPanel.addView(this)}
         val pick=row(fileSelectionPanel)
         button(pick,"Add files"){startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).setType("*/*").putExtra(Intent.EXTRA_ALLOW_MULTIPLE,true).addCategory(Intent.CATEGORY_OPENABLE),10)}
@@ -232,6 +239,10 @@ class MainActivity:ComponentActivity() {
         sendmeFallback=button(transfer,"Use Sendme instead"){mode.setSelection(1);code.setText("");alert("Sendme selected. Ask the sender for its ticket, or select files and press Send.")}
         receivedTextTitle=label(transfer,"Received text",12f)
         receivedText=label(transfer,"").apply{setTextIsSelectable(true)}
+        copyReceivedText=button(transfer,"Copy text"){
+            (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("Received text",receivedText.text))
+            Toast.makeText(this,"Text copied",Toast.LENGTH_SHORT).show()
+        }
         val helpRow=row(screen).apply{gravity=Gravity.CENTER_VERTICAL;setPadding(dp(20),dp(4),dp(20),dp(8))}
         @Suppress("DEPRECATION") val version=packageManager.getPackageInfo(packageName,0).versionName.orEmpty()
         label(helpRow,"v$version",12f).apply{contentDescription="Version $version";setTextColor(Color.LTGRAY);layoutParams=LinearLayout.LayoutParams(0,dp(48),1f);gravity=Gravity.CENTER_VERTICAL}
@@ -304,6 +315,7 @@ class MainActivity:ComponentActivity() {
         }
     }.getOrElse{uri.lastPathSegment?.substringAfterLast('/') ?: "Selected item"}
     private fun refreshSelection(){
+        clearFiles.visibility=if(sources.isEmpty())View.GONE else View.VISIBLE
         selection.text=if(sources.isEmpty())"No files selected" else "${sources.size} item(s) selected"
         selectionList.removeAllViews()
         sources.forEachIndexed{index,uri->
@@ -399,7 +411,7 @@ class MainActivity:ComponentActivity() {
                     if(isDestroyed)return@runOnUiThread
                     checkSendme.isEnabled=true
                     sendmeResults.text=outcome.fold({result->
-                        if(result.optBoolean("reachable"))"Reachable · ${result.getJSONArray("relays").join(", ")}\nIroh relay connection established. Transfers may use Direct or Relay."
+                        if(result.optBoolean("reachable"))"Reachable · ${result.getJSONArray("relays").let{a->(0 until a.length()).joinToString(", "){a.getString(it)}}}\nIroh relay connection established. Transfers may use Direct or Relay."
                         else "Unreachable · "+result.optString("message","Sendme relay could not be reached.")
                     },{"Check failed: ${it.message}"})
                     sendmeResults.setTextColor(if(outcome.getOrNull()?.optBoolean("reachable")==true)Color.rgb(115,220,130) else Color.rgb(255,205,110))
@@ -533,7 +545,8 @@ class MainActivity:ComponentActivity() {
         }
         val sendingText=mode.selectedItem=="Croc" && sendKind=="text"
         val c=JSONObject().put("id",UUID.randomUUID().toString()).put("mode",mode.selectedItem.toString()).put("action",action).put("code",if(mode.selectedItem=="Sendme") "" else if(action=="send")sendCode.text.toString().trim() else code.text.toString().trim()).put("ticket",if(mode.selectedItem=="Sendme")code.text.toString().trim() else "").put("text",if(sendingText)message.text.toString() else "").put("uris",JSONArray(if(sendingText)emptyList<String>() else sources.map{it.toString()})).put("payloadNames",JSONArray(if(sendingText)listOf("Text") else sources.map{sourceName(it)})).put("relay",AppSettings.relay(this)).put("broadcast",action=="send" && mode.selectedItem=="Sendme" && broadcastChoice.isChecked)
-        if(action=="receive") require(code.text.isNotBlank()){"Enter a code or ticket"}        if(action=="receive")c.remove("payloadNames")
+        if(action=="receive") require(code.text.isNotBlank()){"Enter a code or ticket"}
+        if(action=="receive")c.remove("payloadNames")
         if(action=="send") require(if(sendingText)message.text.isNotBlank() else sources.isNotEmpty()){if(sendingText)"Enter text to send" else "Select files or a folder"}
         if(mode.selectedItem!="Croc") c.put("text","")
         if(action=="send" && mode.selectedItem!="Sendme")AppSettings.setCode(this,mode.selectedItem.toString(),sendCode.text.toString().trim())
@@ -637,6 +650,9 @@ class MainActivity:ComponentActivity() {
         } else {cacheDialog?.dismiss();cacheDialog=null}
         if(s.optString("id")==pendingStartId)pendingStartId=""
         transferPanel.visibility=if(s.optString("id").isNotEmpty())View.VISIBLE else View.GONE
+        if(s.optString("id").isNotEmpty() && scrolledTransfer!=s.optString("id")){
+            scrolledTransfer=s.optString("id");screenScroll.postDelayed({screenScroll.fullScroll(View.FOCUS_DOWN)},150)
+        }
         if(s.optString("id").isNotEmpty() && s.optString("id")!=renderedSession){
             renderedSession=s.optString("id");tab=s.optString("action","send")
             mode.setSelection(listOf("EasySendMe","Sendme","Croc").indexOf(s.optString("mode")).coerceAtLeast(0))
@@ -698,6 +714,7 @@ class MainActivity:ComponentActivity() {
         ticket.text=if(running && !receiving && !s.optBoolean("troubleshooting"))if(s.optString("mode")=="Sendme")s.optString("ticket") else s.optString("code") else ""
         openReceived.visibility=if(receiving && s.optString("status")=="complete" && ((s.optJSONObject("published")?.length() ?: 0)>0 || (s.optJSONObject("publishedDirectories")?.length() ?: 0)>0))View.VISIBLE else View.GONE
         receivedText.text=if(receiving)s.optString("text") else "";receivedText.visibility=if(receivedText.text.isEmpty())View.GONE else View.VISIBLE;receivedTextTitle.visibility=receivedText.visibility
+        copyReceivedText.visibility=receivedText.visibility
     }
     private fun relayResultColors(value:CharSequence):CharSequence {
         val colored=android.text.SpannableString(value)
@@ -753,7 +770,7 @@ class MainActivity:ComponentActivity() {
         renderedSession=TransferService.state(this).optString("id")
         acceptShare(intent)
     }
-    override fun onResume(){super.onResume();updateBackgroundStatus();handler.post(ticker);updateTroubleshootBadge();TroubleshootNews.check(applicationContext){runOnUiThread{if(!isDestroyed)updateTroubleshootBadge()}};if(!cleanupScanned){cleanupScanned=true;showStorageCleanup(false)}}
+    override fun onResume(){super.onResume();Thread{runCatching{TransferCleanup.clearInactiveSenders(applicationContext)}}.start();updateBackgroundStatus();handler.post(ticker);updateTroubleshootBadge();TroubleshootNews.check(applicationContext){runOnUiThread{if(!isDestroyed)updateTroubleshootBadge()}};if(!cleanupScanned){cleanupScanned=true;showStorageCleanup(false)}}
     override fun onPause(){handler.removeCallbacks(ticker);super.onPause()}
     override fun onDestroy(){quickMenu?.dismiss();quickMenu=null;cacheDialog?.dismiss();cacheDialog=null;super.onDestroy()}
 }

@@ -132,6 +132,13 @@ object MobilePolishRegression {
                     .put("published",JSONObject().put("generated-test.bin","content://test/1"))
                 render(s)
                 main{check((field("openReceived") as View).visibility==View.VISIBLE)}
+                s.put("text","generated clipboard text");render(s)
+                main{
+                    check((field("copyReceivedText") as View).visibility==View.VISIBLE)
+                    (field("copyReceivedText") as Button).performClick()
+                    check((c.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).primaryClip!!.getItemAt(0).text.toString()=="generated clipboard text")
+                    check((field("clearFiles") as View).visibility==View.GONE)
+                }
                 val filter=IntentFilter(Intent.ACTION_VIEW).apply{addDataScheme("content");addDataType(android.provider.DocumentsContract.Document.MIME_TYPE_DIR)}
                 val monitor=Instrumentation.ActivityMonitor(filter,Instrumentation.ActivityResult(0,null),true)
                 r.addMonitor(monitor)

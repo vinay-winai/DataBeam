@@ -242,6 +242,10 @@ class TransferService : Service() {
                 runCatching{
                     TransferCleanup.record(this,synchronized(this){JSONObject(state.toString())},terminal)
                     if(state.optString("action")=="send")TransferCleanup.remove(filesDir,"blobs/${state.getString("id")}")
+                    if(state.optString("action")=="send" && (terminal=="complete" || sentSuccessfully.get())){
+                        TransferCleanup.remove(filesDir,"outgoing/${state.getString("id")}")
+                        TransferCleanup.remove(filesDir,"received/${state.getString("id")}")
+                    }
                 }
                 TransferCleanup.lock.unlock()
                 main.post {

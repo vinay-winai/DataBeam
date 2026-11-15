@@ -31,7 +31,9 @@ object CleanupRegression {
             val source=directory("received","saved");val name="cleanup-$nonce.txt";File(source,name).writeText("verified published bytes")
             val published=JSONObject();Storage.publishDownloads(fake,source,published,{false}){_,uri->uris.add(uri)}
             val receipt=JSONObject().put("id","saved").put("action","receive").put("output",source.absolutePath).put("published",published)
+            val savedBlob=directory("blobs","saved");File(savedBlob,"data").writeText("temporary blob")
             check(TransferCleanup.saved(fake,receipt)>0);check(!source.exists());check(c.contentResolver.openInputStream(Uri.parse(published.getString(name)))!!.use{String(it.readBytes())}=="verified published bytes")
+            check(!savedBlob.exists()){"Exported receive blobs survived verification"}
 
             val corrupt=directory("received","corrupt");File(corrupt,name).writeText("incoming bytes")
             val original=Uri.parse(published.getString(name));val corruptReceipt=JSONObject().put("id","corrupt").put("action","receive").put("published",published)
@@ -66,9 +68,13 @@ object CleanupRegression {
             val old=directory("outgoing","old");val oldFile=File(old,"source").apply{writeText("restart source")};record("old","send","stopped")
             val sender=record("new","send","stopped",JSONArray().put(oldFile.absolutePath))
             fake.getSharedPreferences("transfer",0).edit().putString("state",sender.toString()).commit()
-            TransferCleanup.scan(fake,migrate=false);check(oldFile.readText()=="restart source")
+            TransferCleanup.scan(fake,migrate=false);check(!old.exists()){"Inactive sender copies were retained for a removed restart action"}
+            val failedBlob=directory("blobs","new");File(failedBlob,"data").writeText("stopped sender blob")
+            val senderText=directory("received","new");File(senderText,"text").writeText("stopped Croc text")
+            val orphan=directory("outgoing","orphan");File(orphan,"data").writeText("orphan sender copy")
+            TransferCleanup.scan(fake,migrate=false);check(!orphan.exists() && !failedBlob.exists() && !senderText.exists())
             Files.delete(File(root,"received/escape").toPath());sentinel.delete();outside.delete()
-            result.putString("result","PASS verified-copy cleanup, corruption/overwrite protection, legacy migration, seven-day expiry, current paused/restart protection and symlink escape rejection");code=0
+            result.putString("result","PASS export/blob cleanup, corruption/overwrite protection, paused receive protection, automatic inactive sender cleanup and symlink escape rejection");code=0
         }catch(error:Throwable){result.putString("error",error.stackTraceToString())}
         finally{
             uris.forEach{runCatching{c.contentResolver.delete(Uri.parse(it),null,null)}}

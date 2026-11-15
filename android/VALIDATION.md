@@ -267,3 +267,11 @@ Artifacts: `mobile-polish/f8fbb43e-4051-4ce0-90b1-a936e2bd3530` (exact text), `m
 Final DataBeam_android-arm64_beta.apk: 20751353 bytes; SHA-256 `e263df6211582467703493abab16d714d6a6adea00c9aeb825c3211d4fbf659b`.
 
 Final DataBeam_android-arm64_dev-update.apk: 31604938 bytes; SHA-256 `7c31dcd06eb7ca7a73082660094846a7fdce6d1abdaedd0e8a74fa8d889a08a2`.
+
+## Private-copy lifecycle and transfer controls - 2026-11-15
+
+- Sender completion closes descriptors and deletes outgoing fallback copies and Croc private temporary output. Sender blobs are removed after the transaction closes. Inactive/failed sender copies and private text are purged on the next app foreground entry without the old Keep/Delete prompt; active transfers are excluded using the cleanup lock and busy guard. Original provider files and public downloads remain outside cleanup targets.
+- Verified publication immediately removes receiver working files and receive blobs. Paused/failed receiver caches remain resumable. Isolated cleanup regression covers retained partial receives, removed stale sender copies/blobs/text, verified export cleanup, overwrite/corruption protection and symlink boundaries.
+- Relay check results join decoded URL strings, removing JSON slash escapes. Clear all is compact and left-aligned, visible only for a nonempty file selection. Received text has a clipboard button. Newly visible transfer cards scroll to the bottom after layout.
+- Phone card/clipboard and 1 MiB receive/export/Open-folder checks passed; generated destination content matched SHA-256. 39 JVM tests and lint passed (zero errors). Existing settings/completed-card host snapshots were restored after generated tests.
+- The phone folder `DataBeam_databeam/folder-4b773744-source/nested` was traced to `folder-4b773744-phone.log`, an earlier generated folder-transfer fixture. Its empty directory skeleton was left by old test cleanup, not created from the user's current transfer. The wrapper name comes from the native bundle/grouping convention. No desktop transfer behavior or public beta release asset is changed by this phone update.

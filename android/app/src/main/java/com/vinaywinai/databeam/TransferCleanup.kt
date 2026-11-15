@@ -50,6 +50,25 @@ object TransferCleanup {
         synchronized(this){temp.writeText(value.toString());check(temp.renameTo(file)){"Cannot record transfer cleanup state"}}
     }
     private fun records(c:Context):Map<String,JSONObject> = catalog(c).listFiles()?.filter{it.extension=="json"}?.mapNotNull{file->runCatching{JSONObject(file.readText())}.getOrNull()?.let{it.optString("id") to it}}?.toMap() ?: emptyMap()
+    fun clearInactiveSenders(c:Context):Long {
+        if(TransferService.isBusy() || !lock.tryLock())return 0
+        try{
+            if(TransferService.isBusy())return 0
+            var bytes=0L
+            for(directory in File(c.filesDir,"outgoing").listFiles().orEmpty()){
+                if(TransferService.isBusy())return bytes
+                if(validId.matches(directory.name) && runCatching{target(c.filesDir,"outgoing/${directory.name}")}.isSuccess)bytes+=remove(c.filesDir,"outgoing/${directory.name}")
+            }
+            for(entry in records(c).values.filter{it.optString("action")=="send"}){
+                if(TransferService.isBusy())return bytes
+                val id=entry.optString("id");if(validId.matches(id)){
+                    bytes+=remove(c.filesDir,"blobs/$id")
+                    bytes+=remove(c.filesDir,"received/$id") // Croc's sender-side temporary text/output.
+                }
+            }
+            return bytes
+        }finally{lock.unlock()}
+    }
     private fun protected(c:Context,extra:List<String>):Set<String> {
         val current=TransferService.state(c);val result=mutableSetOf<String>();val id=current.optString("id")
         fun keep(path:String){
@@ -100,7 +119,10 @@ object TransferCleanup {
         val id=state.getString("id");val directory=target(c.filesDir,"received/$id")
         require(verify(c,directory,state.optJSONObject("published") ?: JSONObject(),state.optJSONObject("publishedDirectories") ?: JSONObject(),{})){"Saved files could not be verified. Working copies were kept; resume to save them again."}
         record(c,state,"complete") // Durable publication receipts precede deletion.
-        val reclaimed=remove(c.filesDir,"received/$id");state.put("workingCleaned",true);record(c,state,"complete");return reclaimed
+        var reclaimed=remove(c.filesDir,"received/$id")
+        if(state.optString("mode") in listOf("Sendme","EasySendMe") && NativeBridge.hash(state.optString("ticket")).isNotEmpty())ReceiveCache.delete(File(c.filesDir,"blobs"),state.getString("ticket"))
+        reclaimed+=remove(c.filesDir,"blobs/$id")
+        state.put("workingCleaned",true);record(c,state,"complete");return reclaimed
     }
     private fun migratePublished(c:Context,directory:File,check:()->Unit):JSONObject? {
         if(android.os.Build.VERSION.SDK_INT<29)return null
@@ -126,6 +148,12 @@ object TransferCleanup {
         try {
             fun idle(){check(!TransferService.isBusy()){"Finish or pause the transfer before cleaning storage"}}
             idle();var reclaimed=0L;var kept=0L;val found=mutableListOf<Candidate>();val known=records(c);val now=System.currentTimeMillis()
+            // File senders now require fresh selection, so no inactive private
+            // sender snapshot is reusable. Never prompt to keep these copies.
+            reclaimed+=clearInactiveSenders(c)
+            for(entry in known.values.filter{it.optString("action")=="receive" && it.optString("status")=="complete" && it.optBoolean("workingCleaned")}){
+                val id=entry.optString("id");if(validId.matches(id)){idle();reclaimed+=remove(c.filesDir,"blobs/$id")}
+            }
             for(kind in namespaces)for(directory in File(c.filesDir,kind).listFiles().orEmpty()){
                 idle();if(!validId.matches(directory.name))continue
                 val relative="$kind/${directory.name}";val checked=runCatching{target(c.filesDir,relative)}.getOrNull() ?: continue
