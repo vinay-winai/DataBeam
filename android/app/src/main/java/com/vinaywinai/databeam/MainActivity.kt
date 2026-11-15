@@ -381,7 +381,13 @@ class MainActivity:ComponentActivity() {
         }
         updateBackgroundStatus()
         label("Download save location")
-        settingsFolder=label(AppSettings.folderLabel(this)).apply{setTextColor(accent)}
+        val locationRow=LinearLayout(this).apply{orientation=LinearLayout.HORIZONTAL;gravity=Gravity.CENTER_VERTICAL;panel.addView(this)}
+        settingsFolder=TextView(this).apply{text=AppSettings.folderLabel(this@MainActivity);setTextColor(accent);setPadding(0,dp(10),dp(8),dp(8));locationRow.addView(this,LinearLayout.LayoutParams(0,-2,1f))}
+        Button(this).apply{
+            text="Open";isAllCaps=false;contentDescription="Open download folder"
+            locationRow.addView(this,LinearLayout.LayoutParams(-2,dp(48)))
+            setOnClickListener{runCatching{openDownloadFolder(AppSettings.folder(this@MainActivity))}.onFailure{alert(it.message ?: "Could not open this folder")}}
+        }
         settingsConfiguration.add(button("Change folder…"){folderPicker.launch(AppSettings.folder(this).takeIf{it.isNotEmpty()}?.let(Uri::parse))})
         settingsConfiguration.add(button("Use Downloads / DataBeam"){AppSettings.setFolder(this,null);updateSaveLocation()})
         label("Applies to new transfers. Paused transfers keep their original folder.").textSize=12f
@@ -734,8 +740,9 @@ class MainActivity:ComponentActivity() {
         return colored
     }
     private fun openReceivedFolder(){
-        val saved=TransferService.state(this)
-        val folder=saved.optString("saveFolder")
+        openDownloadFolder(TransferService.state(this).optString("saveFolder"))
+    }
+    private fun openDownloadFolder(folder:String){
         val uri=if(folder.isNotEmpty())android.provider.DocumentsContract.buildDocumentUriUsingTree(Uri.parse(folder),android.provider.DocumentsContract.getTreeDocumentId(Uri.parse(folder)))
             else android.provider.DocumentsContract.buildDocumentUri("com.android.externalstorage.documents","primary:Download/DataBeam")
         try{startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri,android.provider.DocumentsContract.Document.MIME_TYPE_DIR))}
