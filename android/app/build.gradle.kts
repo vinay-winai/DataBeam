@@ -23,7 +23,7 @@ android {
         minSdk = 26
         targetSdk = 36
         testInstrumentationRunner = "com.vinaywinai.databeam.SmokeInstrumentation"
-        versionCode = 800
+        versionCode = 801
         versionName = "0.8.0"
         ndk { abiFilters += "arm64-v8a" }
     }

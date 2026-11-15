@@ -2,6 +2,13 @@
 
 First native Android beta for Android 8.0+ ARM64 phones and tablets.
 
+APK refresh — build 801:
+
+- Match desktop Sendme/EasySendMe folder naming; Croc retains original names.
+- Automatically remove successful sender copies, clear failed sender copies on the next app opening, and remove receive blobs after verified export while retaining partial receives.
+- Compact Clear all at the right, received-text Copy and Receive with Sendme actions, automatic transfer-card scrolling, and Open beside the download location in Settings.
+- Display relay check URLs without JSON slash escaping.
+
 - Croc, Sendme and EasySendMe file transfers, Croc text, QR sharing/scanning and Android share-sheet integration.
 - Background transfer notification with progress, phases, rate and elapsed time beginning with payload bytes.
 - Latest selected Direct/Relay path, public relay diagnostics and Croc public-relay recovery.
