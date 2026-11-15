@@ -8,7 +8,7 @@ def sender(cache):
  t=p.stdout.readline().strip().removeprefix('TICKET=');assert t.startswith('blob');return p,t
 try:
  first,ticket=sender(token+'-first')
- cfg=dict(id=token,mode='Sendme',action='receive',pauseTest=True,replaceTicket=True,ticket=ticket)
+ cfg=dict(id=token,mode='Sendme',action='receive',pauseTest=True,replaceTicket=True,ticket=ticket,testCacheChoice='continue',requireCachePrompt=True)
  cmd=[A,'shell','am','instrument','-w','-e','config',base64.b64encode(json.dumps(cfg).encode()).decode(),'com.vinaywinai.databeam.test/com.vinaywinai.databeam.SmokeInstrumentation']
  phone=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,encoding='utf-8');procs.append(phone);lines=[]
  for line in phone.stdout:

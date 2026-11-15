@@ -28,6 +28,23 @@ fn event(kind: &str, payload: &str) {
     q.push(json!({"kind":kind,"payload":payload}));
 }
 struct Emitter;
+#[no_mangle]
+pub extern "system" fn Java_com_vinaywinai_databeam_NativeBridge_inspectCache(
+    mut env: JNIEnv, _: JClass, ticket: JString, base: JString,
+) -> jstring {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> anyhow::Result<Value> {
+        let ticket: String = env.get_string(&ticket)?.into();
+        let base: String = env.get_string(&base)?.into();
+        let cache = tokio::runtime::Runtime::new()?.block_on(sendme::core::cache::inspect(&ticket, std::path::Path::new(&base)))?;
+        Ok(serde_json::to_value(cache)?)
+    }));
+    let value = match result {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => json!({"error":format!("{error:#}")}),
+        Err(_) => json!({"error":"Could not inspect saved receive data"}),
+    };
+    env.new_string(value.to_string()).map(|s|s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
 fn check_sendme_relay() -> anyhow::Result<Value> {
     tokio::runtime::Runtime::new()?.block_on(async {
         let endpoint=iroh::Endpoint::builder(iroh::endpoint::presets::N0).bind().await?;

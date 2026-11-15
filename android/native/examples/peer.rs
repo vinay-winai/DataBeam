@@ -3,7 +3,7 @@ struct Events;
 impl sendme::EventEmitter for Events {
     fn emit_event(&self, _: &str) -> Result<(), String> { Ok(()) }
     fn emit_event_with_payload(&self, name: &str, value: &str) -> Result<(), String> {
-        if name.contains("route") || name.contains("paths") { eprintln!("{name} {value}"); }
+        if name.contains("route") || name.contains("paths") || name == "receive-progress" { eprintln!("{name} {value}"); }
         Ok(())
     }
 }

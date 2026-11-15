@@ -65,13 +65,13 @@ for check in checks:
    adb('shell','am','force-stop',P);current.wait(timeout=15)
    xml=state();assert xml['id']==token
    # TransferService.state must turn a dead running session into Interrupted.
-   cfg=xml;cfg.pop('log',None);cfg['requireCachedResume']=True
+   cfg=xml;cfg.pop('log',None);cfg['requireCachedResume']=True;cfg['testCacheChoice']='continue';cfg['requireCachePrompt']=True
    current=phone(cfg,'resume')
    record['manual_resume_after_force_stop']=True
   current.wait(timeout=140)
   saved=state()
   if scenario=='network' and saved.get('status')=='interrupted':
-   cfg=saved;cfg.pop('log',None);cfg['requireCachedResume']=True
+   cfg=saved;cfg.pop('log',None);cfg['requireCachedResume']=True;cfg['testCacheChoice']='continue';cfg['requireCachePrompt']=True
    current=phone(cfg,'resume');current.wait(timeout=140);saved=state()
    record['manual_resume']=True
   assert saved.get('status')=='complete',saved.get('message')

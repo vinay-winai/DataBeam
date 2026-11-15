@@ -1,4 +1,5 @@
 pub mod receive;
+pub mod cache;
 pub mod diagnostics;
 mod directories;
 pub mod network;

@@ -16,6 +16,7 @@ import java.util.UUID
 class MainActivity:ComponentActivity() {
     private var qrDialog:AlertDialog?=null
     private var settingsDialog:AlertDialog?=null
+    private var cacheDialog:AlertDialog?=null
     private var settingsFolder:TextView?=null
     private var settingsBackground:TextView?=null
     private var batteryButton:Button?=null
@@ -457,6 +458,7 @@ class MainActivity:ComponentActivity() {
                 if(c.optString("mode")=="Sendme" && NativeBridge.hash(entered).isNotEmpty()){
                     require(NativeBridge.hash(entered)==NativeBridge.hash(c.optString("ticket"))){"This ticket is for different files. Clear the transfer card and start a new receive."};c.put("ticket",entered)
                 } else if(c.optString("mode") in listOf("EasySendMe","Croc") && entered!=c.optString("code")){
+                    require(c.optString("mode")!="Croc"){"Use the original Croc code to resume. For a different code, tap Receive to start a new transfer."}
                     c.put("code",entered)
                     if(c.optString("mode")=="EasySendMe")c.put("refresh",true)
                 }
@@ -476,6 +478,20 @@ class MainActivity:ComponentActivity() {
     }
     private fun render() {
         val s=TransferService.state(this);val value=s.toString();if(value==previous)return;previous=value
+        if(s.optBoolean("awaitingCacheChoice") && s.optString("status")=="running") {
+            if(cacheDialog==null) {
+                val info=s.getJSONObject("cacheInfo")
+                val names=info.optJSONArray("names")?.let{a->(0 until a.length()).map{a.getString(it)}.joinToString("\n")}?.takeIf{it.isNotBlank()} ?: "Transfer ${NativeBridge.hash(s.optString("ticket")).take(12)}"
+                val complete=info.optBoolean("complete")
+                fun choose(action:String){startService(Intent(this,TransferService::class.java).setAction(action).putExtra("id",s.optString("id")))}
+                cacheDialog=AlertDialog.Builder(this).setTitle(if(complete)"Complete transfer data available" else "Partial transfer data available")
+                    .setMessage("$names\n\n${ProgressEvents.size(info.optLong("bytes"))} saved on this phone. "+(if(complete)"Continue to verify and save these files without downloading them again." else "Continue to download only the missing data. Keep the sender sharing.")+"\n\nDeleting saved data starts the download over. Files already saved to Downloads or your chosen folder are kept.")
+                    .setPositiveButton("Continue"){_,_->choose("continue-cache")}
+                    .setNeutralButton("Delete and start over"){_,_->choose("delete-cache")}
+                    .setNegativeButton("Cancel"){_,_->startService(Intent(this,TransferService::class.java).setAction("pause"))}
+                    .setCancelable(false).create().also{dialog->dialog.setOnDismissListener{cacheDialog=null};dialog.show()}
+            }
+        } else {cacheDialog?.dismiss();cacheDialog=null}
         if(s.optString("id")==pendingStartId)pendingStartId=""
         transferPanel.visibility=if(s.optString("id").isNotEmpty())View.VISIBLE else View.GONE
         if(s.optString("id").isNotEmpty() && s.optString("id")!=renderedSession){
@@ -570,4 +586,5 @@ class MainActivity:ComponentActivity() {
     }
     override fun onResume(){super.onResume();updateBackgroundStatus();handler.post(ticker)}
     override fun onPause(){handler.removeCallbacks(ticker);super.onPause()}
+    override fun onDestroy(){cacheDialog?.dismiss();cacheDialog=null;super.onDestroy()}
 }

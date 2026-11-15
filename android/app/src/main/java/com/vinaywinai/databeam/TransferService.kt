@@ -39,6 +39,7 @@ class TransferService : Service() {
     private var process: java.lang.Process? = null
     @Volatile private var crocPid:Int?=null
     private val stopping = AtomicBoolean(false)
+    private val cacheChoice=java.util.concurrent.atomic.AtomicReference<String?>()
     @Volatile private var backgroundTimedOut=false
     private var wake: PowerManager.WakeLock? = null
     private var multicast: android.net.wifi.WifiManager.MulticastLock? = null
@@ -62,7 +63,7 @@ class TransferService : Service() {
                     if(kind in listOf("receive-progress","transfer-progress","preparation-progress")) {
                         ProgressEvents.native(payload)?.let{sample->synchronized(this@TransferService) {
                             if(kind=="preparation-progress")state.put("preparing",true).put("prepDone",sample.done).put("prepTotal",sample.total).put("prepSpeed",sample.speed).put("phase","Preparing files")
-                            else state.put("preparing",false).put("done",sample.done).put("total",sample.total).put("speed",sample.speed).put("phase","Transferring")
+                            else {if(!state.has("firstPayloadDone"))state.put("firstPayloadDone",sample.done);state.put("preparing",false).put("done",sample.done).put("total",sample.total).put("speed",sample.speed).put("phase","Transferring")}
                             state.put("progress","")
                         }}
                     }
@@ -85,6 +86,10 @@ class TransferService : Service() {
     }
     override fun onBind(i: Intent?) = null
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if(intent?.action in listOf("continue-cache","delete-cache")) {
+            if(state.optBoolean("awaitingCacheChoice") && intent?.getStringExtra("id")==state.optString("id"))cacheChoice.compareAndSet(null,intent.action)
+            return START_NOT_STICKY
+        }
         if(intent?.action=="resume" && state.optString("status")=="paused" && process!=null && crocPid!=null) {
             android.system.Os.kill(crocPid!!,android.system.OsConstants.SIGCONT)
             synchronized(this){state.put("connectionRetained",false)};update("running","Continuing transfer…");return START_NOT_STICKY
@@ -109,9 +114,11 @@ class TransferService : Service() {
         if(!state.has("saveFolder"))state.put("saveFolder",AppSettings.folder(this)).put("saveFolderLabel",AppSettings.folderLabel(this))
         state.remove("route");state.remove("senderRoutes")
         state.put("preparing",false).put("speed",0).put("prepSpeed",0)
+        state.remove("firstPayloadDone")
         if(state.optString("mode")=="Croc"){for(key in listOf("overallProgress","done","total","filesDone","filesTotal"))state.remove(key)}
         if(state.optString("action")=="send") state.remove("ticket")
         state.put("connectionRetained",false);state.remove("phase");state.remove("relayNotice");state.remove("suggestSendme");state.remove("troubleshooting");state.remove("codeRevision")
+        state.remove("cacheInfo");state.remove("awaitingCacheChoice");cacheChoice.set(null)
         val nm=getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(NotificationChannel(CHANNEL,"Transfers",NotificationManager.IMPORTANCE_LOW))
         if(Build.VERSION.SDK_INT>=29) startForeground(1, notification("Preparing transfer"), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC) else startForeground(1, notification("Preparing transfer"))
@@ -217,7 +224,22 @@ class TransferService : Service() {
     }
     private fun runNative(c:JSONObject) {
         check(!stopping.get()){ "Stopped" }
-        c.put("cache",File(filesDir,"blobs/${c.getString("id")}").apply{mkdirs()}.absolutePath)
+        var cache=File(filesDir,"blobs/${c.getString("id")}")
+        if(c.optString("action")=="receive") {
+            synchronized(this){state.put("phase","Checking saved data").put("message","")};persist()
+            val root=File(filesDir,"blobs")
+            ReceiveCache.inspect(root,c.getString("ticket"))?.let{info->
+                synchronized(this){state.put("cacheInfo",info).put("awaitingCacheChoice",true).put("phase","Saved receive data found").put("message","Open DataBeam to continue with saved data or delete it.").put("done",info.optLong("bytes")).put("speed",0)};persist()
+                while(cacheChoice.get()==null && !stopping.get())Thread.sleep(100)
+                check(!stopping.get()){"Paused"}
+                if(cacheChoice.get()=="delete-cache") {
+                    ReceiveCache.delete(root,c.getString("ticket"))
+                    synchronized(this){state.put("done",0).put("percent",0);state.remove("progress")}
+                } else cache=File(info.getString("base"))
+                synchronized(this){state.remove("awaitingCacheChoice");state.remove("cacheInfo");state.put("message","").put("phase","Connecting")};persist()
+            }
+        }
+        c.put("cache",cache.apply{mkdirs()}.absolutePath)
         c.put("output",File(filesDir,"received/${c.getString("id")}").apply{mkdirs()}.absolutePath)
         synchronized(this){state.put("output",c.getString("output"))}
         c.put("root","DataBeam_databeam")
@@ -243,7 +265,17 @@ class TransferService : Service() {
                 args.add("--");val paths=c.getJSONArray("paths")
                 for(i in 0 until paths.length())args.add(paths.getString(i))
             }
-        } else args.addAll(listOf("--out",output.absolutePath))
+        } else {
+            args.addAll(listOf("--out",output.absolutePath))
+            if(c.optString("mode")=="Croc") {
+                require(c.optString("receiveCode",code)==code){"Use the original Croc code to resume. For a different code, start a new receive."}
+                c.put("receiveCode",code);synchronized(this){state.put("receiveCode",code)};persist()
+                // This directory is private working storage for this one session.
+                // --yes does not answer Croc's separate resume question. Public
+                // destination conflicts remain protected by Storage.publishDownloads.
+                args.add("--overwrite")
+            }
+        }
         val command=listOf("/system/bin/sh","-c","echo DATABEAM_CHILD_PID=$$; exec \"$@\"","databeam-croc")+args
         val builder=ProcessBuilder(command).directory(output)
         builder.environment().putAll(mapOf("CROC_SECRET" to code,"HOME" to filesDir.absolutePath,"TMPDIR" to cacheDir.absolutePath,"DATABEAM_CROC_PROGRESS" to "1","CROC_NO_UPDATE_CHECK" to "1"))
@@ -256,7 +288,7 @@ class TransferService : Service() {
                     event.preparation?.let{sample->state.put("preparing",true).put("phase","Preparing files").put("prepDone",sample.done).put("prepTotal",sample.total).put("prepSpeed",sample.speed)}
                     event.speed?.let{if(!state.optBoolean("overallProgress"))state.put("speed",it)}
                     if(event.verifying)state.put("preparing",false).put("phase","Verifying files").put("speed",0)
-                    event.transfer?.let{sample->state.put("overallProgress",true).put("preparing",false).put("phase","Transferring").put("done",sample.done).put("total",sample.total).put("speed",sample.speed).put("filesDone",event.filesDone).put("filesTotal",event.filesTotal).put("progress","")}
+                    event.transfer?.let{sample->if(!state.has("firstPayloadDone"))state.put("firstPayloadDone",sample.done);state.put("overallProgress",true).put("preparing",false).put("phase","Transferring").put("done",sample.done).put("total",sample.total).put("speed",sample.speed).put("filesDone",event.filesDone).put("filesTotal",event.filesTotal).put("progress","")}
                     if(event.prepared){state.put("preparing",false).put("phase","Waiting for receiver").put("speed",0);state.remove("percent");state.put("progress","")}
                 };persist();return
             }

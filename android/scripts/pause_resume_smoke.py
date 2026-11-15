@@ -15,7 +15,7 @@ for mode in sys.argv[1:] or ['Sendme','EasySendMe']:
   log=(W/(token+'-peer.log')).open('w');files.append(log)
   peer=subprocess.Popen([PEER,'send',str(f),str(W/(token+'-cache'))],stdout=subprocess.PIPE,stderr=log,text=True);procs.append(peer)
   ticket=peer.stdout.readline().strip().removeprefix('TICKET=');assert ticket.startswith('blob'),ticket
-  config=dict(id='pause-'+token,mode=mode,action='receive',pauseTest=True,ticket=ticket)
+  config=dict(id='pause-'+token,mode=mode,action='receive',pauseTest=True,ticket=ticket,testCacheChoice='continue',requireCachePrompt=True)
   if mode=='EasySendMe':
    config.pop('ticket');config.update(code='pause-test-'+token,relay='127.0.0.1:39009')
    log=(W/(token+'-croc.log')).open('w');files.append(log)

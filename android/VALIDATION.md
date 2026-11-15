@@ -123,3 +123,41 @@ Final shipping-build device checks passed:
 - APK signature v2 and 16 KiB zip alignment verified.
 
 Overnight Doze, Wi-Fi/cellular switching and additional-device testing remain explicitly excluded at the user’s request.
+
+## Saved receive data choices — 2026-11-15
+
+`android/scripts/receive_cache_e2e.py` passed all ten physical-device checks on SM-M336BU / Android 16. Instrumentation clicked the actual app dialog; no production auto-continue or retry was added.
+
+- Sendme and EasySendMe each received a generated 256 MiB file, paused, displayed a partial-data prompt and continued. The final installed build's first resumed payload reports were 31,965,300 and 18,432,120 bytes respectively. The prompt reports payload bytes without collection metadata, so its count can be slightly lower than the engine's first progress sample.
+- Both completed caches were rediscovered from a new receive session and exported with the PC sender stopped. These offline checks use Sendme tickets; a fresh EasySendMe short code still needs its sender for ticket exchange.
+- Both modes displayed a complete-data prompt for a separate 1 MiB transfer. Delete and start over caused a zero-byte initial download sample and a valid fresh download.
+- An unrelated 256 MiB complete cache was still usable offline after each deletion.
+- All ten automatic Downloads outputs matched their source SHA-256. The 256 MiB fixture hash was `0c5ebcf5cb0e4611da9ecf2adf97f248001e00ed6c0bd75a3a44a33ff26d3612`; the 1 MiB fixture hash was `631b84027d6b9e52b539c4e8373622d23032dfadc64d60af87339c9037e4f769`.
+- The host driver restored the prior settings/transfer preferences and deleted only provenance-recorded test outputs and session directories.
+
+Native cache inspection's regression passed for absent, partial and complete stores without network access or file export. The Android APK/test APK build, 22 JVM tests and lint passed. Receiver caches match the ticket's collection hash; deletion is restricted to that hash beneath private receive stores.
+
+## Sender restart and Croc reconnect — 2026-11-15
+
+`android/scripts/restart_e2e.py` completed ten distinct passing sender scenarios across the initial and corrected regression runs:
+
+| Scenario | Croc | Sendme | EasySendMe |
+| --- | --- | --- | --- |
+| Stop, then actual Restart sharing button; three files, including zero-byte and Unicode names | Passed | Passed | Passed |
+| Force-stop app while waiting, reopen and Restart sharing; nested folder, empty directory and extra file | Passed | Passed | Passed |
+| Interrupt payload, restart sender, reuse desktop receiver cache, verify final SHA-256 | Passed | Passed | Passed |
+| Stop/restart Unicode text; verify exact text without a leaked file | Passed | N/A | N/A |
+
+Flat-file tests removed the original Android document URIs before restarting: the existing staged snapshot was reused. Native restarts issued different tickets with identical collection hashes. EasySendMe checks obtained the new ticket through an actual Croc short-code exchange. App-close tests also verified the old Croc child did not survive force-stop.
+
+First desktop receiver samples after payload interruption/restart were 12,910,592 bytes for Croc's 128 MiB fixture, 278,828 for Sendme and 262,444 for EasySendMe (native fixtures 4 MiB plus two small files). Every final file size, layout and SHA-256 matched, including empty directories in folder cases. These are functional restart checks, not throughput benchmarks.
+
+The first Croc reconnect attempt exposed a separate CLI consent step: `--yes` does not answer the overwrite/resume question, so the noninteractive CLI skipped its partial file and exited successfully. The Android fix accepts resume only inside the session's private receive directory and binds that directory to the original Croc code; public-file publication keeps its existing overwrite protections. The host regression explicitly consents only for its own generated partial destination. No Croc engine upgrade was required.
+
+`python android/scripts/receive_cache_e2e.py --croc-only` then force-stopped the Android receiver during a 64 MiB receive, restarted the PC sender and resumed the same phone session. The first payload sample was 18,087,936 bytes; automatic Downloads SHA-256 matched `5c8a41a9b8d7fc418ba77b0312efc461de86740ef476f4b53adab9313c4d1562`. The final ten native receive-cache tests were repeated after this fix and all passed.
+
+An earlier 8 MiB EasySendMe phone upload exceeded the 190-second test deadline while its Direct/Relay paths switched and the relay was slow. This remains part of the documented upstream Iroh routing/performance limitation; no networking workaround or general app retry was added. The passing smaller restart checks do not establish large-upload throughput.
+
+Installed APK: 31,586,204 bytes, SHA-256 `574ab76c86ca2d469289eabd1701031db4ee0b0d32ba6fd0ca73b7ef9334db2a`. Croc remains 11.5.5. Remote sender restart remains deferred, and the user-excluded overnight/network-switching/additional-device checks remain excluded.
+
+Final device storage and UI-controls regressions passed again, including existing-file protection, idempotent publication, selection controls, configuration locking and ongoing notification progress. APK v2 signature and 16 KiB alignment passed; the installed package hash matched the local APK. The instrumentation package was removed, previous settings/transfer preferences matched their host backup byte-for-byte, no ADB reverse mappings remained, and DataBeam was reopened without a generated active transfer.

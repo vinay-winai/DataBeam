@@ -12,6 +12,7 @@ class SmokeInstrumentation:Instrumentation(){
  override fun onCreate(arguments:Bundle?){super.onCreate(arguments);args=arguments ?: Bundle();start()}
  override fun onStart(){
   try {
+   args.getString("restart_e2e")?.let{RestartE2eRegression.run(this,JSONObject(String(Base64.decode(it,Base64.DEFAULT))));return}
    if(args.getString("ui_controls_test")=="true"){UiControlsRegression.run(this);return}
    if(args.getString("storage_test")=="true"){StorageRegression.run(this);return}
    if(args.getString("share_test")=="true"){ShareEntryRegression.run(this);return}
@@ -51,10 +52,24 @@ class SmokeInstrumentation:Instrumentation(){
    var lastNotice=""
    var backgroundAt=0L
    var backgroundBytes=0L
+   var cachePrompts=0
    while(System.currentTimeMillis()<end){
     Thread.sleep(300)
     val s=TransferService.state(c)
     if(s.optString("id")!=config.getString("id"))continue
+    if(s.optBoolean("awaitingCacheChoice") && config.optString("testCacheChoice").isNotEmpty()) {
+        val info=s.getJSONObject("cacheInfo")
+        if(config.has("expectCompleteCache"))check(info.optBoolean("complete")==config.getBoolean("expectCompleteCache")){"Wrong cache completeness"}
+        check(info.optLong("bytes")>0){"Saved-data prompt reported no cached bytes"}
+        var clicked=false
+        runOnMainSync {
+            val field=MainActivity::class.java.getDeclaredField("cacheDialog").apply{isAccessible=true}
+            val dialog=field.get(activity) as? android.app.AlertDialog
+            if(dialog!=null && dialog.isShowing){dialog.getButton(if(config.getString("testCacheChoice")=="delete")android.content.DialogInterface.BUTTON_NEUTRAL else android.content.DialogInterface.BUTTON_POSITIVE).performClick();clicked=true}
+        }
+        if(clicked){cachePrompts++;sendStatus(1,Bundle().apply{putString("cache_prompt_bytes",info.getLong("bytes").toString());putString("cache_prompt_complete",info.getBoolean("complete").toString());putString("cache_prompt_choice",config.getString("testCacheChoice"))})}
+        continue
+    }
     val currentPercent=if(s.has("total"))ProgressEvents.percent(s.optLong("done"),s.optLong("total"),s.optInt("filesDone"),s.optInt("filesTotal")) else s.optInt("percent")
     if(config.optBoolean("backgroundTest") && backgroundAt==0L && (s.optLong("done")>=config.optLong("backgroundThreshold",8*1024*1024L) || s.optInt("percent")>=5)){
         backgroundAt=System.currentTimeMillis();backgroundBytes=s.optLong("done")
@@ -90,8 +105,7 @@ class SmokeInstrumentation:Instrumentation(){
         continue
     }
     if((didPause || config.optBoolean("requireCachedResume")) && resumedFrom<0){
-        val first=s.optString("log").lineSequence().firstOrNull{it.startsWith("receive-progress ")}
-        if(first!=null)resumedFrom=first.substringAfter("receive-progress ").substringBefore(':').toLong()
+        if(s.has("firstPayloadDone"))resumedFrom=s.getLong("firstPayloadDone")
     }
     val revision=s.optString("codeRevision")
     if(revision.isNotEmpty() && revision!=lastRevision){lastRevision=revision;sendStatus(1,Bundle().apply{putString("replacement_code",revision)})}
@@ -100,6 +114,7 @@ class SmokeInstrumentation:Instrumentation(){
     val ticket=s.optString("ticket")
     if(ticket.isNotEmpty() && ticket!=last){last=ticket;sendStatus(1,Bundle().apply{putString("ticket",ticket)})}
     if(s.optString("status") in listOf("complete","interrupted")) {
+     if(config.optBoolean("requireCachePrompt"))check(cachePrompts>0){"Saved-data prompt was not shown and clicked"}
      if(config.optBoolean("pauseTest")){check(didPause){"Transfer finished before test pause"};check(resumedFrom>0){"Resume downloaded from zero: $resumedFrom"}}
      if(config.optBoolean("requireCachedResume"))check(resumedFrom>0){"Restart did not reuse cached data: $resumedFrom"}
      val out=Bundle();out.putString("state",s.toString());out.putString("resumed_from",resumedFrom.toString())

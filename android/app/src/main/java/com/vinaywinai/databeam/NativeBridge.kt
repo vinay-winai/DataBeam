@@ -5,6 +5,7 @@ object NativeBridge {
     @JvmStatic external fun run(config: String): String
     @JvmStatic external fun poll(): String
     @JvmStatic external fun hash(ticket: String): String
+    @JvmStatic external fun inspectCache(ticket: String, base: String): String
     @JvmStatic external fun prepare()
     @JvmStatic external fun cancel()
     @JvmStatic external fun checkSendmeRelay():String
