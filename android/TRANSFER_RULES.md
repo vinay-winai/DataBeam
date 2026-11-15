@@ -72,3 +72,7 @@ No general transfer auto-retry or remote restart of a stopped sender. Croc publi
 Android Sendme/EasySendMe senders derive the same wrapper as desktop: first 20 Unicode code points of the largest selected item by total file bytes, `_and_more` for multiple selections, then `_databeam`. Equal sizes retain selection order. Folder trees keep their original children. This changes newly created sender tickets; existing ticket/cache contents are not renamed. Croc has no added wrapper.
 
 A valid Sendme ticket in received text exposes an explicit Receive with Sendme action. It switches the receive engine, passes the validated ticket and starts a normal receive; other text does not show the action.
+
+## Guide badge refresh and rendering
+
+Each Activity resume requests a fresh guide check, bypassing the ordinary cooldown while coalescing an existing in-flight request. Requests disable HTTP caches and use a unique query. The read baseline is saved once and survives APK bundle updates; legacy installs use their last checked revision when no seen revision exists. The badge is explicitly above the button, whose elevation animator is disabled. Device regression checks both Z ordering and orange screenshot pixels before testing read acknowledgement.

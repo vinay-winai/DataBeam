@@ -27,10 +27,22 @@ object GuideBadgeRegression {
             runner.runOnMainSync{try {
                 MainActivity::class.java.getDeclaredMethod("updateTroubleshootBadge").apply{isAccessible=true}.invoke(activity)
                 check((field("troubleshootBadge") as View).visibility==View.VISIBLE)
-                (field("troubleshootButton") as Button).performClick()
-                check((field("troubleshootBadge") as View).visibility==View.GONE)
+                check((field("troubleshootBadge") as View).z>(field("troubleshootButton") as View).z){"Badge is behind the native button"}
+                check((field("troubleshootButton") as Button).stateListAnimator==null){"Button animation can cover the badge"}
             }catch(e:Throwable){failure=e}}
             failure?.let{throw it}
+            runner.waitForIdleSync();Thread.sleep(200)
+            val location=IntArray(2);var radius=0
+            runner.runOnMainSync{val badge=field("troubleshootBadge") as View;badge.getLocationOnScreen(location);radius=badge.width/2}
+            val screenshot=runner.uiAutomation.takeScreenshot() ?: error("Badge screenshot unavailable")
+            try{
+                val pixel=screenshot.getPixel(location[0]+radius,location[1]+radius)
+                check(android.graphics.Color.red(pixel)>200 && android.graphics.Color.green(pixel) in 40..130 && android.graphics.Color.blue(pixel)<70){"Badge pixels are obscured despite VISIBLE state"}
+            }finally{screenshot.recycle()}
+            runner.runOnMainSync{
+                (field("troubleshootButton") as Button).performClick()
+                check((field("troubleshootBadge") as View).visibility==View.GONE)
+            }
             check(monitor.hits==1 && !TroubleshootNews.hasUnread(c))
             result.putString("result","PASS unread troubleshooting badge, guide opening and read acknowledgement");code=0
         }catch(e:Throwable){result.putString("error",e.stackTraceToString())}

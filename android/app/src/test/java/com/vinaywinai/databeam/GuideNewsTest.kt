@@ -17,4 +17,14 @@ class GuideNewsTest {
         assertEquals(GuideNews.revision("# News\r\nHello\r\n"),GuideNews.revision("# News\nHello\n"))
         assertNotEquals(GuideNews.revision("Hello"),GuideNews.revision("Hello!"))
     }
+    @Test fun removingGuideSectionsIsUnreadAndAnApkUpgradeDoesNotResetTheBaseline(){
+        val old=GuideNews.revision("# News\nHello\n## Previous releases\nOld notes\n")
+        val edited=GuideNews.revision("# News\nHello\n")
+        val seen=GuideNews.initialSeen(null,old,edited)
+        val news=GuideNews(seen,edited)
+        assertTrue(news.hasUnread())
+        news.markRead();assertFalse(news.hasUnread())
+        assertEquals(old,GuideNews.initialSeen(old,edited,edited))
+        assertEquals(edited,GuideNews.initialSeen(null,null,edited))
+    }
 }

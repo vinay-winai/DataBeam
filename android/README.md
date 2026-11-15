@@ -89,3 +89,5 @@ Android Sendme/EasySendMe sender and receiver endpoints temporarily disable UDP 
 `assembleRelease` produces v0.8.0-beta.1. Release signing uses the ignored `.tools/signing/databeam-release.jks` and `.tools/signing/release.properties` (properties: `storePassword`, `keyAlias`, `keyPassword`). Keep a private backup of both files: future public APK updates must use the same key. Neither signing file belongs in Git or release assets. Without the local signing setup, a release APK is unsigned and must not be published.
 
 The development APK installed during USB testing uses Android's development certificate. The public beta uses the dedicated release certificate. Keep using development APK updates to preserve that installation's settings and partial data; switching it to the public beta requires uninstalling the development app first. Desktop releases remain independent.
+
+Guide badge refresh now runs on every foreground resume, bypassing the ordinary cooldown and HTTP cache; concurrent checks are coalesced. The read revision persists across APK updates. The dot draws above the native button rather than relying on child insertion order.

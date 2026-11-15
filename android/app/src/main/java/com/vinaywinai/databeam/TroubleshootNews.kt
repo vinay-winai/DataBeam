@@ -16,13 +16,17 @@ object TroubleshootNews {
     private fun prefs(c:Context)=c.getSharedPreferences("troubleshoot-news",0)
     @Synchronized private fun load(c:Context):GuideNews {
         val baseline=bundled ?: GuideNews.revision(c.assets.open("troubleshoot.md").bufferedReader().use{it.readText()}).also{bundled=it}
-        return GuideNews(prefs(c).getString("seen",baseline)!!,prefs(c).getString("latest",null))
+        val preferences=prefs(c)
+        val latest=preferences.getString("latest",null)
+        val seen=GuideNews.initialSeen(preferences.getString("seen",null),latest,baseline)
+        if(!preferences.contains("seen"))preferences.edit().putString("seen",seen).commit()
+        return GuideNews(seen,latest)
     }
     fun hasUnread(c:Context)=load(c).hasUnread()
     @Synchronized fun markRead(c:Context){val news=load(c);news.markRead();prefs(c).edit().putString("seen",news.seen).commit()}
     @Synchronized fun observe(c:Context,revision:String){prefs(c).edit().putString("latest",revision).commit()}
-    fun check(c:Context,changed:()->Unit){
-        if(SystemClock.elapsedRealtime()<nextCheck || !checking.compareAndSet(false,true))return
+    fun check(c:Context,force:Boolean=false,changed:()->Unit){
+        if((!force && SystemClock.elapsedRealtime()<nextCheck) || !checking.compareAndSet(false,true))return
         Thread{
             try {
                 val revision=fetch()
@@ -33,8 +37,10 @@ object TroubleshootNews {
     }
     private fun fetch():String {
         val start=SystemClock.elapsedRealtime()
-        val connection=URL(RAW_URL).openConnection() as HttpsURLConnection
+        val connection=URL("$RAW_URL?check=${System.currentTimeMillis()}").openConnection() as HttpsURLConnection
         try {
+            connection.useCaches=false
+            connection.setRequestProperty("Cache-Control","no-cache")
             connection.connectTimeout=5000;connection.readTimeout=10000;connection.instanceFollowRedirects=false
             connection.setRequestProperty("User-Agent","DataBeam-Android")
             check(connection.responseCode==200){"Guide unavailable"}

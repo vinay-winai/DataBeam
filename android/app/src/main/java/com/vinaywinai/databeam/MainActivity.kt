@@ -255,6 +255,7 @@ class MainActivity:ComponentActivity() {
         label(helpRow,"v$version",12f).apply{contentDescription="Version $version";setTextColor(Color.LTGRAY);layoutParams=LinearLayout.LayoutParams(0,dp(48),1f);gravity=Gravity.CENTER_VERTICAL}
         val help=FrameLayout(this).also{helpRow.addView(it,LinearLayout.LayoutParams(dp(48),dp(48)))}
         troubleshootButton=Button(this).apply{
+            stateListAnimator=null;elevation=0f;translationZ=0f
             text="?";textSize=20f;isAllCaps=false;setTextColor(ink);setPadding(0,0,0,0);background=rounded(Color.rgb(28,28,28));contentDescription="Troubleshoot"
             help.addView(this,FrameLayout.LayoutParams(-1,-1))
             setOnClickListener{runCatching{
@@ -263,7 +264,7 @@ class MainActivity:ComponentActivity() {
             }.onFailure{alert("Could not open troubleshooting guidance")}}
         }
         troubleshootBadge=View(this).apply{
-            background=rounded(accent);visibility=View.GONE
+            background=rounded(accent);visibility=View.GONE;elevation=dp(4).toFloat();importantForAccessibility=View.IMPORTANT_FOR_ACCESSIBILITY_NO
             help.addView(this,FrameLayout.LayoutParams(dp(9),dp(9),Gravity.TOP or Gravity.END).apply{topMargin=dp(5);marginEnd=dp(5)})
         }
         updateTroubleshootBadge()
@@ -786,7 +787,7 @@ class MainActivity:ComponentActivity() {
         renderedSession=TransferService.state(this).optString("id")
         acceptShare(intent)
     }
-    override fun onResume(){super.onResume();Thread{runCatching{TransferCleanup.clearInactiveSenders(applicationContext)}}.start();updateBackgroundStatus();handler.post(ticker);updateTroubleshootBadge();TroubleshootNews.check(applicationContext){runOnUiThread{if(!isDestroyed)updateTroubleshootBadge()}};if(!cleanupScanned){cleanupScanned=true;showStorageCleanup(false)}}
+    override fun onResume(){super.onResume();Thread{runCatching{TransferCleanup.clearInactiveSenders(applicationContext)}}.start();updateBackgroundStatus();handler.post(ticker);updateTroubleshootBadge();TroubleshootNews.check(applicationContext,force=true){runOnUiThread{if(!isDestroyed)updateTroubleshootBadge()}};if(!cleanupScanned){cleanupScanned=true;showStorageCleanup(false)}}
     override fun onPause(){handler.removeCallbacks(ticker);super.onPause()}
     override fun onDestroy(){quickMenu?.dismiss();quickMenu=null;cacheDialog?.dismiss();cacheDialog=null;super.onDestroy()}
 }

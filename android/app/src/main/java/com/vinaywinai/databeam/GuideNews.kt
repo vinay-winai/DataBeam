@@ -8,6 +8,7 @@ data class GuideNews(var seen:String,var latest:String?=null){
     fun observe(revision:String){latest=revision}
     fun markRead(){latest?.let{seen=it}}
     companion object {
+        fun initialSeen(saved:String?,lastChecked:String?,bundled:String)=saved ?: lastChecked ?: bundled
         fun revision(contents:String)=MessageDigest.getInstance("SHA-256").digest(contents.replace("\r\n","\n").toByteArray(Charsets.UTF_8)).joinToString(""){"%02x".format(it)}
     }
 }
