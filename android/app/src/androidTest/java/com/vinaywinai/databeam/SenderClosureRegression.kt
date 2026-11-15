@@ -21,7 +21,7 @@ object SenderClosureRegression {
                 fake.getSharedPreferences("transfer",0).edit().putString("state",s.toString()).commit()
                 val restored=TransferService.state(fake)
                 check(restored.optString("status")=="complete"){"Acknowledged $status sender became interrupted"}
-                check(TransferLabels.title(restored)=="Sent" && TransferLabels.message(restored).contains("Share again"))
+                check(TransferLabels.title(restored)=="Sent" && TransferLabels.message(restored)=="Sent successfully.")
             }
             val pending=JSONObject().put("action","send").put("mode","Sendme").put("status","running").put("phase","Transferring")
                 .put("done",100).put("total",100).put("timing",JSONObject().put("complete",false))

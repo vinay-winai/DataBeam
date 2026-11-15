@@ -14,6 +14,15 @@ class TransferRouteTest {
         assertEquals(1,s.getJSONObject("lastSenderRoutes").length())
         assertEquals("relay",s.getJSONObject("lastSenderRoutes").getString("second"))
     }
+    @Test fun relayCanUpgradeToDirectAndTeardownKeepsTheLatestKnownPath(){
+        val s=org.json.JSONObject()
+        TransferRoute.senderEvent(s,"a","relay");TransferRoute.senderEvent(s,"a","direct")
+        TransferRoute.senderEvent(s,"a","unknown");TransferRoute.senderEvent(s,"a","closed")
+        assertEquals("direct",s.getJSONObject("lastSenderRoutes").getString("a"))
+        TransferRoute.receiveEvent(s,"relay");TransferRoute.receiveEvent(s,"direct");TransferRoute.receiveEvent(s,"unknown")
+        assertEquals("direct",s.getString("route"))
+        assertEquals("direct",TransferRoute.selected(org.json.JSONArray("[{selected:false,route:relay},{selected:true,route:direct}]")))
+    }
     @Test fun crocReportsOnlyDirectionEvidence(){
         assertEquals("relay",TransferRoute.croc("Sending (->203.0.113.7)"))
         assertEquals("relay",TransferRoute.croc("Receiving (<-203.0.113.7)"))

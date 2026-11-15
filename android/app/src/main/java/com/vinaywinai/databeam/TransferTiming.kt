@@ -13,28 +13,35 @@ class TransferTiming(saved:JSONObject?=null) {
     private var tick:Long?=null
     private var payloadActive=false
     private var lastDone:Long?=null
+    private var started=saved?.optBoolean("started",saved.optLong("bytes")>0) ?: false
 
     fun resume(now:Long){tick=now}
     fun checkpoint(now:Long){
-        tick?.let{previous->val delta=(now-previous).coerceAtLeast(0);if(!complete)elapsed+=delta;if(payloadActive)payload+=delta;tick=now}
+        tick?.let{previous->val delta=(now-previous).coerceAtLeast(0);if(!complete && payloadActive){elapsed+=delta;payload+=delta};tick=now}
     }
     fun beginPayload(now:Long){
         checkpoint(now)
-        if(complete){elapsed=0;payload=0;bytes=0;lastDone=null;complete=false;completedElapsed=null}
-        payloadActive=true
+        if(complete){elapsed=0;payload=0;bytes=0;lastDone=null;complete=false;completedElapsed=null;started=false}
     }
     fun progress(done:Long,now:Long){
         // Final counters may repeat after completion. A native sender's next
         // transfer has an explicit begin event; duplicates must not erase its average.
         if(complete)return
-        beginPayload(now)
+        checkpoint(now)
         // A first report can include cached data; never count that as traffic.
-        lastDone?.let{previous->bytes+=(done-previous).coerceAtLeast(0)}
+        lastDone?.let{previous->
+            val delta=(done-previous).coerceAtLeast(0)
+            if(delta>0){
+                // Start at observed payload traffic, never at a zero/cached
+                // sample that may precede a long connection wait.
+                bytes+=delta;started=true;payloadActive=true
+            }
+        }
         lastDone=done
     }
     fun finishPayload(now:Long){checkpoint(now);if(!complete)completedElapsed=elapsed;payloadActive=false;complete=true}
-    fun pause(now:Long){checkpoint(now);tick=null}
-    fun save(state:JSONObject){state.put("timing",JSONObject().put("elapsedMs",elapsed).put("payloadMs",payload).put("bytes",bytes).put("complete",complete).apply{completedElapsed?.let{put("completedElapsedMs",it)}})}
+    fun pause(now:Long){checkpoint(now);tick=null;payloadActive=false;lastDone=null}
+    fun save(state:JSONObject){state.put("timing",JSONObject().put("elapsedMs",elapsed).put("payloadMs",payload).put("bytes",bytes).put("started",started).put("complete",complete).apply{completedElapsed?.let{put("completedElapsedMs",it)}})}
 
     companion object {
         fun duration(ms:Long):String {

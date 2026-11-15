@@ -29,9 +29,10 @@ object RelayRecovery {
     }
     fun transportError(error:String):Boolean {
         val text=error.lowercase()
-        return !text.contains("lookup ") && !text.contains("room ") &&
-            (text.contains("could not connect to ") || text.contains("relay connection failed")) &&
-            listOf("i/o timeout","connection refused","connection reset","network is unreachable","no route to host","relay closed").any{text.contains(it)}
+        if(listOf("password","passphrase","pake","room ","lookup ","permission denied","decompress","corrupt input").any{text.contains(it)})return false
+        return text.contains("relay connection failed") ||
+            (text.contains("could not connect to ") &&
+            listOf("i/o timeout","timed out","connection refused","connection reset","network is unreachable","no route to host","relay closed","lookup ").any{text.contains(it)})
     }
     fun failureMessage(output:String,exit:Int):String {
         val ansi=Regex("\u001B\\[[0-?]*[ -/]*[@-~]")

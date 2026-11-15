@@ -12,6 +12,12 @@ class RelayRecoveryTest {
         words=text.lineSequence().filter{it.isNotBlank()}.toSet()
         RelayRecovery.initializeWordList(text)
     }
+    @Test fun bareRelayConnectionFailureTriggersTroubleshooting(){
+        assertTrue(RelayRecovery.transportError("relay connection failed"))
+        assertTrue(RelayRecovery.transportError("relay connection failed: 3.getcroc.com:9009"))
+        assertFalse(RelayRecovery.transportError("relay connection failed: incorrect password"))
+        assertFalse(RelayRecovery.transportError("room not found"))
+    }
     @Test fun generatedCodesUseThreeWordsFromTheDesktopDictionary() {
         assertEquals(1296,words.size)
         repeat(100){

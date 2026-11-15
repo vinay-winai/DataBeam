@@ -52,6 +52,7 @@ class MainActivity:ComponentActivity() {
     private var codeMode=""
     private var retainedSession=""
     private lateinit var message:EditText
+    private lateinit var clearText:Button
     private lateinit var saveLocation:TextView
     private lateinit var status:TextView
     private lateinit var ticket:TextView
@@ -83,6 +84,9 @@ class MainActivity:ComponentActivity() {
     private lateinit var pause:Button
     private lateinit var resumeButton:Button
     private lateinit var restartSharing:Button
+    private lateinit var openReceived:Button
+    private var clearedPayloadSession=""
+    private val notificationPermission=registerForActivityResult(ActivityResultContracts.RequestPermission()){updateBackgroundStatus()}
     private lateinit var sharing:LinearLayout
     private lateinit var bar:ProgressBar
     private lateinit var detail:TextView
@@ -112,6 +116,9 @@ class MainActivity:ComponentActivity() {
         RelayRecovery.initializeWordList(assets.open("eff-short-wordlist-1.txt").bufferedReader().use{it.readText()})
         sendKind=savedInstanceState?.getString("sendKind") ?: "files"
         val current=TransferService.state(this)
+        if(savedInstanceState==null && current.optString("action")=="send" && current.optString("status") in listOf("interrupted","stopped") && current.optString("mode") in listOf("Croc","EasySendMe") && current.optString("code").isNotEmpty())
+            AppSettings.setCode(this,current.optString("mode"),current.optString("code"))
+        clearedPayloadSession=savedInstanceState?.getString("clearedPayloadSession") ?: if(current.optString("status") in listOf("complete","interrupted","stopped"))current.optString("id") else ""
         browserSend=savedInstanceState?.getBoolean("browserSend") ?: (current.optString("action")=="send" && current.optBoolean("browserSend"))
         renderedSession=current.optString("id")
         tab=savedInstanceState?.getString("tab") ?: current.optString("action","send")
@@ -143,15 +150,17 @@ class MainActivity:ComponentActivity() {
             header.addView(this,LinearLayout.LayoutParams(dp(48),dp(48)));setOnClickListener{showSettings()}
         }
         label(layout,"Secure sharing between your devices").setTextColor(Color.LTGRAY)
-        quickActions=button(layout,"Quick actions ▾"){showQuickActions()}
+        backgroundNotice=label(layout,"",12f).apply{
+            setTextColor(Color.rgb(255,205,110));visibility=View.GONE;minHeight=dp(48)
+            setOnClickListener{showSettings()}
+        }
+        quickActions=button(layout,"Quick actions ▾"){showQuickActions()}.apply{
+            (layoutParams as LinearLayout.LayoutParams).bottomMargin=dp(14)
+        }
         browserGuidance=label(layout,"On the receiving device, open https://getcroc.com",14f).apply{
             setTextColor(accent);setLinkTextColor(accent);visibility=View.GONE
             android.text.util.Linkify.addLinks(this,android.text.util.Linkify.WEB_URLS)
             movementMethod=android.text.method.LinkMovementMethod.getInstance()
-        }
-        backgroundNotice=label(layout,"",12f).apply{
-            setTextColor(Color.rgb(255,205,110));visibility=View.GONE;minHeight=dp(48)
-            setOnClickListener{showSettings()}
         }
         val tabs=row(layout)
         sendTab=button(tabs,"Send"){selectTab("send")};receiveTab=button(tabs,"Receive"){selectTab("receive")}
@@ -166,12 +175,14 @@ class MainActivity:ComponentActivity() {
         textChoice=button(contentSwitch,"Text"){sendKind="text";browserSend=false;updatePanels()}
         fileSelectionPanel=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL;sendPanel.addView(this)}
         selection=label(fileSelectionPanel,"No files selected")
+        button(fileSelectionPanel,"Clear all"){sources.clear();restartedNames.clear();refreshSelection()}
         selectionList=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL;fileSelectionPanel.addView(this)}
         val pick=row(fileSelectionPanel)
         button(pick,"Add files"){startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).setType("*/*").putExtra(Intent.EXTRA_ALLOW_MULTIPLE,true).addCategory(Intent.CATEGORY_OPENABLE),10)}
         button(pick,"Add folder"){startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE),11)}
         message=input(sendPanel,"Text to send")
         message.apply{setSingleLine(false);minLines=2;maxLines=5;gravity=Gravity.TOP;layoutParams=LinearLayout.LayoutParams(-1,-2);setText(savedInstanceState?.getString("message") ?: "")}
+        button(sendPanel,"Clear text"){message.setText("")}.also{clearText=it}
         sendCode=input(sendPanel,"Custom sharing code (optional)")
         sendCode.addTextChangedListener(object:android.text.TextWatcher{
             override fun beforeTextChanged(s:CharSequence?,start:Int,count:Int,after:Int){}
@@ -195,6 +206,7 @@ class MainActivity:ComponentActivity() {
         val receiveActions=row(receivePanel)
         button(receiveActions,"Paste"){val clipboard=getSystemService(CLIPBOARD_SERVICE) as ClipboardManager;code.setText(clipboard.primaryClip?.getItemAt(0)?.coerceToText(this));normalizeInput()}
         button(receiveActions,"Scan QR"){scan()}
+        button(receiveActions,"Clear"){code.setText("")}
         receiveRecent=button(receivePanel,"Recent codes"){showRecent("receive",code)}
         saveLocation=label(receivePanel,"",12f).apply{setTextColor(accent)}
         updateSaveLocation()
@@ -213,6 +225,7 @@ class MainActivity:ComponentActivity() {
         pause=button(transfer,"Pause"){startService(Intent(this,TransferService::class.java).setAction(if(TransferService.state(this).optString("action")=="receive")"pause" else "stop"))}
         resumeButton=button(transfer,"Resume",true){resume(false)}
         restartSharing=button(transfer,"Restart sharing",true){restartSender()}
+        openReceived=button(transfer,"Open folder",true){openReceivedFolder()}
         endPaused=button(transfer,"End transfer"){startService(Intent(this,TransferService::class.java).setAction("stop"))}
         newTransfer=button(transfer,"Clear transfer card"){val saved=TransferService.state(this);require(saved.optString("status") !in listOf("running","stopping") && !saved.optBoolean("connectionRetained")){"End the current transfer first"};getSharedPreferences("transfer",0).edit().remove("state").apply();previous="";renderedSession="";code.setText("");render()}
         clearTransferNote=label(transfer,"Clears this card. Saved files remain.",12f).apply{setTextColor(Color.LTGRAY)}
@@ -237,13 +250,16 @@ class MainActivity:ComponentActivity() {
         }
         updateTroubleshootBadge()
         savedInstanceState?.getStringArrayList("sources")?.forEach{sources.add(Uri.parse(it))}
-        if((savedInstanceState==null || (sources.isEmpty() && current.optString("status") in listOf("running","stopping"))) && current.optString("action")=="send" && current.optString("id").isNotEmpty()){
+        if((savedInstanceState==null || (sources.isEmpty() && current.optString("status") in listOf("running","stopping"))) && current.optString("action")=="send" && current.optString("id").isNotEmpty() && current.optString("status") in listOf("running","stopping")){
             val uris=current.optJSONArray("uris");val paths=current.optJSONArray("paths")
             if(uris!=null && uris.length()>0)for(i in 0 until uris.length()){
                 val uri=Uri.parse(uris.getString(i));sources.add(uri)
                 if(paths?.length()==uris.length())restartedNames[uri]=File(paths.getString(i)).name
             } else if(paths!=null)for(i in 0 until paths.length())sources.add(Uri.fromFile(File(paths.getString(i))))
             if(current.optString("mode")=="Croc" && current.optString("text").isNotEmpty()){sendKind="text";message.setText(current.getString("text"))}
+        }
+        if(savedInstanceState==null && current.optString("action")=="send" && current.optString("status") in listOf("interrupted","stopped") && current.optString("text").isNotEmpty()){
+            sendKind="text";message.setText(current.optString("text"))
         }
         mode.onItemSelectedListener=object:AdapterView.OnItemSelectedListener{
             override fun onNothingSelected(p:AdapterView<*>?){}
@@ -258,6 +274,13 @@ class MainActivity:ComponentActivity() {
         refreshSelection()
         selectTab(tab)
         lockConfiguration(configurationLocked())
+        // Mark before launching so rotation or denial cannot produce a prompt loop.
+        val permissions=getSharedPreferences("permissions",0)
+        if(Build.VERSION.SDK_INT>=33 && !permissions.getBoolean("notificationsAsked",false)){
+            permissions.edit().putBoolean("notificationsAsked",true).apply()
+            if(checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)!=android.content.pm.PackageManager.PERMISSION_GRANTED)
+                notificationPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
     }
     private fun updatePrimaryLabel(){
         if(::primary.isInitialized)primary.text=if(tab=="receive")"Receive" else if(mode.selectedItem=="Croc" && sendKind=="text")"Send text" else "Send files"
@@ -362,6 +385,7 @@ class MainActivity:ComponentActivity() {
                         RelayRecovery.relays.joinToString("\n"){"$it · ${if(it in healthy)"Reachable" else "Unreachable"}"}+"\n\n"+
                         if(healthy.isEmpty())"No public relay reachable. Use Sendme instead." else "Reachability from this phone; a transfer may still fail later."
                     },{"Check failed: ${it.message}"})
+                    results.text=relayResultColors(results.text)
                 }
             }.start()
         }
@@ -376,8 +400,9 @@ class MainActivity:ComponentActivity() {
                     checkSendme.isEnabled=true
                     sendmeResults.text=outcome.fold({result->
                         if(result.optBoolean("reachable"))"Reachable · ${result.getJSONArray("relays").join(", ")}\nIroh relay connection established. Transfers may use Direct or Relay."
-                        else result.optString("message","Sendme relay could not be reached.")
+                        else "Unreachable · "+result.optString("message","Sendme relay could not be reached.")
                     },{"Check failed: ${it.message}"})
+                    sendmeResults.setTextColor(if(outcome.getOrNull()?.optBoolean("reachable")==true)Color.rgb(115,220,130) else Color.rgb(255,205,110))
                 }
             }.start()
         }
@@ -442,6 +467,7 @@ class MainActivity:ComponentActivity() {
         val textMode=croc && sendKind=="text"
         fileSelectionPanel.visibility=if(textMode)View.GONE else View.VISIBLE
         message.visibility=if(textMode)View.VISIBLE else View.GONE
+        clearText.visibility=message.visibility
         filesChoice.background=rounded(if(!textMode)accent else Color.rgb(28,28,28));filesChoice.setTextColor(if(!textMode)Color.BLACK else ink)
         textChoice.background=rounded(if(textMode)accent else Color.rgb(28,28,28));textChoice.setTextColor(if(textMode)Color.BLACK else ink)
         updatePrimaryLabel()
@@ -491,7 +517,7 @@ class MainActivity:ComponentActivity() {
         val image=ImageView(this).apply{setImageBitmap(Bitmap.createBitmap(pixels,matrix.width,matrix.height,Bitmap.Config.ARGB_8888));adjustViewBounds=true;setPadding(dp(12),dp(12),dp(12),dp(12));setBackgroundColor(Color.WHITE)}
         qrDialog?.dismiss();qrDialog=AlertDialog.Builder(this).setTitle("${TransferService.state(this).optString("mode")} sharing QR").setView(image).setPositiveButton("Close",null).show()
     }
-    override fun onSaveInstanceState(out:Bundle){out.putBoolean("browserSend",browserSend);out.putBoolean("broadcast",broadcastChoice.isChecked);out.putString("sendKind",sendKind);out.putString("tab",tab);out.putInt("mode",mode.selectedItemPosition);out.putString("message",message.text.toString());out.putString("code",code.text.toString());out.putStringArrayList("sources",ArrayList(sources.map{it.toString()}));super.onSaveInstanceState(out)}
+    override fun onSaveInstanceState(out:Bundle){out.putString("clearedPayloadSession",clearedPayloadSession);out.putBoolean("browserSend",browserSend);out.putBoolean("broadcast",broadcastChoice.isChecked);out.putString("sendKind",sendKind);out.putString("tab",tab);out.putInt("mode",mode.selectedItemPosition);out.putString("message",message.text.toString());out.putString("code",code.text.toString());out.putStringArrayList("sources",ArrayList(sources.map{it.toString()}));super.onSaveInstanceState(out)}
     private fun launch(action:String) {
         val state=TransferService.state(this)
         require(!configurationLocked()){"Stop or pause the active transfer first"}
@@ -506,8 +532,8 @@ class MainActivity:ComponentActivity() {
             }
         }
         val sendingText=mode.selectedItem=="Croc" && sendKind=="text"
-        val c=JSONObject().put("id",UUID.randomUUID().toString()).put("mode",mode.selectedItem.toString()).put("action",action).put("code",if(mode.selectedItem=="Sendme") "" else if(action=="send")sendCode.text.toString().trim() else code.text.toString().trim()).put("ticket",if(mode.selectedItem=="Sendme")code.text.toString().trim() else "").put("text",if(sendingText)message.text.toString() else "").put("uris",JSONArray(if(sendingText)emptyList<String>() else sources.map{it.toString()})).put("relay",AppSettings.relay(this)).put("broadcast",action=="send" && mode.selectedItem=="Sendme" && broadcastChoice.isChecked)
-        if(action=="receive") require(code.text.isNotBlank()){"Enter a code or ticket"}
+        val c=JSONObject().put("id",UUID.randomUUID().toString()).put("mode",mode.selectedItem.toString()).put("action",action).put("code",if(mode.selectedItem=="Sendme") "" else if(action=="send")sendCode.text.toString().trim() else code.text.toString().trim()).put("ticket",if(mode.selectedItem=="Sendme")code.text.toString().trim() else "").put("text",if(sendingText)message.text.toString() else "").put("uris",JSONArray(if(sendingText)emptyList<String>() else sources.map{it.toString()})).put("payloadNames",JSONArray(if(sendingText)listOf("Text") else sources.map{sourceName(it)})).put("relay",AppSettings.relay(this)).put("broadcast",action=="send" && mode.selectedItem=="Sendme" && broadcastChoice.isChecked)
+        if(action=="receive") require(code.text.isNotBlank()){"Enter a code or ticket"}        if(action=="receive")c.remove("payloadNames")
         if(action=="send") require(if(sendingText)message.text.isNotBlank() else sources.isNotEmpty()){if(sendingText)"Enter text to send" else "Select files or a folder"}
         if(mode.selectedItem!="Croc") c.put("text","")
         if(action=="send" && mode.selectedItem!="Sendme")AppSettings.setCode(this,mode.selectedItem.toString(),sendCode.text.toString().trim())
@@ -520,6 +546,7 @@ class MainActivity:ComponentActivity() {
         val selected=saved.optString("mode")
         browserSend=selected=="Croc" && saved.optBoolean("browserSend")
         val text=if(selected=="Croc")saved.optString("text") else ""
+        require(text.isNotBlank()){"Reselect the exact same files and start a new transfer."}
         val uris=saved.optJSONArray("uris") ?: JSONArray()
         val cached=saved.optJSONArray("paths")
         val reusable=!saved.optBoolean("referencedSources") && cached!=null && cached.length()>0 && (0 until cached.length()).all{File(cached.getString(it)).exists()}
@@ -582,8 +609,15 @@ class MainActivity:ComponentActivity() {
             startService(Intent(this,TransferService::class.java).setAction("resume"));return
         }
         c.remove("log");c.remove("message");pendingStartId=c.optString("id");lockConfiguration(true)
-        try{startForegroundService(Intent(this,TransferService::class.java).putExtra("config",c.toString()));status.text="Starting…"}
-        catch(error:Exception){pendingStartId="";lockConfiguration(configurationLocked());throw error}
+        var handoff:File?=null
+        try{
+            val service=Intent(this,TransferService::class.java).putExtra("sessionId",c.optString("id")).putExtra("mode",c.optString("mode")).putExtra("action",c.optString("action"))
+            if(c.optString("text").length>8192){
+                handoff=File(File(cacheDir,"start-config").apply{mkdirs()},"${UUID.randomUUID()}.json").apply{writeText(c.toString(),Charsets.UTF_8)}
+                service.putExtra("configFile",handoff.name)
+            }else service.putExtra("config",c.toString())
+            startForegroundService(service);status.text="Starting…"
+        }catch(error:Exception){handoff?.delete();pendingStartId="";lockConfiguration(configurationLocked());throw error}
     }
     private fun render() {
         val s=TransferService.state(this);val value=s.toString();if(value==previous)return;previous=value
@@ -612,6 +646,12 @@ class MainActivity:ComponentActivity() {
         val running=s.optString("status")=="running";val stopping=s.optString("status")=="stopping"
         val paused=s.optString("status") in listOf("paused","interrupted")
         val receiving=s.optString("action")=="receive"
+        if(!receiving && !running && !stopping && s.optString("status") in listOf("complete","interrupted","stopped") && clearedPayloadSession!=s.optString("id")){
+            clearedPayloadSession=s.optString("id");sources.clear();restartedNames.clear()
+            if(s.optString("status")=="complete")message.setText("")
+            else if(s.optString("mode")!="Sendme" && mode.selectedItem==s.optString("mode") && s.optString("code").isNotEmpty())sendCode.setText(s.optString("code"))
+            refreshSelection()
+        }
         transferDirection.text="${s.optString("mode")} · ${if(receiving)"Receive on this phone" else "Send from this phone"}"
         if(!receiving && s.optString("mode")=="Croc" && s.optString("status")=="complete" && retainedSession!=s.optString("id")){
             retainedSession=s.optString("id");if(mode.selectedItem=="Croc")sendCode.setText(AppSettings.code(this,"Croc"))
@@ -623,7 +663,7 @@ class MainActivity:ComponentActivity() {
         status.text=TransferLabels.title(s)
         val completedSender=TransferLabels.senderFinished(s)
         val paths=if(completedSender || (!running && !stopping))s.optJSONObject("lastSenderRoutes") ?: s.optJSONObject("senderRoutes") else s.optJSONObject("senderRoutes")
-        val pathValues=paths?.keys()?.asSequence()?.map{paths.optString(it)}?.toList() ?: emptyList()
+        val pathValues=paths?.keys()?.asSequence()?.map{paths.optString(it).takeIf{v->v in listOf("direct","relay")} ?: s.optJSONObject("lastSenderRoutes")?.optString(it,"unknown") ?: "unknown"}?.toList() ?: emptyList()
         val activeRoute=if(s.optString("mode")!="Croc" && !receiving) {
             if(pathValues.isEmpty())"Waiting for receiver" else TransferRoute.label(pathValues)
         } else TransferRoute.label(listOf(s.optString("route","unknown")))
@@ -635,14 +675,16 @@ class MainActivity:ComponentActivity() {
         val progress=if(total>0 || s.optInt("filesTotal")>0)"$percent% · ${ProgressEvents.size(done)} of ${ProgressEvents.size(total)}" else if(s.has("percent"))"$percent% · ${s.optString("progress")}" else s.optString("progress")
         val rate=if(running && speed>0)"${ProgressEvents.size(speed.toLong())}/s"+ (ProgressEvents.eta(done,total,speed)?.let{" · $it left"} ?: "") else ""
         val files=if(s.optInt("filesTotal")>0)"${s.optInt("filesDone")} / ${s.optInt("filesTotal")} files" else ""
-        detail.text=listOf(TransferLabels.message(s),progress,files,rate,TransferTiming.elapsedText(s),TransferTiming.averageText(s)).filter{it.isNotEmpty()}.joinToString("\n")
+        val names=s.optJSONArray("payloadNames")?.let{a->(0 until a.length()).joinToString("\n"){a.optString(it)}}.orEmpty()
+        detail.text=if(s.optString("status")=="complete")listOf(names,TransferLabels.message(s),TransferTiming.elapsedText(s)).filter{it.isNotEmpty()}.joinToString("\n")
+            else listOf(names,TransferLabels.message(s),progress,files,rate,TransferTiming.elapsedText(s),TransferTiming.averageText(s)).filter{it.isNotEmpty()}.joinToString("\n")
         bar.isIndeterminate=running && total==0L && !s.has("percent") && s.optInt("filesTotal")==0
         bar.progress=percent
-        bar.visibility=if(running || (paused && receiving) || stopping)View.VISIBLE else View.GONE
+        bar.visibility=if(running || paused || stopping || s.optString("status")=="stopped")View.VISIBLE else View.GONE
         lockConfiguration(configurationLocked())
         pause.visibility=if(running || stopping)View.VISIBLE else View.GONE;pause.isEnabled=!stopping;pause.text=if(receiving)"Pause" else "Stop sharing"
         resumeButton.visibility=if(paused && receiving)View.VISIBLE else View.GONE
-        restartSharing.visibility=if(!receiving && s.optString("status") in listOf("interrupted","stopped","complete"))View.VISIBLE else View.GONE
+        restartSharing.visibility=if(!receiving && s.optString("text").isNotEmpty() && s.optString("status") in listOf("interrupted","stopped"))View.VISIBLE else View.GONE
         restartSharing.text=if(s.optString("status")=="complete")"Share again" else "Restart sharing"
         endPaused.visibility=if(paused && s.optBoolean("connectionRetained"))View.VISIBLE else View.GONE
         newTransfer.visibility=if(!running && !stopping && !s.optBoolean("connectionRetained"))View.VISIBLE else View.GONE
@@ -654,7 +696,24 @@ class MainActivity:ComponentActivity() {
         sendmeFallback.visibility=if(s.optBoolean("suggestSendme"))View.VISIBLE else View.GONE;sendmeFallback.isEnabled=!configurationLocked()
         val replacement=s.optString("codeRevision");if(replacement.isNotEmpty() && replacement!=lastReplacement){qrDialog?.dismiss();sendCode.setText(replacement);lastReplacement=replacement}
         ticket.text=if(running && !receiving && !s.optBoolean("troubleshooting"))if(s.optString("mode")=="Sendme")s.optString("ticket") else s.optString("code") else ""
-        receivedText.text=s.optString("text");receivedText.visibility=if(receivedText.text.isEmpty())View.GONE else View.VISIBLE;receivedTextTitle.visibility=receivedText.visibility
+        openReceived.visibility=if(receiving && s.optString("status")=="complete" && ((s.optJSONObject("published")?.length() ?: 0)>0 || (s.optJSONObject("publishedDirectories")?.length() ?: 0)>0))View.VISIBLE else View.GONE
+        receivedText.text=if(receiving)s.optString("text") else "";receivedText.visibility=if(receivedText.text.isEmpty())View.GONE else View.VISIBLE;receivedTextTitle.visibility=receivedText.visibility
+    }
+    private fun relayResultColors(value:CharSequence):CharSequence {
+        val colored=android.text.SpannableString(value)
+        Regex("(?m)^.*(?:Reachable|Unreachable|Check failed|No public relay).*$").findAll(value).forEach{match->
+            val good=match.value.contains("Reachable") && !match.value.contains("Unreachable")
+            colored.setSpan(android.text.style.ForegroundColorSpan(if(good)Color.rgb(115,220,130) else Color.rgb(255,205,110)),match.range.first,match.range.last+1,android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+        return colored
+    }
+    private fun openReceivedFolder(){
+        val saved=TransferService.state(this)
+        val folder=saved.optString("saveFolder")
+        val uri=if(folder.isNotEmpty())android.provider.DocumentsContract.buildDocumentUriUsingTree(Uri.parse(folder),android.provider.DocumentsContract.getTreeDocumentId(Uri.parse(folder)))
+            else android.provider.DocumentsContract.buildDocumentUri("com.android.externalstorage.documents","primary:Download/DataBeam")
+        try{startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri,android.provider.DocumentsContract.Document.MIME_TYPE_DIR))}
+        catch(_:ActivityNotFoundException){startActivity(Intent(android.app.DownloadManager.ACTION_VIEW_DOWNLOADS))}
     }
     private fun alert(s:String){AlertDialog.Builder(this).setMessage(s).setPositiveButton("OK",null).show()}
     @Deprecated("Legacy result API") override fun onActivityResult(request:Int,result:Int,data:Intent?){

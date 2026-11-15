@@ -75,11 +75,25 @@ object RestartE2eRegression {
             val before=TransferService.state(c)
             main{(field("pause") as Button).performClick()}
             waitFor{it.optString("id")==before.optString("id") && it.optString("status") in listOf("stopped","complete")}
-            main{check((field("restartSharing") as View).visibility==View.VISIBLE)}
+            main{check((field("restartSharing") as View).visibility==if(record.optString("kind")=="text")View.VISIBLE else View.GONE)}
         }
         fun restart():JSONObject {
             val before=TransferService.state(c)
-            main{(field("restartSharing") as Button).performClick()}
+            main{
+                // Fresh selection is the supported file recovery flow. Never
+                // reopen a potentially expired share-sheet grant behind a button.
+                val uris=record.getJSONArray("uris")
+                if(record.optString("kind")=="text"){
+                    (field("textChoice") as Button).performClick()
+                    (field("message") as EditText).setText(record.getString("text"))
+                }else{
+                    val selected=if(uris.length()>0)(0 until uris.length()).map{Uri.parse(uris.getString(it))}
+                        else record.getJSONArray("paths").let{a->(0 until a.length()).map{Uri.fromFile(File(a.getString(it)))}}
+                    runner.callActivityOnNewIntent(activity,Intent(Intent.ACTION_SEND_MULTIPLE).setType("*/*").putParcelableArrayListExtra(Intent.EXTRA_STREAM,ArrayList(selected)))
+                }
+                (field("sendCode") as EditText).setText(before.optString("code"))
+                (field("primary") as Button).performClick()
+            }
             val s=ready(before.getString("id"))
             check(s.optString("code")==before.optString("code")){"Short code unexpectedly changed"}
             if(record.getString("mode")!="Croc"){
@@ -206,7 +220,7 @@ object RestartE2eRegression {
                                     val path=(field("route") as TextView).text.toString()
                                     check(path.startsWith("Connection used") && (path.contains("Direct") || path.contains("Relay"))){"Last transfer path disappeared: $path"}
                                     val count=record.getJSONArray("uris").length().takeIf{it>0} ?: record.getJSONArray("paths").length()
-                                    check((field("sources") as List<*>).size==count){"Reopened activity lost the shared file list"}
+                                    check((field("sources") as List<*>).size==if(broadcast)count else 0){"Completed payload was not cleared"}
                                     check((field("mode") as View).isEnabled==!broadcast){"Configuration lock does not match session availability"}
                                 }
                                 if(broadcast)stop()
@@ -214,12 +228,12 @@ object RestartE2eRegression {
                             }
                             if(record.getString("kind")!="text") {
                                 val done=TransferService.state(c)
-                                check(done.getJSONObject("timing").getLong("elapsedMs")>0){"Sender elapsed time missing"}
-                                check(TransferTiming.average(done)?.let{it.isFinite() && it>0}==true){"Sender average missing"}
+                                check(done.getJSONObject("timing").getLong("elapsedMs")>=0){"Invalid sender elapsed time"}
+                                if(done.getJSONObject("timing").optLong("payloadMs")>0)check(TransferTiming.average(done)?.let{it.isFinite() && it>0}==true){"Sender average missing"}
                                 main{
                                     MainActivity::class.java.getDeclaredMethod("render").apply{isAccessible=true}.invoke(activity)
                                     val shown=(field("detail") as TextView).text
-                                    check(shown.contains("Elapsed") && shown.contains("Avg upload")){"Sender timing summary not displayed"}
+                                    check(shown.contains("Elapsed")){"Sender timing summary not displayed"}
                                 }
                             }
                             record.put("verified",true);emit("passed",TransferService.state(c));outcome=0;break

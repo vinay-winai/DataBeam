@@ -1,4 +1,17 @@
 const API_URL = "https://api.github.com/repos/vinay-winai/DataBeam/releases/latest";
+const ANDROID_APK_URL = "https://github.com/vinay-winai/DataBeam/releases/download/android-v0.8.0-beta.1/DataBeam_android-arm64_beta.apk";
+
+function showAndroidDownload() {
+    const button = document.getElementById("download-btn");
+    button.href = ANDROID_APK_URL;
+    button.querySelector(".btn-text").textContent = "Download Android beta APK";
+    document.getElementById("download-status").textContent = "Android v0.8.0-beta.1 · Android 8.0+ · ARM64";
+    const badge = document.getElementById("version-badge");
+    if (badge) badge.textContent = "Android beta now available";
+    const secondary = document.getElementById("secondary-download");
+    if (secondary) { secondary.style.display = "block"; secondary.textContent = "Native Android app. Download the APK to install."; }
+    gAutoDownloadUrl = ANDROID_APK_URL;
+}
 
 let gReleaseData = null;
 let gUserOS = "unknown";
@@ -20,6 +33,7 @@ async function fetchLatestRelease() {
         
         updateDownloadLinks();
     } catch (error) {
+        if (gUserOS === "android") { showAndroidDownload(); return; }
         console.error("Error fetching release:", error);
         document.getElementById("download-status").textContent = "Could not fetch latest release. Check GitHub.";
         document.getElementById("download-status").style.color = "#ff5f56";
@@ -64,6 +78,7 @@ async function setupOSLinks() {
     // Set fallback GitHub page link if JS fails or API fails
     const mainBtn = document.getElementById("download-btn");
     mainBtn.href = "https://github.com/vinay-winai/DataBeam/releases/latest";
+    if (gUserOS === "android") showAndroidDownload();
     // Some browsers hide the CPU in the user agent. Use client hints when
     // available; explicit architecture links remain available in all browsers.
     if (["linux", "android"].includes(gUserOS) && window.navigator.userAgentData?.getHighEntropyValues) {
@@ -76,6 +91,7 @@ async function setupOSLinks() {
 }
 
 function updateDownloadLinks() {
+    if (gUserOS === "android") showAndroidDownload();
     if (!gReleaseData || !gReleaseData.assets) return;
 
     let windowsAsset = null;
@@ -112,6 +128,7 @@ function updateDownloadLinks() {
     document.getElementById("link-mac").href = macUnivAsset || macAarchAsset || releaseUrl;
     document.getElementById("link-linux").href = linuxAssets.x64 || releaseUrl;
     document.getElementById("link-linux-arm64").href = linuxAssets.arm64 || releaseUrl;
+    if (gUserOS === "android") return;
     const linuxAppAsset = linuxAssets[gUserArch];
 
     const mainBtn = document.getElementById("download-btn");
@@ -137,7 +154,7 @@ function updateDownloadLinks() {
             secStatus.style.display = "block";
             secStatus.innerHTML = `On Apple Silicon? <a href="${macAarchAsset}" style="color: #ff8c00; text-decoration: underline;">Get aarch64 build for smaller app size</a>`;
         }
-    } else if (["linux", "android"].includes(gUserOS)) {
+    } else if (gUserOS === "linux") {
         if (linuxAppAsset) {
             autoUrl = linuxAppAsset;
             const archLabel = gUserArch === "arm64" ? "AArch64" : "x64";
@@ -151,10 +168,6 @@ function updateDownloadLinks() {
             autoUrl = releaseUrl;
             statusText.textContent = `Latest Release: ${gReleaseData.tag_name} (Linux)`;
             btnText.textContent = "View Linux downloads";
-        }
-        if (gUserOS === "android" && secStatus) {
-            secStatus.style.display = "block";
-            secStatus.textContent = "For DroidDeck or another Linux environment on Android.";
         }
     } else {
         autoUrl = releaseUrl; // fallback

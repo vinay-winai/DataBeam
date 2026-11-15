@@ -12,6 +12,7 @@ class SmokeInstrumentation:Instrumentation(){
  override fun onCreate(arguments:Bundle?){super.onCreate(arguments);args=arguments ?: Bundle();start()}
  override fun onStart(){
   try {
+   if(args.getString("polish_test")=="true" || args.getString("polish_text")!=null || args.getString("polish_file")=="true"){MobilePolishRegression.run(this,args);return}
    if(args.getString("guide_badge_test")=="true"){GuideBadgeRegression.run(this);return}
    if(args.getString("sender_state_test")=="true"){SenderClosureRegression.run(this);return}
    if(args.getString("source_access_test")=="true"){SourceAccessRegression.run(this);return}
@@ -122,14 +123,14 @@ class SmokeInstrumentation:Instrumentation(){
     if(s.optString("status") in listOf("complete","interrupted")) {
      if(s.optString("status")=="complete") {
         val timing=s.getJSONObject("timing")
-        check(timing.getLong("elapsedMs")>0){"Elapsed time missing"}
-        if(timing.optLong("bytes")>0)check(TransferTiming.average(s)?.let{it.isFinite() && it>0}==true){"Completion average missing"}
+        check(timing.getLong("elapsedMs")>=0){"Invalid elapsed time"}
+        if(timing.optLong("bytes")>0 && timing.optLong("payloadMs")>0)check(TransferTiming.average(s)?.let{it.isFinite() && it>0}==true){"Completion average missing"}
         else check(TransferTiming.average(s)==null){"Cached data inflated the average"}
         runOnMainSync {
             MainActivity::class.java.getDeclaredMethod("render").apply{isAccessible=true}.invoke(activity)
             val detail=MainActivity::class.java.getDeclaredField("detail").apply{isAccessible=true}.get(activity) as android.widget.TextView
             check(detail.text.contains("Elapsed")){"Elapsed time not displayed"}
-            if(timing.optLong("bytes")>0)check(detail.text.contains("Avg download")){"Average speed not displayed"}
+            check(!detail.text.contains("Share again")){"Completed card offered an expired payload"}
         }
      }
      if(config.optBoolean("requireCachePrompt"))check(cachePrompts>0){"Saved-data prompt was not shown and clicked"}

@@ -7,10 +7,20 @@ object TransferRoute {
             if(routes.length()==0 && state.optJSONObject("timing")?.optBoolean("complete")==true)state.remove("lastSenderRoutes")
             routes.put(connection,value)
             val last=state.optJSONObject("lastSenderRoutes") ?: org.json.JSONObject()
-            last.put(connection,value);state.put("lastSenderRoutes",last)
+            // A path can become unselected during teardown. Keep the latest
+            // known transport instead of replacing it with "unknown".
+            if(value in listOf("direct","relay"))last.put(connection,value)
+            state.put("lastSenderRoutes",last)
         }
         if(routes.length()>1)state.put("timingConcurrent",true)
         state.put("senderRoutes",routes)
+    }
+    fun selected(paths:org.json.JSONArray):String?=(0 until paths.length()).asSequence()
+        .map{paths.getJSONObject(it)}.firstOrNull{it.optBoolean("selected")}
+        ?.optString("route")?.takeIf{it in listOf("direct","relay")}
+
+    fun receiveEvent(state:org.json.JSONObject,value:String){
+        if(value in listOf("direct","relay"))state.put("route",value)
     }
     /** Croc's direction line describes the payload path; relay configuration does not. */
     fun croc(line:String):String? {

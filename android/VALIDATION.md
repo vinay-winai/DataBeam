@@ -239,3 +239,31 @@ Device UI-controls regression passed all three actual popup-menu actions, browse
 An ADB disconnect exposed a test-driver bug: a reused empty snapshot was treated as missing preferences and cleared the saved card/settings entries. Original files were not touched. The user's intact pre-test `normal/settings.xml` and `normal/transfer.xml` backups were restored and verified byte-for-byte, retaining the completed 700,692-byte two-item card. Both checked-in test drivers now distinguish missing files from ADB/read failures and abort on the latter; restart tests take a fresh snapshot rather than blindly reusing an earlier empty backup. A disconnected-serial regression verified that an existing backup remains untouched. The user was informed of the restoration.
 
 Artifacts: `android/.tools/smoke/android-actions/normal`, `broadcast-repeat`, `ui` and `harness-disconnect-check`. Final installed APK: 31,594,425 bytes, SHA-256 `52c8960967bb7fc46f19b9810ef1572fc68a680c29f810cd19b871b15bd4be96`; installed hash, v2 signature and 16 KiB alignment passed. Desktop UI and non-Android transport behavior were not changed.
+
+## Android transfer polish and public beta - 2026-11-15
+
+Current behavior supersedes the earlier Restart/Share-again and elapsed-time UI records above.
+
+- Latest selected Sendme/EasySendMe route replaces the initial route; unknown/closed teardown events retain the last known route. JNI coalesces progress while preserving the baseline, first advancing sample, latest sample, route changes and completion; native event timestamps avoid polling-time inflation.
+- Elapsed starts at advancing payload bytes, excluding preparation, initial waiting, paused/resume connection waits and app downtime. Fully cached export alone does not start transfer time.
+- Success clears sender file/text inputs and saved payload references, with names/success/elapsed/path retained. Failed file sends retain names, reason and progress, clear their stale selection and require fresh selection of the exact originals. Croc retains its code for receiver Resume; failed text stays editable. File Restart/Share again is removed. Broadcast retains its sources until sharing ends.
+- Spacing/warning position, populated Clear all, Clear text, receiver Clear, reachable-green/unreachable-yellow results and saved-folder Open are implemented. Android 13+ requests notifications once when permission is missing; the existing grant was preserved (no production-data reset to simulate a first install).
+- Croc text is piped instead of placed in argv. Large service configs use a private consumed/deleted handoff file, and foreground status precedes config processing. Successful stdout preserves exact text, while failed stdout contributes the terminal error to relay recovery. Bare relay-connection failures now qualify; auth/file/payload failures do not.
+
+Validation:
+
+- 39 JVM tests and the native queue regression passed. Debug and signed release builds passed. Lint: zero errors, 54 warnings.
+- Device controls/news-badge regressions passed, including populated Clear all, exclusive Files/Text controls, text retry, fresh URI re-selection without a staging copy, configuration lock and ongoing notification progress.
+- Croc sender -> PC: valid Sendme ticket (222 bytes), multiline/CRLF/Unicode/leading-dash text (74 bytes), and 534,890-byte Unicode text matched exactly. PC -> Android: both multiline and 534,890-byte text matched exactly. Completion cleared send payloads and removed sender Restart/received-text presentation.
+- PC -> Android Sendme: generated 1 MiB file SHA-256 matched; automatic publication and private-working cleanup passed. Open folder actually opened the DataBeam directory in Android DocumentsUI.
+- Android -> PC Sendme: Stop, fresh selection and new ticket passed for 1,048,618 bytes across three files, including empty/Unicode fixtures; collection hash/content matched, completion froze timing/path, removed the notification, unlocked controls and cleared selections.
+- Tests exposed an oversized service-handoff foreground deadline, fixed by file handoff/early foreground status. The local Croc test initially selected an unavailable LAN transfer port; text checks pin their test-only USB relay route (`--ip` for the PC receiver, `--no-local` for the PC sender). The final full text run had no new crash. These relay-only text checks do not assert LAN Direct speed.
+- Generated data/receipts, test package and ADB reverse mappings were removed. User settings and the completed card matched the host backup byte-for-byte; no app-data reset. The final development APK was installed with matching APK hash, preserving its certificate and data.
+- Public beta is a separately signed, non-debuggable release build, version 0.8.0-beta.1, min API 26, ARM64 only. APK v2 signature and 16 KiB zip alignment passed. It uses the same tested application/native source; the existing phone retains the development-signed build to avoid uninstalling its data. Keep the ignored release signing key/properties backed up for future public updates.
+- Website download tests passed for native Android beta selection, desktop-API failure fallback and unchanged stable Windows selection. Android beta news and direct download links were added to the site and Troubleshoot.
+
+Artifacts: `mobile-polish/f8fbb43e-4051-4ce0-90b1-a936e2bd3530` (exact text), `mobile-polish/04700d37-b738-426c-9f4d-ee5a6423c001` (receive/Open), `mobile-polish-native-send` (fresh-selection sender), `android-actions/ui` (controls/badge), and final build/signature logs under `android/.tools/smoke/`.
+
+Final DataBeam_android-arm64_beta.apk: 20751353 bytes; SHA-256 `e263df6211582467703493abab16d714d6a6adea00c9aeb825c3211d4fbf659b`.
+
+Final DataBeam_android-arm64_dev-update.apk: 31604938 bytes; SHA-256 `7c31dcd06eb7ca7a73082660094846a7fdce6d1abdaedd0e8a74fa8d889a08a2`.

@@ -4,6 +4,10 @@ import org.json.JSONObject
 
 /** Presentation depends on direction: a stopped sender starts a new session. */
 object TransferLabels {
+    private fun senderRetry(s:JSONObject)=if(s.optString("text").isNotEmpty())"Your text is kept. Edit it and tap Send text, or tap Restart sharing."
+        else "To resume, reselect the exact same files or folder and start a new transfer. "+
+            if(s.optString("mode")=="Croc")"Keep the same Croc code so the receiver can tap Resume with its partial files."
+            else "Share the new code or ticket with the receiver; it can continue using its saved data."
     fun broadcast(s:JSONObject)=s.optString("action")=="send" && s.optString("mode")=="Sendme" && s.optBoolean("broadcast")
     fun autoEnd(s:JSONObject)=s.optString("action")=="send" && s.optString("mode") in listOf("Sendme","EasySendMe") &&
         !broadcast(s) && s.optJSONObject("timing")?.optBoolean("complete")==true
@@ -13,8 +17,8 @@ object TransferLabels {
     fun sentAndSharing(s:JSONObject)=broadcast(s) && s.optString("status")=="running" && senderFinished(s)
     fun interruptedMessage(s:JSONObject):String {
         if(s.optString("action")=="send")return if(s.optString("phase")=="Waiting for receiver")
-            "App closed while waiting for a receiver. Tap Restart sharing to try again."
-        else "Sharing stopped when the app closed. Tap Restart sharing to try again."
+            "App closed while waiting for a receiver. ${senderRetry(s)}"
+        else "Sharing stopped when the app closed. ${senderRetry(s)}"
         return "Receiving stopped when the app closed. Partial data is kept. Keep the sender sharing, then tap Resume."
     }
     fun title(s:JSONObject):String {
@@ -39,17 +43,16 @@ object TransferLabels {
         val receiving=s.optString("action")=="receive"
         val raw=s.optString("message")
         return when(s.optString("status")) {
-            "paused"->if(receiving)"Partial data is kept. Keep the sender sharing, then tap Resume." else "Tap Restart sharing to start a new session."
-            "stopped"->"Tap Restart sharing to use the previous files or text."
+            "paused"->if(receiving)"Partial data is kept. Keep the sender sharing, then tap Resume." else senderRetry(s)
+            "stopped"->senderRetry(s)
             "interrupted"->when {
                 raw.startsWith("App restarted") || raw.startsWith("App closed") || raw.isBlank()->interruptedMessage(s)
                 raw.contains("Clear the transfer card",ignoreCase=true)->raw
                 receiving && (raw.contains("invalid ticket",ignoreCase=true) || raw.contains("did not supply",ignoreCase=true))->"$raw\nConfirm both devices use ${s.optString("mode")}. Paste the correct code or ticket, then tap Receive."
-                !receiving && raw.contains("files are missing",ignoreCase=true)->"$raw\nSelect the files again, then tap Send files."
                 receiving->"$raw\nKeep the sender sharing, then tap Resume. If its code or ticket changed, paste the new one first."
-                else->"$raw\nTap Restart sharing to try again, or select the files again if they are no longer available."
+                else->"$raw\n${senderRetry(s)}"
             }
-            "complete"->if(raw in listOf("Complete", ""))if(receiving)"Transfer finished." else "Transfer finished. Use Share again to send to another device." else raw
+            "complete"->if(receiving)if(raw in listOf("Complete",""))"Received successfully." else raw else "Sent successfully."
             "running"->when {
                 s.optBoolean("troubleshooting")->"Checking which public relays are reachable. Please wait for the result."
                 senderFinished(s)->if(broadcast(s))"Files sent successfully. Broadcast stays open for other receivers. Tap Stop sharing when finished."

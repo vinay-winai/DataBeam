@@ -1,6 +1,17 @@
 # News
 
-DataBeam is verified running on Android via DroidDeck with the AArch64/ARM64 build.
+## Android beta APK available
+
+The native DataBeam Android app is now available as **v0.8.0-beta.1** for **Android 8.0+ on ARM64** phones and tablets.
+
+[Download the Android beta APK](https://github.com/vinay-winai/DataBeam/releases/download/android-v0.8.0-beta.1/DataBeam_android-arm64_beta.apk) · [Android beta release notes](https://github.com/vinay-winai/DataBeam/releases/tag/android-v0.8.0-beta.1)
+
+- Send and receive with Croc, Sendme and EasySendMe; generate and scan transfer QR codes.
+- Share files or text to DataBeam from other Android apps, with background transfer notifications.
+- Follow the latest Direct/Relay path, payload progress and elapsed time; open the saved folder after receiving.
+- Public relay checks, Croc relay recovery and clear file re-selection guidance after a failed send.
+
+The Linux AArch64 AppImage also runs through DroidDeck on Android; it is separate from the native APK.
 
 [Download DataBeam](https://wisesloth.pages.dev/DataBeam/)
 
@@ -29,7 +40,7 @@ The connection can start as Direct and later fall back to Relay if its UDP path 
 
 [Iroh issue #4555](https://github.com/n0-computer/iroh/issues/4555) documents failed UDP segmentation offload batches causing established connections to time out. Its discussion includes Samsung Android 16 with Iroh 1.4.1. [Upstream fix #4645](https://github.com/n0-computer/iroh/pull/4645) was still open when checked on 2026-11-14. Sendme also has an older [offload failure report #45](https://github.com/n0-computer/sendme/issues/45). This is a strong match for the phone-to-PC behavior reproduced during DataBeam testing.
 
-DataBeam retains upstream's normal transport settings and automatic Direct/Relay selection; it does not ship a local GSO workaround. Check the transfer's actual route indicator. Let a relayed transfer continue if its speed is acceptable, or use Croc for a different transfer engine.
+Desktop DataBeam retains upstream's normal transport settings and automatic Direct/Relay selection. The Android beta temporarily disables UDP GSO for Sendme/EasySendMe while tracking the upstream fix. Check the transfer's actual route indicator. Let a relayed transfer continue if its speed is acceptable, or use Croc for a different transfer engine.
 
 ## Transfer issues
 

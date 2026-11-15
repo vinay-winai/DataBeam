@@ -26,18 +26,18 @@ class TransferLabelsTest {
         s.put("mode","Sendme").put("action","receive");assertFalse(TransferLabels.autoEnd(s))
     }
     private fun state(action:String,status:String,phase:String="")=JSONObject().put("action",action).put("status",status).put("phase",phase).put("mode","EasySendMe")
-    @Test fun closedWaitingSenderOffersRestartAndNeverResume(){
+    @Test fun closedWaitingFileSenderRequiresFreshSelection(){
         val s=state("send","interrupted","Waiting for receiver").put("message","App restarted; saved data retained. Press Resume to reconnect.")
         assertEquals("Sharing stopped",TransferLabels.title(s))
         assertTrue(TransferLabels.message(s).contains("waiting for a receiver"))
-        assertTrue(TransferLabels.message(s).contains("Restart sharing"))
+        assertTrue(TransferLabels.message(s).contains("reselect the exact same files"))
         assertFalse(TransferLabels.message(s).contains("Resume"))
     }
     @Test fun receivingAndSendingHaveDifferentProgressAndRecoveryActions(){
         assertEquals("Receiving",TransferLabels.title(state("receive","running","Transferring")))
         assertEquals("Sending",TransferLabels.title(state("send","running","Transferring")))
         assertTrue(TransferLabels.message(state("receive","paused")).contains("Resume"))
-        assertTrue(TransferLabels.message(state("send","stopped")).contains("Restart sharing"))
+        assertTrue(TransferLabels.message(state("send","stopped")).contains("reselect the exact same files"))
         assertTrue(TransferLabels.message(state("receive","interrupted").put("message","Network disconnected")).contains("paste the new one"))
     }
     @Test fun completeAndVerificationDoNotClaimTheSameThing(){
@@ -45,6 +45,14 @@ class TransferLabelsTest {
         assertTrue(TransferLabels.message(state("receive","running","Verifying and saving")).contains("Wait for the saved location"))
         val s=state("receive","complete").put("message","Saved to Downloads / DataBeam")
         assertEquals("Saved to Downloads / DataBeam",TransferLabels.message(s))
+    }
+    @Test fun failedCrocFilesKeepTheirCodeWhileTextRemainsEditable(){
+        val s=state("send","stopped").put("mode","Croc")
+        assertTrue(TransferLabels.message(s).contains("Keep the same Croc code"))
+        assertTrue(TransferLabels.message(s).contains("reselect the exact same files"))
+        s.put("text","generated text")
+        assertTrue(TransferLabels.message(s).contains("Your text is kept"))
+        assertFalse(TransferLabels.message(s).contains("reselect"))
     }
     @Test fun invalidContentAndTicketErrorsOfferTheActionThatCanResolveThem(){
         val changed=state("receive","interrupted").put("message","This code points to different files. Clear the transfer card and start a new receive.")

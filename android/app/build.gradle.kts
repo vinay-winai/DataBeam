@@ -1,3 +1,4 @@
+import java.util.Properties
 plugins { id("com.android.application") }
 abstract class BundleGuideAsset : DefaultTask() {
     @get:InputFile abstract val sourceFile:org.gradle.api.file.RegularFileProperty
@@ -10,6 +11,8 @@ abstract class BundleGuideAsset : DefaultTask() {
 val bundleGuide=tasks.register<BundleGuideAsset>("bundleGuide") {
     sourceFile.set(rootProject.file("../troubleshoot.md"));outputDirectory.set(layout.buildDirectory.dir("generated/guideAssets"))
 }
+val releaseSigningFile=rootProject.file(".tools/signing/release.properties")
+val releaseSigning=Properties().apply{if(releaseSigningFile.exists())releaseSigningFile.inputStream().use{load(it)}}
 android {
     namespace = "com.vinaywinai.databeam"
     compileSdk = 36
@@ -25,6 +28,14 @@ android {
         ndk { abiFilters += "arm64-v8a" }
     }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+    if(releaseSigningFile.exists())signingConfigs.create("betaRelease"){
+        storeFile=rootProject.file(".tools/signing/databeam-release.jks")
+        storePassword=releaseSigning.getProperty("storePassword");keyAlias=releaseSigning.getProperty("keyAlias");keyPassword=releaseSigning.getProperty("keyPassword")
+    }
+    buildTypes.getByName("release"){
+        versionNameSuffix="-beta.1"
+        if(releaseSigningFile.exists())signingConfig=signingConfigs.getByName("betaRelease")
+    }
     packaging { jniLibs { useLegacyPackaging = true } }
 }
 androidComponents.onVariants {variant->variant.sources.assets?.addGeneratedSourceDirectory(bundleGuide,BundleGuideAsset::outputDirectory)}

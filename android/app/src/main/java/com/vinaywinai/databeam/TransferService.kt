@@ -61,7 +61,12 @@ class TransferService : Service() {
                 for (i in 0 until events.length()) {
                     val e=events.getJSONObject(i)
                     val kind=e.getString("kind"); val payload=e.getString("payload")
-                    if(kind=="receive-route")synchronized(this@TransferService){state.put("route",payload)}
+                    val eventNow=SystemClock.elapsedRealtime()-(System.currentTimeMillis()-e.optLong("atMs",System.currentTimeMillis())).coerceAtLeast(0)
+                    if(kind=="receive-route")synchronized(this@TransferService){TransferRoute.receiveEvent(state,payload)}
+                    if(kind=="receive-paths")synchronized(this@TransferService){TransferRoute.selected(JSONArray(payload))?.let{TransferRoute.receiveEvent(state,it)}}
+                    if(kind=="send-paths")synchronized(this@TransferService){
+                        val event=JSONObject(payload);TransferRoute.selected(event.getJSONArray("paths"))?.let{TransferRoute.senderEvent(state,event.getString("connection"),it)}
+                    }
                     if(kind=="send-route")synchronized(this@TransferService){
                         val event=JSONObject(payload);TransferRoute.senderEvent(state,event.getString("connection"),event.getString("route"))
                     }
@@ -69,7 +74,7 @@ class TransferService : Service() {
                     if(kind in listOf("receive-progress","transfer-progress","preparation-progress")) {
                         ProgressEvents.native(payload)?.let{sample->synchronized(this@TransferService) {
                             if(kind=="preparation-progress")state.put("preparing",true).put("prepDone",sample.done).put("prepTotal",sample.total).put("prepSpeed",sample.speed).put("phase","Preparing files")
-                            else {timing.progress(sample.done,SystemClock.elapsedRealtime());timing.save(state);if(!state.has("firstPayloadDone"))state.put("firstPayloadDone",sample.done);state.put("preparing",false).put("done",sample.done).put("total",sample.total).put("speed",sample.speed).put("phase","Transferring")}
+                            else {timing.progress(sample.done,eventNow);timing.save(state);if(!state.has("firstPayloadDone"))state.put("firstPayloadDone",sample.done);state.put("preparing",false).put("done",sample.done).put("total",sample.total).put("speed",sample.speed).put("phase","Transferring")}
                             state.put("progress","")
                         }}
                     }
@@ -82,9 +87,9 @@ class TransferService : Service() {
                     if(kind=="receive-export-started")synchronized(this@TransferService){state.put("preparing",false).put("phase","Verifying and saving").put("speed",0)}
                     if(kind=="receive-started")synchronized(this@TransferService){state.put("phase","Connecting").put("message","")}
                     if(kind=="receive-progress")synchronized(this@TransferService){state.put("message","")}
-                    if(kind=="transfer-started")synchronized(this@TransferService){timing.beginPayload(SystemClock.elapsedRealtime());timing.save(state)}
+                    if(kind=="transfer-started")synchronized(this@TransferService){timing.beginPayload(eventNow);timing.save(state)}
                     if(kind=="transfer-completed"){
-                        val end=synchronized(this@TransferService){timing.finishPayload(SystemClock.elapsedRealtime());timing.save(state);TransferLabels.autoEnd(state)}
+                        val end=synchronized(this@TransferService){timing.finishPayload(eventNow);timing.save(state);TransferLabels.autoEnd(state)}
                         if(end){sentSuccessfully.set(true);NativeBridge.cancel();process?.destroy()}
                     }
                     log("$kind $payload")
@@ -118,11 +123,30 @@ class TransferService : Service() {
             return START_NOT_STICKY
         }
         if(!busy.compareAndSet(false,true)) return START_NOT_STICKY
+        // Foreground status precedes loading a large text configuration. Large
+        // configs are private temporary files, never large Binder extras.
+        state=JSONObject()
+        val nm=getSystemService(NotificationManager::class.java)
+        nm.createNotificationChannel(NotificationChannel(CHANNEL,"Transfers",NotificationManager.IMPORTANCE_LOW))
+        if(Build.VERSION.SDK_INT>=29)startForeground(1,notification("Preparing transfer"),ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        else startForeground(1,notification("Preparing transfer"))
         stopping.set(false)
         sentSuccessfully.set(false)
         backgroundTimedOut=false
         NativeBridge.prepare()
-        state=JSONObject(intent?.getStringExtra("config") ?: "{}")
+        try{
+            val name=intent?.getStringExtra("configFile")
+            state=if(name!=null){
+                require(name.matches(Regex("[0-9a-f-]{36}\\.json"))){"Invalid transfer configuration"}
+                val root=File(cacheDir,"start-config").canonicalFile;val config=File(root,name).canonicalFile
+                require(config.parentFile==root){"Invalid transfer configuration"}
+                try{JSONObject(config.readText(Charsets.UTF_8))}finally{config.delete()}
+            }else JSONObject(intent?.getStringExtra("config") ?: "{}")
+        }catch(error:Exception){
+            state=JSONObject().put("id",intent?.getStringExtra("sessionId").orEmpty()).put("mode",intent?.getStringExtra("mode").orEmpty())
+                .put("action",intent?.getStringExtra("action").orEmpty()).put("status","interrupted").put("message","Could not open transfer settings: ${error.message}")
+            persist();busy.set(false);stopForeground(STOP_FOREGROUND_REMOVE);stopSelf();return START_NOT_STICKY
+        }
         timing=TransferTiming(state.optJSONObject("timing")).apply{resume(SystemClock.elapsedRealtime());save(state)}
         if(!state.has("saveFolder"))state.put("saveFolder",AppSettings.folder(this)).put("saveFolderLabel",AppSettings.folderLabel(this))
         state.remove("route");state.remove("senderRoutes")
@@ -133,9 +157,6 @@ class TransferService : Service() {
         if(state.optString("action")=="send") state.remove("ticket")
         state.put("connectionRetained",false);state.remove("phase");state.remove("relayNotice");state.remove("suggestSendme");state.remove("troubleshooting");state.remove("codeRevision")
         state.remove("cacheInfo");state.remove("awaitingCacheChoice");cacheChoice.set(null)
-        val nm=getSystemService(NotificationManager::class.java)
-        nm.createNotificationChannel(NotificationChannel(CHANNEL,"Transfers",NotificationManager.IMPORTANCE_LOW))
-        if(Build.VERSION.SDK_INT>=29) startForeground(1, notification("Preparing transfer"), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC) else startForeground(1, notification("Preparing transfer"))
         wake=(getSystemService(POWER_SERVICE) as PowerManager).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,"DataBeam:transfer").apply { acquire(6*60*60*1000L) }
         update("running","Preparing…")
         main.post(poll)
@@ -146,7 +167,10 @@ class TransferService : Service() {
             try {
                 val config=synchronized(this) {JSONObject(state.toString())}
                 stageSources(config)
-                synchronized(this) { state.put("paths",config.optJSONArray("paths")) }
+                synchronized(this) {
+                    state.put("paths",config.optJSONArray("paths"))
+                    if(config.optString("action")=="send" && !state.has("payloadNames"))state.put("payloadNames",if(config.optString("text").isNotEmpty())JSONArray().put("Text") else JSONArray((0 until (config.optJSONArray("paths")?.length() ?: 0)).map{File(config.getJSONArray("paths").getString(it)).name}))
+                }
                 persist()
                 check(!stopping.get()) {"Stopped"}
                 val mode=config.getString("mode")
@@ -225,7 +249,15 @@ class TransferService : Service() {
                     poll.run()
                     main.removeCallbacks(poll)
                     if(sentSuccessfully.get()){terminal="complete";terminalMessage="Files sent successfully. Sharing ended automatically."}
-                    synchronized(this){if(terminal=="complete")timing.finishPayload(SystemClock.elapsedRealtime());timing.pause(SystemClock.elapsedRealtime());timing.save(state)}
+                    synchronized(this){
+                        if(terminal=="complete"){
+                            timing.finishPayload(SystemClock.elapsedRealtime())
+                            if(state.optString("action")=="send"){
+                                state.put("text","").put("uris",JSONArray());state.remove("paths")
+                            } else state.optJSONObject("published")?.let{published->state.put("payloadNames",JSONArray(published.keys().asSequence().toList()))}
+                        }
+                        timing.pause(SystemClock.elapsedRealtime());timing.save(state)
+                    }
                     wake?.let { if(it.isHeld) it.release() };multicast?.let{if(it.isHeld)it.release()}
                     update(terminal,terminalMessage)
                     busy.set(false)
@@ -292,11 +324,14 @@ class TransferService : Service() {
         val relay=c.optString("relay").ifEmpty { RelayRecovery.relay(code) }
         val output=File(filesDir,"received/${c.getString("id")}").apply{mkdirs()}
         if(action=="receive"){synchronized(this){state.put("output",output.absolutePath)};persist()}
-        val args=mutableListOf(File(applicationInfo.nativeLibraryDir,"libcroc.so").absolutePath,"--yes","--ignore-stdin","--relay",relay)
+        val sendText=if(action=="send")text ?: c.optString("text").takeIf{it.isNotEmpty()} else null
+        val args=mutableListOf(File(applicationInfo.nativeLibraryDir,"libcroc.so").absolutePath,"--yes","--relay",relay)
+        if(sendText==null)args.add("--ignore-stdin")
         if(action=="send") {
             args.add("send")
-            val message=text ?: c.optString("text").takeIf{it.isNotEmpty()}
-            if(message!=null) args.addAll(listOf("--text",message)) else {
+            // Croc reads piped stdin before --text, while --text marks it as
+            // text for the receiver. Never place unbounded text in argv (E2BIG).
+            if(sendText!=null) args.addAll(listOf("--text","-")) else {
                 args.add("--");val paths=c.getJSONArray("paths")
                 for(i in 0 until paths.length())args.add(paths.getString(i))
             }
@@ -315,7 +350,13 @@ class TransferService : Service() {
         val builder=ProcessBuilder(command).directory(output)
         builder.environment().putAll(mapOf("CROC_SECRET" to code,"HOME" to filesDir.absolutePath,"TMPDIR" to cacheDir.absolutePath,"DATABEAM_CROC_PROGRESS" to "1","CROC_NO_UPDATE_CHECK" to "1"))
         if(action=="send" && c.optBoolean("referencedSources"))builder.environment()["DATABEAM_ANDROID_SOURCE_ROOT"]=c.getString("sourceRoot")
-        val p=builder.start();process=p;if(stopping.get())p.destroy();p.outputStream.close()
+        val p=builder.start();process=p;if(stopping.get())p.destroy()
+        val writeFailure=java.util.concurrent.atomic.AtomicReference<Exception?>()
+        val writer=if(sendText!=null)Thread{
+            try{p.outputStream.use{it.write(sendText.toByteArray(Charsets.UTF_8))}}
+            catch(error:Exception){if(!stopping.get())writeFailure.compareAndSet(null,error)}
+        }.apply{start()} else null
+        if(writer==null)p.outputStream.close()
         val errors=StringBuffer()
         val payloadStarted=AtomicBoolean(false)
         fun observe(line:String) {
@@ -342,14 +383,25 @@ class TransferService : Service() {
             catch(error:Exception){if(!stopping.get()){readFailure.compareAndSet(null,error);p.destroy()}}
         }.apply{start()}
         val result=StringBuilder()
-        try{p.inputStream.bufferedReader().useLines{lines->lines.forEach{
-            if(it.startsWith("DATABEAM_CHILD_PID=")){crocPid=it.substringAfter('=').toInt();return@forEach}
-            if(result.length+it.length<2*1024*1024)result.append(it).append('\n')
-            observe(it)
-        }}}
+        try{p.inputStream.bufferedReader(Charsets.UTF_8).use{reader->
+            val first=reader.readLine()
+            if(first?.startsWith("DATABEAM_CHILD_PID=")==true)crocPid=first.substringAfter('=').toInt()
+            else if(first!=null)error("Croc did not report its process ID")
+            // stdout after the wrapper's PID line is the exact received text.
+            // Do not normalize line endings, append newlines or parse user text
+            // as progress/error events. Croc telemetry is read from stderr.
+            val buffer=CharArray(8192)
+            while(true){val count=reader.read(buffer);if(count<0)break
+                check(result.length+count<=8*1024*1024){"Text exceeds the display limit. Send it as a text file instead."}
+                result.append(buffer,0,count)
+            }
+        }}
         catch(error:Exception){if(!stopping.get())readFailure.compareAndSet(null,error);p.destroy()}
-        val exit=try{p.waitFor()}finally{err.join();process=null;crocPid=null}
+        val exit=try{p.waitFor()}finally{err.join();writer?.join();process=null;crocPid=null}
         check(!stopping.get()){"Stopped"}
+        // Croc prints its terminal error to stdout. Successful stdout is
+        // payload text; inspect it as an error only after a failed exit.
+        if(exit!=0)synchronized(errors){errors.append('\n').append(result.takeLast(16000))}
         readFailure.get()?.let{throw IllegalStateException("Could not read Croc transfer status: ${it.message}",it)}
         if(exit!=0 && allowRecovery && c.optString("relay").isEmpty() && !payloadStarted.get() && !stopping.get() && RelayRecovery.transportError(errors.toString())) {
             synchronized(this){state.put("relayNotice","Auto troubleshooting Croc public relays…").put("troubleshooting",true)}
@@ -376,6 +428,7 @@ class TransferService : Service() {
             return crocAttempt(c,action,text,false)
         }
         require(exit==0){RelayRecovery.failureMessage(errors.toString(),exit)}
+        writeFailure.get()?.let{throw IllegalStateException("Could not send all text: ${it.message}",it)}
         synchronized(this){state.put("output",output.absolutePath)}
         return result.toString()
     }

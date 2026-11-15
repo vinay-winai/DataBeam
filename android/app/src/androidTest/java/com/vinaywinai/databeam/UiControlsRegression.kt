@@ -75,6 +75,11 @@ object UiControlsRegression {
                 check(find(root){it.contentDescription=="DataBeam logo"}!=null){"Arrow branding missing"}
             }
             screenshot("ui-controls-files.png")
+            main{
+                check(find(activity!!.window.decorView){it is Button && it.text=="Clear all"}!!.performClick())
+                check((field("sources") as List<*>).isEmpty())
+                runner.callActivityOnNewIntent(activity,Intent(Intent.ACTION_SEND_MULTIPLE).setType("text/plain").putParcelableArrayListExtra(Intent.EXTRA_STREAM,arrayListOf(first,second)))
+            }
             main {
                 check(find(activity!!.window.decorView){it.contentDescription=="Remove $firstName"}!!.performClick())
                 check((field("sources") as List<*>).size==1)
@@ -151,14 +156,20 @@ object UiControlsRegression {
             check(fileSession.optJSONArray("paths")?.length()==1 && fileSession.optInt("referencedFiles")==1 && fileSession.optInt("copiedFiles")==0){"Seekable file was not referenced"}
             main{(field("pause") as Button).performClick()}
             waitFor{it.optString("status")=="stopped" && it.optString("id")==fileSession.optString("id")}
-            main{(field("restartSharing") as Button).performClick()}
+            main{
+                check((field("restartSharing") as View).visibility==View.GONE){"File restart must require fresh picker access"}
+                check((field("sources") as List<*>).isEmpty())
+                check((field("detail") as TextView).text.contains("reselect the exact same files"))
+                runner.callActivityOnNewIntent(activity,Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_STREAM,first))
+                (field("primary") as Button).performClick()
+            }
             val fileRestart=waitFor{it.optString("status")=="running" && it.optString("phase")=="Waiting for receiver" && it.optString("id")!=fileSession.optString("id")}
             sessions.add(fileRestart.getString("id"))
             check(fileRestart.optInt("referencedFiles")==1 && fileRestart.optInt("copiedFiles")==0){"Restart did not reopen the original URI"}
             check(fileRestart.getJSONArray("paths").toString()!=fileSession.getJSONArray("paths").toString()){"Restart reused closed descriptor aliases"}
             main{(field("pause") as Button).performClick()}
             waitFor{it.optString("status")=="stopped" && it.optString("id")==fileRestart.optString("id")}
-            result.putString("result","PASS selection names/removal/add-folder, Files/Text isolation, version/logo, real transfer input/settings lock, three-word codes, ongoing notification progress, text restart and original-URI file restart without a staging copy")
+            result.putString("result","PASS selection names/removal/add-folder, Files/Text isolation, version/logo, real transfer input/settings lock, three-word codes, ongoing notification progress, text retry and reselected-file new transfer without a staging copy")
         }catch(error:Throwable){code=1;result.putString("error",error.stackTraceToString())}
         finally {
             if(TransferService.state(c).optString("id") in sessions && TransferService.state(c).optString("status") in listOf("running","stopping")){

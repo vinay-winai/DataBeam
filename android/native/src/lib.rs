@@ -22,10 +22,50 @@ static ANDROID_DNS_CONTEXT: OnceLock<jni22::refs::Global<jni22::objects::JObject
 static ANDROID_DNS_INIT: std::sync::Once = std::sync::Once::new();
 fn event(kind: &str, payload: &str) {
     let mut q = EVENTS.get_or_init(Default::default).lock().unwrap();
-    if q.len() >= 256 {
-        q.remove(0);
+    queue_event(&mut q, kind, payload);
+}
+fn queue_event(q: &mut Vec<Value>, kind: &str, payload: &str) {
+    if matches!(kind, "receive-progress" | "transfer-progress" | "preparation-progress") {
+        let samples: Vec<_> = q.iter().enumerate().filter(|(_, e)| e["kind"] == kind).map(|(i, _)| i).collect();
+        if let Some(&last) = samples.last() {
+            let previous = q[last]["payload"].as_str().unwrap_or("");
+            if previous.split(':').next() == payload.split(':').next() {
+                q[last]["payload"] = json!(payload);
+                return;
+            }
+            // Keep the baseline, first advancing sample (first-byte timing),
+            // and latest sample. Coalesce later samples without reordering any
+            // route changes or completion events relative to the latest one.
+            if samples.len() >= 3 { q.remove(last); }
+        }
     }
-    q.push(json!({"kind":kind,"payload":payload}));
+    if q.len() >= 256 {
+        // Progress/log bursts must not evict a route change or completion before
+        // Android's next poll. These samples can be superseded safely.
+        let discard = q.iter().position(|e| {
+            matches!(e["kind"].as_str(), Some("log" | "receive-progress" | "transfer-progress" | "preparation-progress" | "send-paths" | "receive-paths"))
+        }).unwrap_or(0);
+        q.remove(discard);
+    }
+    let at_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+    q.push(json!({"kind":kind,"payload":payload,"atMs":at_ms}));
+}
+#[cfg(test)]
+mod event_queue_tests {
+    #[test]
+    fn progress_burst_retains_path_switch_and_completion() {
+        let mut q = Vec::new();
+        super::queue_event(&mut q, "receive-route", "relay");
+        super::queue_event(&mut q, "receive-route", "direct");
+        super::queue_event(&mut q, "transfer-completed", "");
+        for n in 0..1000 { super::queue_event(&mut q, "receive-progress", &format!("{n}:1000:0")); }
+        assert!(q.len() <= 256);
+        let samples: Vec<_> = q.iter().filter(|e| e["kind"] == "receive-progress").map(|e| e["payload"].as_str().unwrap()).collect();
+        assert_eq!(samples, ["0:1000:0", "1:1000:0", "999:1000:0"]);
+        let routes: Vec<_> = q.iter().filter(|e| e["kind"] == "receive-route").map(|e| e["payload"].as_str().unwrap()).collect();
+        assert_eq!(routes, ["relay", "direct"]);
+        assert!(q.iter().any(|e| e["kind"] == "transfer-completed"));
+    }
 }
 struct Emitter;
 #[no_mangle]
