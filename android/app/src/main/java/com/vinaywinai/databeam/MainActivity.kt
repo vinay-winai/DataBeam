@@ -525,7 +525,7 @@ class MainActivity:ComponentActivity() {
         val progress=if(total>0 || s.optInt("filesTotal")>0)"$percent% · ${ProgressEvents.size(done)} of ${ProgressEvents.size(total)}" else if(s.has("percent"))"$percent% · ${s.optString("progress")}" else s.optString("progress")
         val rate=if(running && speed>0)"${ProgressEvents.size(speed.toLong())}/s"+ (ProgressEvents.eta(done,total,speed)?.let{" · $it left"} ?: "") else ""
         val files=if(s.optInt("filesTotal")>0)"${s.optInt("filesDone")} / ${s.optInt("filesTotal")} files" else ""
-        detail.text=listOf(TransferLabels.message(s),progress,files,rate).filter{it.isNotEmpty()}.joinToString("\n")
+        detail.text=listOf(TransferLabels.message(s),progress,files,rate,TransferTiming.elapsedText(s),TransferTiming.averageText(s)).filter{it.isNotEmpty()}.joinToString("\n")
         bar.isIndeterminate=running && total==0L && !s.has("percent") && s.optInt("filesTotal")==0
         bar.progress=percent
         bar.visibility=if(running || (paused && receiving) || stopping)View.VISIBLE else View.GONE

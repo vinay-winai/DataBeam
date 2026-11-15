@@ -161,3 +161,14 @@ An earlier 8 MiB EasySendMe phone upload exceeded the 190-second test deadline w
 Installed APK: 31,586,204 bytes, SHA-256 `574ab76c86ca2d469289eabd1701031db4ee0b0d32ba6fd0ca73b7ef9334db2a`. Croc remains 11.5.5. Remote sender restart remains deferred, and the user-excluded overnight/network-switching/additional-device checks remain excluded.
 
 Final device storage and UI-controls regressions passed again, including existing-file protection, idempotent publication, selection controls, configuration locking and ongoing notification progress. APK v2 signature and 16 KiB alignment passed; the installed package hash matched the local APK. The instrumentation package was removed, previous settings/transfer preferences matched their host backup byte-for-byte, no ADB reverse mappings remained, and DataBeam was reopened without a generated active transfer.
+
+## Elapsed time and completion average — 2026-11-15
+
+- Transfer cards and ongoing notifications show elapsed active time. Preparation/waiting/saving count toward elapsed time; pauses and app downtime do not. Completed/stopped durations freeze. Only accumulated durations are persisted, so reboot/process downtime cannot be mistaken for active work.
+- Completion average uses reported newly transferred payload bytes over active payload-through-saving time. Cached starting offsets are excluded. Fully cached exports have no download average. A native sender's latest completed average stays frozen while it waits for another receiver; a new payload starts a new average. Aggregate averages are hidden for concurrent native receiver connections because current progress follows the latest receiver.
+- Six deterministic timing tests cover preparation, pause/resume, process recreation, cached exports, sender idle periods, repeated final counters and duration formatting. The full JVM suite passed 29 tests with no failures; APK/test APK builds and lint passed.
+- Ten on-device Sendme/EasySendMe receive-cache checks passed with assertions for the displayed elapsed time/average and original saved-file SHA-256. Fully cached offline saves correctly counted zero transferred bytes and displayed no download average.
+- Croc, Sendme and EasySendMe sender stop/restart transfers passed displayed elapsed/average upload assertions and desktop receiver SHA-256 checks. Android Croc app-close/reconnect also passed displayed completion timing and automatic Downloads SHA-256.
+- The device UI-controls test verified elapsed text in the ongoing notification. The final full suite also exposed and fixed a pre-existing flaky test: the EFF dictionary word `yo-yo` is one word, so counting hyphen separators cannot validate a three-word generated phrase. The production dictionary and code generator were unchanged.
+
+Timing APK SHA-256: `7547550a550376191b1404f04b1a459a62ed2ec32cf972805bd1a3928360d744` (31,586,204 bytes). Earlier APK hashes above identify their respective historical builds.

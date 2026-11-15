@@ -5,6 +5,8 @@ import org.junit.Before
 
 class RelayRecoveryTest {
     private lateinit var words:Set<String>
+    private fun isPhrase(value:String,count:Int=3):Boolean=if(count==1)value in words else
+        value.indices.any{index->value[index]=='-' && value.take(index) in words && isPhrase(value.substring(index+1),count-1)}
     @Before fun loadDesktopWords() {
         val text=javaClass.getResourceAsStream("/eff-short-wordlist-1.txt")!!.bufferedReader().use{it.readText()}
         words=text.lineSequence().filter{it.isNotBlank()}.toSet()
@@ -13,9 +15,8 @@ class RelayRecoveryTest {
     @Test fun generatedCodesUseThreeWordsFromTheDesktopDictionary() {
         assertEquals(1296,words.size)
         repeat(100){
-            val parts=RelayRecovery.newCode().split('-')
-            assertEquals(3,parts.size)
-            assertTrue(parts.all{it in words})
+            val code=RelayRecovery.newCode()
+            assertTrue(code,isPhrase(code))
         }
     }
     @Test fun replacementConnectsPeersToTheChosenReachableRelay() {
@@ -23,9 +24,13 @@ class RelayRecoveryTest {
             val code=RelayRecovery.replacement("my-custom-code",endpoint)
             assertNotEquals("my-custom-code",code)
             assertEquals(endpoint,RelayRecovery.relay(code))
-            assertEquals(3,code.split('-').size)
-            assertTrue(code.split('-').all{it in words})
+            assertTrue(code,isPhrase(code))
         }
+    }
+    @Test fun hyphenatedDictionaryWordsStillCountAsOneWord(){
+        assertTrue("yo-yo" in words)
+        assertTrue(isPhrase("yo-yo-${words.first()}-${words.last()}"))
+        assertFalse(isPhrase("yo-yo-${words.first()}"))
     }
     @Test fun probesReturnOnlyReachableRelaysAndHandleExceptions() {
         val result=RelayRecovery.healthy(stopped={false},connect={endpoint->

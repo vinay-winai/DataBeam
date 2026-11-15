@@ -46,6 +46,7 @@ class TransferService : Service() {
     private var state = JSONObject()
     private var job: Thread? = null
     private var lastProgressNotice=0L
+    private var timing=TransferTiming()
     private val poll = object : Runnable {
         override fun run() {
             runCatching {
@@ -57,13 +58,14 @@ class TransferService : Service() {
                     if(kind=="send-route")synchronized(this@TransferService){
                         val event=JSONObject(payload);val routes=state.optJSONObject("senderRoutes") ?: JSONObject()
                         if(event.optString("route")=="closed")routes.remove(event.getString("connection")) else routes.put(event.getString("connection"),event.getString("route"))
+                        if(routes.length()>1)state.put("timingConcurrent",true)
                         state.put("senderRoutes",routes)
                     }
                     if(kind=="ticket") synchronized(this@TransferService) { state.put("ticket",payload) }
                     if(kind in listOf("receive-progress","transfer-progress","preparation-progress")) {
                         ProgressEvents.native(payload)?.let{sample->synchronized(this@TransferService) {
                             if(kind=="preparation-progress")state.put("preparing",true).put("prepDone",sample.done).put("prepTotal",sample.total).put("prepSpeed",sample.speed).put("phase","Preparing files")
-                            else {if(!state.has("firstPayloadDone"))state.put("firstPayloadDone",sample.done);state.put("preparing",false).put("done",sample.done).put("total",sample.total).put("speed",sample.speed).put("phase","Transferring")}
+                            else {timing.progress(sample.done,SystemClock.elapsedRealtime());timing.save(state);if(!state.has("firstPayloadDone"))state.put("firstPayloadDone",sample.done);state.put("preparing",false).put("done",sample.done).put("total",sample.total).put("speed",sample.speed).put("phase","Transferring")}
                             state.put("progress","")
                         }}
                     }
@@ -76,10 +78,12 @@ class TransferService : Service() {
                     if(kind=="receive-export-started")synchronized(this@TransferService){state.put("preparing",false).put("phase","Verifying and saving").put("speed",0)}
                     if(kind=="receive-started")synchronized(this@TransferService){state.put("phase","Connecting").put("message","")}
                     if(kind=="receive-progress")synchronized(this@TransferService){state.put("message","")}
+                    if(kind=="transfer-started")synchronized(this@TransferService){timing.beginPayload(SystemClock.elapsedRealtime());timing.save(state)}
+                    if(kind=="transfer-completed")synchronized(this@TransferService){timing.finishPayload(SystemClock.elapsedRealtime());timing.save(state)}
                     log("$kind $payload")
                 }
                 val now=SystemClock.elapsedRealtime()
-                if(busy.get() && now-lastProgressNotice>=1000){lastProgressNotice=now;getSystemService(NotificationManager::class.java).notify(1,notification(""))}
+                if(busy.get() && now-lastProgressNotice>=1000){lastProgressNotice=now;synchronized(this@TransferService){timing.checkpoint(now);timing.save(state);persist()};getSystemService(NotificationManager::class.java).notify(1,notification(""))}
             }
             if(busy.get()) main.postDelayed(this,300)
         }
@@ -92,11 +96,11 @@ class TransferService : Service() {
         }
         if(intent?.action=="resume" && state.optString("status")=="paused" && process!=null && crocPid!=null) {
             android.system.Os.kill(crocPid!!,android.system.OsConstants.SIGCONT)
-            synchronized(this){state.put("connectionRetained",false)};update("running","Continuing transfer…");return START_NOT_STICKY
+            synchronized(this){timing.resume(SystemClock.elapsedRealtime());timing.save(state);state.put("connectionRetained",false)};update("running","Continuing transfer…");return START_NOT_STICKY
         }
         if(intent?.action=="pause" && state.optString("action")=="receive" && state.optString("mode")=="Croc" && process!=null && crocPid!=null) {
             android.system.Os.kill(crocPid!!,android.system.OsConstants.SIGSTOP)
-            synchronized(this){state.put("connectionRetained",true)};update("paused","Paused · connection retained");return START_NOT_STICKY
+            synchronized(this){timing.pause(SystemClock.elapsedRealtime());timing.save(state);state.put("connectionRetained",true)};update("paused","Paused · connection retained");return START_NOT_STICKY
         }
         if(intent?.action in listOf("stop","pause")) {
             if(!busy.get()){stopSelf();return START_NOT_STICKY}
@@ -111,8 +115,10 @@ class TransferService : Service() {
         backgroundTimedOut=false
         NativeBridge.prepare()
         state=JSONObject(intent?.getStringExtra("config") ?: "{}")
+        timing=TransferTiming(state.optJSONObject("timing")).apply{resume(SystemClock.elapsedRealtime());save(state)}
         if(!state.has("saveFolder"))state.put("saveFolder",AppSettings.folder(this)).put("saveFolderLabel",AppSettings.folderLabel(this))
         state.remove("route");state.remove("senderRoutes")
+        state.remove("timingConcurrent")
         state.put("preparing",false).put("speed",0).put("prepSpeed",0)
         state.remove("firstPayloadDone")
         if(state.optString("mode")=="Croc"){for(key in listOf("overallProgress","done","total","filesDone","filesTotal"))state.remove(key)}
@@ -194,7 +200,10 @@ class TransferService : Service() {
                 terminalMessage=if(backgroundTimedOut)"Android reached its background transfer time limit." else if(stopping.get()) if(state.optString("action")=="send")"Sharing ended" else "Paused · received data retained" else (e.message ?: e.javaClass.simpleName)
             } finally {
                 main.post {
+                    // Drain final JNI counters before freezing the completion summary.
+                    poll.run()
                     main.removeCallbacks(poll)
+                    synchronized(this){if(terminal=="complete")timing.finishPayload(SystemClock.elapsedRealtime());timing.pause(SystemClock.elapsedRealtime());timing.save(state)}
                     wake?.let { if(it.isHeld) it.release() };multicast?.let{if(it.isHeld)it.release()}
                     update(terminal,terminalMessage)
                     busy.set(false)
@@ -288,7 +297,7 @@ class TransferService : Service() {
                     event.preparation?.let{sample->state.put("preparing",true).put("phase","Preparing files").put("prepDone",sample.done).put("prepTotal",sample.total).put("prepSpeed",sample.speed)}
                     event.speed?.let{if(!state.optBoolean("overallProgress"))state.put("speed",it)}
                     if(event.verifying)state.put("preparing",false).put("phase","Verifying files").put("speed",0)
-                    event.transfer?.let{sample->if(!state.has("firstPayloadDone"))state.put("firstPayloadDone",sample.done);state.put("overallProgress",true).put("preparing",false).put("phase","Transferring").put("done",sample.done).put("total",sample.total).put("speed",sample.speed).put("filesDone",event.filesDone).put("filesTotal",event.filesTotal).put("progress","")}
+                    event.transfer?.let{sample->timing.progress(sample.done,SystemClock.elapsedRealtime());timing.save(state);if(!state.has("firstPayloadDone"))state.put("firstPayloadDone",sample.done);state.put("overallProgress",true).put("preparing",false).put("phase","Transferring").put("done",sample.done).put("total",sample.total).put("speed",sample.speed).put("filesDone",event.filesDone).put("filesTotal",event.filesTotal).put("progress","")}
                     if(event.prepared){state.put("preparing",false).put("phase","Waiting for receiver").put("speed",0);state.remove("percent");state.put("progress","")}
                 };persist();return
             }
@@ -360,10 +369,11 @@ class TransferService : Service() {
         val percentage=if(total>0 || snapshot.optInt("filesTotal")>0)ProgressEvents.percent(done,total,snapshot.optInt("filesDone"),snapshot.optInt("filesTotal")) else snapshot.optInt("percent")
         val phase=TransferLabels.title(snapshot)
         val speed=snapshot.optDouble(if(preparing)"prepSpeed" else "speed").takeIf{it.isFinite() && it>0} ?: 0.0
-        val content=if(message.isNotEmpty())TransferLabels.message(snapshot).ifEmpty{phase} else listOf(phase,
+        val summary=if(message.isNotEmpty())TransferLabels.message(snapshot).ifEmpty{phase} else listOf(phase,
             if(total>0)"$percentage% · ${ProgressEvents.size(done)} / ${ProgressEvents.size(total)}" else if(snapshot.has("percent"))"$percentage%" else "",
             if(snapshot.optInt("filesTotal")>0)"${snapshot.optInt("filesDone")} / ${snapshot.optInt("filesTotal")} files" else "",
             if(speed>0 && snapshot.optString("status")=="running")"${ProgressEvents.size(speed.toLong())}/s"+(ProgressEvents.eta(done,total,speed)?.let{" · $it left"} ?: "") else "").filter{it.isNotEmpty()}.joinToString(" · ")
+        val content=listOf(summary,TransferTiming.elapsedText(snapshot),TransferTiming.averageText(snapshot)).filter{it.isNotEmpty()}.joinToString(" · ")
         return Notification.Builder(this,CHANNEL).setSmallIcon(com.vinaywinai.databeam.R.drawable.ic_databeam).setContentTitle("DataBeam")
             .setSubText("${snapshot.optString("mode")} · ${if(snapshot.optString("action")=="receive")"Receive" else "Send"}")
             .setContentText(content).setStyle(Notification.BigTextStyle().bigText(content))

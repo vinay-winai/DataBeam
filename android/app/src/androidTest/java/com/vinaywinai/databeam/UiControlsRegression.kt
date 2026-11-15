@@ -88,7 +88,9 @@ object UiControlsRegression {
             val firstSession=waitFor{it.optString("status")=="running" && it.optString("phase")=="Waiting for receiver" && it.optString("text")==text}
             sessions.add(firstSession.getString("id"))
             val words=c.assets.open("eff-short-wordlist-1.txt").bufferedReader().use{it.readLines().toSet()}
-            check(firstSession.optString("code").split('-').let{it.size==3 && it.all{word->word in words}}){"Generated code did not use the desktop word list"}
+            fun phrase(value:String,count:Int):Boolean=if(count==1)value in words else
+                value.indices.any{index->value[index]=='-' && value.take(index) in words && phrase(value.substring(index+1),count-1)}
+            check(phrase(firstSession.optString("code"),3)){"Generated code did not use the desktop word list"}
             main {
                 check(!(field("mode") as View).isEnabled)
                 check(!(field("message") as View).isEnabled)
@@ -103,6 +105,7 @@ object UiControlsRegression {
             val notification=c.getSystemService(NotificationManager::class.java).activeNotifications.firstOrNull{it.id==1}?.notification ?: error("Active transfer notification missing")
             check(notification.extras.getInt(Notification.EXTRA_PROGRESS_MAX)==100){"Notification progress bar missing"}
             check(notification.flags and Notification.FLAG_ONGOING_EVENT!=0){"Transfer notification was not ongoing"}
+            check(notification.extras.getCharSequence(Notification.EXTRA_TEXT)?.contains("Elapsed")==true){"Notification elapsed time missing"}
             screenshot("ui-controls-active.png")
             main{(field("pause") as Button).performClick()}
             waitFor{it.optString("status")=="stopped" && it.optString("id")==firstSession.optString("id")}

@@ -114,6 +114,18 @@ class SmokeInstrumentation:Instrumentation(){
     val ticket=s.optString("ticket")
     if(ticket.isNotEmpty() && ticket!=last){last=ticket;sendStatus(1,Bundle().apply{putString("ticket",ticket)})}
     if(s.optString("status") in listOf("complete","interrupted")) {
+     if(s.optString("status")=="complete") {
+        val timing=s.getJSONObject("timing")
+        check(timing.getLong("elapsedMs")>0){"Elapsed time missing"}
+        if(timing.optLong("bytes")>0)check(TransferTiming.average(s)?.let{it.isFinite() && it>0}==true){"Completion average missing"}
+        else check(TransferTiming.average(s)==null){"Cached data inflated the average"}
+        runOnMainSync {
+            MainActivity::class.java.getDeclaredMethod("render").apply{isAccessible=true}.invoke(activity)
+            val detail=MainActivity::class.java.getDeclaredField("detail").apply{isAccessible=true}.get(activity) as android.widget.TextView
+            check(detail.text.contains("Elapsed")){"Elapsed time not displayed"}
+            if(timing.optLong("bytes")>0)check(detail.text.contains("Avg download")){"Average speed not displayed"}
+        }
+     }
      if(config.optBoolean("requireCachePrompt"))check(cachePrompts>0){"Saved-data prompt was not shown and clicked"}
      if(config.optBoolean("pauseTest")){check(didPause){"Transfer finished before test pause"};check(resumedFrom>0){"Resume downloaded from zero: $resumedFrom"}}
      if(config.optBoolean("requireCachedResume"))check(resumedFrom>0){"Restart did not reuse cached data: $resumedFrom"}

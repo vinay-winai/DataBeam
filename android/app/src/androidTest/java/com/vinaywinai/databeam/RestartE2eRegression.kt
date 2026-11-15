@@ -165,7 +165,17 @@ object RestartE2eRegression {
                         "finish"->{
                             check(command.optBoolean("verified")){"Host did not verify the received payload"}
                             if(record.getString("mode")=="Croc")waitFor{it.optString("status")=="complete"}
-                            else{check(TransferService.state(c).optString("status")=="running"){TransferService.state(c).optString("message")};stop()}
+                            else{waitFor{it.optJSONObject("timing")?.optBoolean("complete")==true};check(TransferService.state(c).optString("status")=="running"){TransferService.state(c).optString("message")};stop()}
+                            if(record.getString("kind")!="text") {
+                                val done=TransferService.state(c)
+                                check(done.getJSONObject("timing").getLong("elapsedMs")>0){"Sender elapsed time missing"}
+                                check(TransferTiming.average(done)?.let{it.isFinite() && it>0}==true){"Sender average missing"}
+                                main{
+                                    MainActivity::class.java.getDeclaredMethod("render").apply{isAccessible=true}.invoke(activity)
+                                    val shown=(field("detail") as TextView).text
+                                    check(shown.contains("Elapsed") && shown.contains("Avg upload")){"Sender timing summary not displayed"}
+                                }
+                            }
                             record.put("verified",true);emit("passed",TransferService.state(c));outcome=0;break
                         }
                         "abort"->error("Host aborted the test")
