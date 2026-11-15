@@ -38,12 +38,15 @@ class TransferTimingTest {
     @Test fun senderWaitDoesNotDiluteCompletedAverageAndNextReceiverStartsFresh(){
         val state=JSONObject().put("action","send");val time=TransferTiming();time.resume(0);time.progress(0,1000);time.progress(2000,2000);time.finishPayload(2000)
         time.checkpoint(12000);time.save(state);assertEquals(2000.0,TransferTiming.average(state)!!,0.001)
+        assertEquals("Elapsed 0:02",TransferTiming.elapsedText(state))
+        time.finishPayload(12000);time.save(state);assertEquals("Elapsed 0:02",TransferTiming.elapsedText(state))
         time.progress(2000,12000);time.save(state);assertEquals(2000.0,TransferTiming.average(state)!!,0.001)
         time.beginPayload(12000);time.progress(1000,12000);time.progress(3000,14000);time.finishPayload(14000);time.save(state)
-        assertEquals(1000.0,TransferTiming.average(state)!!,0.001);assertEquals("Elapsed 0:14",TransferTiming.elapsedText(state))
+        assertEquals(1000.0,TransferTiming.average(state)!!,0.001);assertEquals("Elapsed 0:02",TransferTiming.elapsedText(state))
     }
     @Test fun formattingSupportsHoursAndLegacySessions(){
         assertEquals("1:01:05",TransferTiming.duration(3665000));assertEquals("0:00",TransferTiming.duration(-1))
         assertEquals("",TransferTiming.elapsedText(JSONObject()));assertNull(TransferTiming.average(JSONObject()))
+        assertEquals("",TransferTiming.elapsedText(JSONObject().put("action","send").put("timing",JSONObject().put("complete",true).put("elapsedMs",999999))))
     }
 }

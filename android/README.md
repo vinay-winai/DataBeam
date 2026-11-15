@@ -2,6 +2,8 @@
 
 Native Android alpha, isolated from the desktop application. Open this directory in Android Studio.
 
+Transfer behavior and required regression coverage are maintained in [TRANSFER_RULES.md](TRANSFER_RULES.md).
+
 ## Build on this PC
 
 Android Studio: `X:/as`, SDK: `X:/asproj`. `local.properties` is local and ignored.
@@ -31,7 +33,7 @@ Requires Rust with `aarch64-linux-android`, Go (the recipe selects its toolchain
 - Fresh CameraX + bundled ML Kit receiver scanner (full portrait camera frames, rotation/lifecycle handling, tap focus, pinch zoom and torch). Sender QR generation for codes/tickets, with stale QR dialogs closed on relay recovery. Receiver camera scanning is embedded in the app and fills the code field without automatically starting a transfer; camera permission is requested when scanning.
 - Native system file and folder pickers, “Send with DataBeam” in Android’s share sheet and selected-text menu, background source preparation, and automatic publication to Downloads/DataBeam after receipt. Sharing files keeps attachments rather than treating their captions as transfer text. Croc keeps its existing file layout; no extra DataBeam wrapper is added.
 - Ongoing foreground transfer notification with phase, progress and live rate, Stop and tap-to-return. It is removed after completion/stop. Preparation and payload progress are separate; all modes show selection-wide byte totals and ETA when known. Croc includes completed-file counts and explicit verification reporting. Cooperative Sendme cancellation retains partial caches; the wake lock is bounded to six hours.
-- Elapsed time appears in the transfer card and ongoing notification. It includes active preparation/waiting/saving, excludes pauses and app downtime, and freezes when stopped/completed. Completion average uses newly transferred payload bytes and active payload-through-saving time; cached bytes do not inflate it. Fully cached exports show no download average. A native sender retains its latest completed average while waiting for another receiver; concurrent-receiver aggregate averages are omitted because the existing counters follow the latest receiver.
+- Elapsed time appears in the transfer card and ongoing notification. It includes active preparation/waiting/saving, excludes pauses and app downtime, and freezes when stopped/completed. Completion average uses newly transferred payload bytes and active payload-through-saving time; cached bytes do not inflate it. Fully cached exports show no download average. A native sender keeps its Sent heading, completed progress, elapsed time, average and last connection path while sharing stays open. A new receiver starts a fresh timing summary; concurrent-receiver aggregate averages are omitted because the existing counters follow the latest receiver.
 - Public Croc relay recovery: bounded background diagnostics, visible auto-troubleshooting status, sender replacement codes with a warning to reshare, and a Sendme fallback when no public relay is reachable. Receiver codes and explicit custom-relay settings are preserved; payloads are not automatically replayed.
 - Separate Send and Receive screens, engine descriptions, contextual sharing controls, and a single progress card.
 - Settings cog for advanced Croc relay configuration, a persistent download-folder picker, and manual Croc/Sendme public-relay checks. Croc checks TCP reachability of all four public endpoints; Sendme establishes an Iroh relay connection. These are checks from this device, not global service-health guarantees.

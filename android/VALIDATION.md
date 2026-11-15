@@ -207,3 +207,19 @@ At the user's request, DataBeam app data was reset before testing (3,045,110 KiB
 Installed APK: 31,587,675 bytes, SHA-256 `49e1f5a85a356c1563c96fdb58af9384cc9c37f80f17786282c1d8f976b0f4a8`.
 
 Measured DashBeam 0.7.1 storage and source-inspected FlCroc/croc-app/iOS comparisons are in [the source-access investigation](../investigations/android-source-references.md). Iroh issue #4555 and proposed fix #4645 were rechecked on November 15: both remain open, the PR is unmerged, and the latest published Iroh is still 1.4.1. The existing documentation-only decision stands. Overnight Doze, network switching and additional devices remain explicitly excluded.
+
+## Android completed sender presentation — 2026-11-15
+
+The user's phone-to-PC EasySendMe transfer had completed, but Android still displayed Waiting for a receiver, an increasing elapsed value and no selected files after activity recreation. The native endpoint was deliberately still sharing. This Android-only change separates acknowledged payload completion from session availability; no desktop code or native transport behavior changed.
+
+- An acknowledged idle native sender now displays Sent, completed progress, a frozen elapsed/average and its last actual connection path. Its foreground notification also says Sent while the share remains open. A new receiver replaces the old path and begins a fresh timing summary when payload starts.
+- Ending sharing after completion preserves Sent and offers Share again. Recovery after app closure, including closure during stopping, preserves acknowledged completion; a transfer at 100% without acknowledgement remains interrupted.
+- Fresh activity creation restores the current sender's selected URIs/names or cached paths. This also repaired the user's existing two-item completed card without clearing app data.
+- Older completed cards lack a recorded finish-time snapshot and may lack the removed connection path. The UI omits unavailable values rather than presenting idle session time as elapsed transfer time or inventing a route.
+- [TRANSFER_RULES.md](TRANSFER_RULES.md) is now the maintained Android transfer-state tree/table, with links by name to the enforcing regression checks.
+
+Validation: 33 JVM tests passed; APK/test APK builds and lint passed (zero errors, 47 warnings). `SenderClosureRegression` passed isolated recovery checks for running/stopping/stopped/interrupted acknowledged senders and rejection of unacknowledged 100%. Croc stop/restart still passed its real PC-receiver checksum check. Sendme and EasySendMe real stop/restart transfers passed desktop SHA-256 verification plus assertions for the Sent heading, frozen elapsed after an idle delay, retained Direct/Relay route, ongoing Sent notification, exact restored selection count after closing/reopening the activity, and completed state after Stop sharing. The first heading assertion incorrectly compared Android's styled CharSequence directly with a String; it was corrected to compare text values, and both native cases passed on repeat.
+
+Artifacts are under `android/.tools/smoke/completed-sender-ui/`; final native cases are in `verified-e2e`. The user's real completed card and settings matched their host backups byte-for-byte after generated-fixture testing. Its two original selections and 700,692 completed bytes were retained. The instrumentation package was removed and the phone reopened on the repaired card. No new app-data reset was performed.
+
+Installed APK: 31,587,675 bytes, SHA-256 `ae24cc85513d36945023466fe78035ce6fd64d6ad26e39586ca42334fefbb96a`. Installed hash, v2 signature and 16 KiB alignment were verified.

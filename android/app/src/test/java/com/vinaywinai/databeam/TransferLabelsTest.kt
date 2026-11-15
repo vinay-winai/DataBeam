@@ -4,6 +4,18 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class TransferLabelsTest {
+    @Test fun acknowledgedSenderStaysSentWhileTheShareRemainsAvailable(){
+        val s=state("send","running","Waiting for receiver").put("timing",JSONObject().put("complete",true))
+        assertEquals("Sent",TransferLabels.title(s))
+        assertTrue(TransferLabels.message(s).contains("Files sent successfully"))
+        assertTrue(TransferLabels.message(s).contains("this receiver can reconnect"))
+        s.put("mode","Sendme")
+        assertTrue(TransferLabels.message(s).contains("another receiver"))
+        s.put("senderRoutes",JSONObject().put("next","direct"))
+        assertFalse(TransferLabels.sentAndSharing(s))
+        s.put("senderRoutes",JSONObject()).put("timing",JSONObject().put("complete",false)).put("done",100).put("total",100)
+        assertEquals("Waiting for a receiver",TransferLabels.title(s)) // Byte totals alone are not an acknowledgement.
+    }
     private fun state(action:String,status:String,phase:String="")=JSONObject().put("action",action).put("status",status).put("phase",phase).put("mode","EasySendMe")
     @Test fun closedWaitingSenderOffersRestartAndNeverResume(){
         val s=state("send","interrupted","Waiting for receiver").put("message","App restarted; saved data retained. Press Resume to reconnect.")

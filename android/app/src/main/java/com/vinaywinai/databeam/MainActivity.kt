@@ -208,6 +208,14 @@ class MainActivity:ComponentActivity() {
             layoutParams=LinearLayout.LayoutParams(dp(48),dp(48))
         }
         savedInstanceState?.getStringArrayList("sources")?.forEach{sources.add(Uri.parse(it))}
+        if((savedInstanceState==null || (sources.isEmpty() && current.optString("status") in listOf("running","stopping"))) && current.optString("action")=="send" && current.optString("id").isNotEmpty()){
+            val uris=current.optJSONArray("uris");val paths=current.optJSONArray("paths")
+            if(uris!=null && uris.length()>0)for(i in 0 until uris.length()){
+                val uri=Uri.parse(uris.getString(i));sources.add(uri)
+                if(paths?.length()==uris.length())restartedNames[uri]=File(paths.getString(i)).name
+            } else if(paths!=null)for(i in 0 until paths.length())sources.add(Uri.fromFile(File(paths.getString(i))))
+            if(current.optString("mode")=="Croc" && current.optString("text").isNotEmpty()){sendKind="text";message.setText(current.getString("text"))}
+        }
         mode.onItemSelectedListener=object:AdapterView.OnItemSelectedListener{
             override fun onNothingSelected(p:AdapterView<*>?){}
             override fun onItemSelected(p:AdapterView<*>?,v:View?,position:Int,id:Long){updatePanels()}
@@ -551,12 +559,13 @@ class MainActivity:ComponentActivity() {
         sendRecent.visibility=if(AppSettings.recent(this,mode.selectedItem.toString(),"send").isNotEmpty())View.VISIBLE else View.GONE
         receiveRecent.visibility=if(mode.selectedItem!="Sendme" && AppSettings.recent(this,mode.selectedItem.toString(),"receive").isNotEmpty())View.VISIBLE else View.GONE
         status.text=TransferLabels.title(s)
-        val paths=s.optJSONObject("senderRoutes")
+        val sentAndSharing=TransferLabels.sentAndSharing(s)
+        val paths=if(sentAndSharing || (!running && !stopping))s.optJSONObject("lastSenderRoutes") ?: s.optJSONObject("senderRoutes") else s.optJSONObject("senderRoutes")
         val pathValues=paths?.keys()?.asSequence()?.map{paths.optString(it)}?.toList() ?: emptyList()
         val activeRoute=if(s.optString("mode")!="Croc" && !receiving) {
             if(pathValues.isEmpty())"Waiting for receiver" else TransferRoute.label(pathValues)
         } else TransferRoute.label(listOf(s.optString("route","unknown")))
-        route.text="${if(!running && !stopping)"Connection used" else "Connection"} · $activeRoute";route.visibility=if(running || stopping || (activeRoute !in listOf("Waiting for receiver","Connecting…","Unknown") && (s.has("route") || pathValues.isNotEmpty())))View.VISIBLE else View.GONE
+        route.text="${if(sentAndSharing || (!running && !stopping))"Connection used" else "Connection"} · $activeRoute";route.visibility=if(running || stopping || (activeRoute !in listOf("Waiting for receiver","Connecting…","Unknown") && (s.has("route") || pathValues.isNotEmpty())))View.VISIBLE else View.GONE
         val preparing=s.optBoolean("preparing")
         val total=s.optLong(if(preparing)"prepTotal" else "total");val done=s.optLong(if(preparing)"prepDone" else "done")
         val speed=s.optDouble(if(preparing)"prepSpeed" else "speed").takeIf{it.isFinite() && it>=0} ?: 0.0

@@ -1,6 +1,17 @@
 package com.vinaywinai.databeam
 
 object TransferRoute {
+    fun senderEvent(state:org.json.JSONObject,connection:String,value:String){
+        val routes=state.optJSONObject("senderRoutes") ?: org.json.JSONObject()
+        if(value=="closed")routes.remove(connection) else {
+            if(routes.length()==0 && state.optJSONObject("timing")?.optBoolean("complete")==true)state.remove("lastSenderRoutes")
+            routes.put(connection,value)
+            val last=state.optJSONObject("lastSenderRoutes") ?: org.json.JSONObject()
+            last.put(connection,value);state.put("lastSenderRoutes",last)
+        }
+        if(routes.length()>1)state.put("timingConcurrent",true)
+        state.put("senderRoutes",routes)
+    }
     /** Croc's direction line describes the payload path; relay configuration does not. */
     fun croc(line:String):String? {
         val clean=line.replace(Regex("\u001B\\[[0-?]*[ -/]*[@-~]"),"").trim().lowercase()

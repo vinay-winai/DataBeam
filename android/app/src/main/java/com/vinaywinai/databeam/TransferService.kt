@@ -19,6 +19,10 @@ class TransferService : Service() {
             val wasBusy=busy.get()
             val prefs=c.getSharedPreferences("transfer",0)
             val saved=JSONObject(prefs.getString("state","{}")!!)
+            if(!wasBusy && !busy.get() && saved.optString("status") in listOf("running","stopping","stopped","interrupted") && TransferLabels.senderFinished(saved)){
+                saved.put("connectionRetained",false).put("status","complete").put("message","Files sent successfully. Sharing has ended. Tap Share again to start a new session.")
+                prefs.edit().putString("state",saved.toString()).commit();return saved
+            }
             if(!wasBusy && !busy.get() && (saved.optString("status") in listOf("running","stopping") || (saved.optString("status")=="paused" && saved.optBoolean("connectionRetained")))) {
                 saved.put("connectionRetained",false).put("status","interrupted").put("message",TransferLabels.interruptedMessage(saved))
                 prefs.edit().putString("state",saved.toString()).commit()
@@ -58,10 +62,7 @@ class TransferService : Service() {
                     val kind=e.getString("kind"); val payload=e.getString("payload")
                     if(kind=="receive-route")synchronized(this@TransferService){state.put("route",payload)}
                     if(kind=="send-route")synchronized(this@TransferService){
-                        val event=JSONObject(payload);val routes=state.optJSONObject("senderRoutes") ?: JSONObject()
-                        if(event.optString("route")=="closed")routes.remove(event.getString("connection")) else routes.put(event.getString("connection"),event.getString("route"))
-                        if(routes.length()>1)state.put("timingConcurrent",true)
-                        state.put("senderRoutes",routes)
+                        val event=JSONObject(payload);TransferRoute.senderEvent(state,event.getString("connection"),event.getString("route"))
                     }
                     if(kind=="ticket") synchronized(this@TransferService) { state.put("ticket",payload) }
                     if(kind in listOf("receive-progress","transfer-progress","preparation-progress")) {
@@ -204,6 +205,9 @@ class TransferService : Service() {
             } catch(e:Throwable) {
                 terminal=if(backgroundTimedOut)"interrupted" else if(stopping.get()) if(state.optString("action")=="send")"stopped" else "paused" else "interrupted"
                 terminalMessage=if(backgroundTimedOut)"Android reached its background transfer time limit." else if(stopping.get()) if(state.optString("action")=="send")"Sharing ended" else "Paused · received data retained" else (e.message ?: e.javaClass.simpleName)
+                if(terminal=="stopped" && synchronized(this){TransferLabels.senderFinished(state)}){
+                    terminal="complete";terminalMessage="Files sent successfully. Sharing has ended. Tap Share again to start a new session."
+                }
             } finally {
                 runCatching{outgoingSources?.close()};outgoingSources=null
                 runCatching{

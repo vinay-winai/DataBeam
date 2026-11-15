@@ -74,7 +74,7 @@ object RestartE2eRegression {
         fun stop(){
             val before=TransferService.state(c)
             main{(field("pause") as Button).performClick()}
-            waitFor{it.optString("id")==before.optString("id") && it.optString("status")=="stopped"}
+            waitFor{it.optString("id")==before.optString("id") && it.optString("status") in listOf("stopped","complete")}
             main{check((field("restartSharing") as View).visibility==View.VISIBLE)}
         }
         fun restart():JSONObject {
@@ -180,7 +180,27 @@ object RestartE2eRegression {
                         "finish"->{
                             check(command.optBoolean("verified")){"Host did not verify the received payload"}
                             if(record.getString("mode")=="Croc")waitFor{it.optString("status")=="complete"}
-                            else{waitFor{it.optJSONObject("timing")?.optBoolean("complete")==true};check(TransferService.state(c).optString("status")=="running"){TransferService.state(c).optString("message")};stop()}
+                            else{
+                                val sent=waitFor{TransferLabels.sentAndSharing(it)}
+                                val elapsed=TransferTiming.elapsedText(sent);Thread.sleep(1800)
+                                check(TransferTiming.elapsedText(TransferService.state(c))==elapsed){"Completed elapsed time kept counting idle sharing"}
+                                val notice=c.getSystemService(NotificationManager::class.java).activeNotifications.firstOrNull{it.id==1}?.notification ?: error("Sharing notification missing")
+                                check(notice.extras.getCharSequence(Notification.EXTRA_TEXT).toString().contains("Sent")){"Notification still reports waiting after completion"}
+                                main{activity?.finish()}
+                                activity=runner.startActivitySync(Intent(c,MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                                runner.waitForIdleSync()
+                                main{
+                                    MainActivity::class.java.getDeclaredMethod("render").apply{isAccessible=true}.invoke(activity)
+                                    val heading=(field("status") as TextView).text.toString()
+                                    check(heading=="Sent"){"Unexpected completed heading: $heading"}
+                                    val path=(field("route") as TextView).text.toString()
+                                    check(path.startsWith("Connection used") && (path.contains("Direct") || path.contains("Relay"))){"Last transfer path disappeared: $path"}
+                                    val count=record.getJSONArray("uris").length().takeIf{it>0} ?: record.getJSONArray("paths").length()
+                                    check((field("sources") as List<*>).size==count){"Reopened activity lost the shared file list"}
+                                }
+                                stop()
+                                check(TransferService.state(c).optString("status")=="complete"){"Ending successful sharing erased completion"}
+                            }
                             if(record.getString("kind")!="text") {
                                 val done=TransferService.state(c)
                                 check(done.getJSONObject("timing").getLong("elapsedMs")>0){"Sender elapsed time missing"}
