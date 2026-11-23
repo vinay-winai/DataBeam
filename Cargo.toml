@@ -26,7 +26,7 @@ zip = { version = "0.6", default-features = false, features = ["deflate"] }
 qrcode = "0.14"
 rand = "0.9"
 sha2 = "0.11"
-portable-pty = "0.8"
+portable-pty = "0.9"
 raw-window-handle = "0.6"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 sendme_native = { package = "sendme", path = "third_party/sendme", default-features = false }
