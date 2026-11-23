@@ -197,18 +197,27 @@ class MainActivity:ComponentActivity() {
             ?: current.optString("mode").takeIf{current.optString("status") in listOf("running","stopping") || current.optBoolean("connectionRetained")}
             ?: "Croc"
         val initialMode=savedMode.takeIf{it in AppSettings.modes(this)} ?: engines.first()
+        val enginePicker=row(engine).apply{gravity=Gravity.CENTER_VERTICAL}
         mode=Spinner(this).apply{
             adapter=ArrayAdapter(this@MainActivity,android.R.layout.simple_spinner_dropdown_item,engines)
-            engine.addView(this)
+            enginePicker.addView(this,LinearLayout.LayoutParams(0,-2,1f))
+        }
+        ImageButton(this).apply{
+            setImageResource(R.drawable.ic_info)
+            imageTintList=android.content.res.ColorStateList.valueOf(ink)
+            background=rounded(Color.rgb(28,28,28))
+            contentDescription="About transfer engines"
+            enginePicker.addView(this,LinearLayout.LayoutParams(dp(48),dp(48)))
+            setOnClickListener{showEngineInfo()}
         }
         mode.setSelection(engines.indexOf(if(initialMode=="EasySendMe")"Sendme" else initialMode))
         easyMode=CheckBox(this).apply{
-            text="EasySendMe · use a short code"
+            text="EasySendMe"
             isChecked=initialMode=="EasySendMe"
             setTextColor(ink)
             engine.addView(this)
         }
-        engineDescription=label(engine,"Short code · resumable transfer",12f).apply{setTextColor(Color.LTGRAY)}
+        engineDescription=label(engine,"",12f).apply{setTextColor(Color.LTGRAY)}
         sendPanel=card(layout)
         label(sendPanel,"1 · Choose what to send",17f)
         contentSwitch=row(sendPanel)
@@ -664,9 +673,9 @@ class MainActivity:ComponentActivity() {
         sendTab.background=rounded(if(tab=="send")accent else Color.rgb(28,28,28));sendTab.setTextColor(if(tab=="send")Color.BLACK else ink)
         receiveTab.background=rounded(if(tab=="receive")accent else Color.rgb(28,28,28));receiveTab.setTextColor(if(tab=="receive")Color.BLACK else ink)
         engineDescription.text=when(selected){
-            "Croc"->"Fast public relay · Resumable · Text and browser sharing"
-            "Sendme"->"Less reliance on relays · Resumable · Optional Broadcast"
-            else->"Short code · Less reliance on relays · Resumable"
+            "Croc"->"Fast public relay · Convenient"
+            "Sendme"->"Less reliance on relays · Broadcast"
+            else->"Share with a short code"
         }
         receiveInputTitle.text=if(selected=="Sendme")"1 · Enter the sender’s ticket" else "1 · Enter the sender’s code"
         code.hint=if(selected=="Sendme")"Paste a Sendme ticket" else "Paste a $selected code"
@@ -687,6 +696,18 @@ class MainActivity:ComponentActivity() {
         filesChoice.background=rounded(if(!textMode)accent else Color.rgb(28,28,28));filesChoice.setTextColor(if(!textMode)Color.BLACK else ink)
         textChoice.background=rounded(if(textMode)accent else Color.rgb(28,28,28));textChoice.setTextColor(if(textMode)Color.BLACK else ink)
         updatePrimaryLabel()
+    }
+    private fun showEngineInfo(){
+        val descriptions=AppSettings.modes(this).joinToString("\n\n"){mode->
+            val description=when(mode){
+                "Croc"->"Prefers a direct connection. If Croc selects a relay, it keeps that route for the rest of the transfer while the connection stays up. Supports resumable file transfers, text, and browser sharing."
+                "Sendme"->"Always prefers a direct connection and can switch from relay to direct mid-transfer when a suitable route becomes available. Transfers can continue across network changes and resume from saved data. Broadcast keeps sharing available for multiple receivers."
+                else->"Sendme engine but with short Croc code. Croc delivers the sendme ticket, then Sendme transfers the files."
+            }
+            "$mode\n$description"
+        }
+        AlertDialog.Builder(this).setTitle("Transfer engines").setMessage(descriptions)
+            .setPositiveButton("Close",null).show()
     }
     private fun showQuickActions(){
         if(configurationLocked())return

@@ -4962,7 +4962,40 @@ impl DataBeamApp {
             ui.add_space(16.0);
         });
 
-        section_header(ui, "🔧", "Engine");
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("🔧").size(15.0));
+            let heading = ui.label(RichText::new("Engine").size(14.0).color(TEXT_PRIMARY).strong());
+            let height = heading.rect.height();
+            let button = egui::Button::new(RichText::new("i").size(12.0).strong())
+                .small()
+                .frame(false)
+                .min_size(Vec2::splat(height));
+            let info = egui::menu::menu_custom_button(ui, button, |ui| {
+                ui.set_max_width(300.0);
+                for (name, description) in [
+                    (
+                        "Croc",
+                        "Prefers a direct connection. If Croc selects a relay, it keeps that route for the rest of the transfer while the connection stays up. Supports resumable file transfers, text, and browser sharing.",
+                    ),
+                    (
+                        "Sendme",
+                        "Always prefers a direct connection and can switch from relay to direct mid-transfer when a suitable route becomes available. Transfers can continue across network changes and resume from saved data. Broadcast keeps sharing available for multiple receivers.",
+                    ),
+                    (
+                        "EasySendMe",
+                        "Sendme engine but with short Croc code. Croc delivers the sendme ticket, then Sendme transfers the files.",
+                    ),
+                ] {
+                    ui.strong(name);
+                    ui.label(description);
+                    ui.add_space(4.0);
+                }
+            })
+            .response
+            .on_hover_text("About transfer engines");
+            let stroke = ui.style().interact(&info).fg_stroke;
+            ui.painter().circle_stroke(info.rect.center(), (height - stroke.width) * 0.5, stroke);
+        });
         ui.add_space(4.0);
 
         let croc_status = self
@@ -4980,7 +5013,7 @@ impl DataBeamApp {
         ui.add_enabled_ui(!locked, |ui| {
             if let Some(croc) = &croc_status {
                 if tool_card(
-                    ui, "Croc", "Fast public relay, resumable transfers, text and browser sharing", croc.available,
+                    ui, "Croc", "Fast public relay · Convenient", croc.available,
                     croc.version.as_deref(), CROC_COLOR, self.selected_tool == SelectedTool::Croc,
                 ).clicked() && croc.available {
                     self.switch_tool(SelectedTool::Croc);
@@ -4989,8 +5022,13 @@ impl DataBeamApp {
             ui.add_space(6.0);
             if let Some(sendme) = &sendme_status {
                 let selected = matches!(self.selected_tool, SelectedTool::Sendme | SelectedTool::EazySendme);
+                let summary = if self.selected_tool == SelectedTool::EazySendme {
+                    "Share with a short code"
+                } else {
+                    "Less reliance on relays · Broadcast"
+                };
                 if tool_card(
-                    ui, "Sendme", "Less reliance on relays, EasySendMe and Broadcast", sendme.available,
+                    ui, "Sendme", summary, sendme.available,
                     sendme.version.as_deref(), SENDME_COLOR, selected,
                 ).clicked() && sendme.available && !selected {
                     self.switch_tool(SelectedTool::Sendme);
