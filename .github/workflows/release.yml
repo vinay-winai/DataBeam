@@ -96,7 +96,7 @@ jobs:
           Copy-Item "target/release/databeam.exe" "dist/databeam_windows-x64.exe"
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: release-windows-x64
           path: dist/*
@@ -188,7 +188,7 @@ jobs:
           hdiutil create -volname "DataBeam" -srcfolder "${app_path}" -ov -format UDZO "${dmg_path_univ}"
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: release-macos-universal
           path: dist/*
@@ -288,7 +288,7 @@ jobs:
         run: cargo test --locked --bin databeam correct_assets_are_selected_on_all_shipping_platforms
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: release-linux-${{ matrix.arch }}
           path: dist/*
