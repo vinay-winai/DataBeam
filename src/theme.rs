@@ -27,11 +27,12 @@ pub const EAZYSENDME_COLOR: Color32 = Color32::from_rgb(214, 66, 36);
 pub const SUCCESS: Color32 = Color32::from_rgb(87, 214, 36);
 pub const WARNING: Color32 = Color32::from_rgb(255, 190, 95);
 pub const ERROR: Color32 = Color32::from_rgb(255, 100, 100);
+pub const NOTIFICATION_ORANGE: Color32 = Color32::from_rgb(255, 77, 0);
 
-/// Paint inside a button's right padding so badges never depend on font glyphs.
-pub fn notification_dot(ui: &egui::Ui, response: &egui::Response, color: Color32) {
-    let center = egui::pos2(response.rect.right() - 7.0, response.rect.center().y);
-    ui.painter().circle_filled(center, 3.0, color);
+/// Paint the badge inside the button's top-right corner.
+pub fn notification_dot(ui: &egui::Ui, response: &egui::Response) {
+    let center = response.rect.right_top() + egui::vec2(-7.0, 7.0);
+    ui.painter().circle_filled(center, 3.0, NOTIFICATION_ORANGE);
 }
 
 // ── Spacing & Sizing ───────────────────────────────────────────────

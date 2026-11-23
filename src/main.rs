@@ -4547,6 +4547,7 @@ impl eframe::App for DataBeamApp {
                         ui.set_style(style);
 
                         let transfer_running = self.transfer_state == TransferState::Running;
+                        let mut home_button_height = ui.spacing().interact_size.y;
                         for (label, view) in &[
                             ("🏠 Home", AppView::Home),
                             ("📤 Send", AppView::Send),
@@ -4567,6 +4568,9 @@ impl eframe::App for DataBeamApp {
                                     RichText::new(*label).size(12.0).color(c),
                                 ),
                             );
+                            if *view == AppView::Home {
+                                home_button_height = btn.rect.height();
+                            }
                             if btn.clicked() && self.view != *view && !transfer_running {
                                 self.view = *view;
                                 self.croc_browser_send = false;
@@ -4578,12 +4582,19 @@ impl eframe::App for DataBeamApp {
                         }
 
                         let unread_news = self.troubleshoot_news.has_unread();
-                        let troubleshoot_button = ui.add(
-                            egui::Button::new(RichText::new("?").size(18.0).color(TEXT_SECONDARY))
-                                .min_size(egui::vec2(30.0, 26.0)),
-                        );
+                        let troubleshoot_button = ui
+                            .scope(|ui| {
+                                ui.spacing_mut().button_padding.y = 0.0;
+                                ui.add(
+                                    egui::Button::new(
+                                        RichText::new("?").size(18.0).color(TEXT_SECONDARY),
+                                    )
+                                    .min_size(egui::vec2(30.0, home_button_height)),
+                                )
+                            })
+                            .inner;
                         if unread_news {
-                            notification_dot(ui, &troubleshoot_button, WARNING);
+                            notification_dot(ui, &troubleshoot_button);
                         }
                         if troubleshoot_button
                             .on_hover_text(if unread_news {
@@ -4643,15 +4654,21 @@ impl eframe::App for DataBeamApp {
                             else { "Update" };
                         let tooltip = if transfer_active { "Finish or stop the transfer before updating DataBeam." }
                             else { self.app_updater.status.as_deref().unwrap_or("Check for DataBeam updates") };
-                        let update_button = ui.add_enabled(!managed && !transfer_active && !self.app_updater.busy() && !self.app_updater.installing,
-                            egui::Button::new(RichText::new(label).size(12.0).color(if available { Color32::YELLOW } else { TEXT_SECONDARY })));
+                        let update_button = ui.add_enabled(
+                            !managed && !transfer_active && !self.app_updater.busy() && !self.app_updater.installing,
+                            egui::Button::new(RichText::new(label).size(12.0).color(if available {
+                                NOTIFICATION_ORANGE
+                            } else {
+                                TEXT_SECONDARY
+                            })),
+                        );
                         if update_button
                             .on_hover_text(tooltip).clicked() {
                             self.app_updater.install(ctx);
                         }
                         if let Some(status) = &self.app_updater.status {
                             ui.add(egui::Label::new(RichText::new(status).size(11.0)
-                                .color(if available { Color32::YELLOW } else { TEXT_MUTED })).truncate())
+                                .color(if available { NOTIFICATION_ORANGE } else { TEXT_MUTED })).truncate())
                                 .on_hover_text(status);
                         }
                     });
