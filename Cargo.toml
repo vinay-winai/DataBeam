@@ -10,7 +10,7 @@ eframe = { version = "0.31", features = ["persistence"] }
 egui = "0.31"
 egui_extras = { version = "0.31", features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
-rfd = "0.15"
+rfd = "0.18"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
