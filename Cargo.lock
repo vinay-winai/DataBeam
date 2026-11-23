@@ -1335,8 +1335,9 @@ dependencies = [
 
 [[package]]
 name = "databeam"
-version = "0.8.0"
+version = "0.8.8"
 dependencies = [
+ "chrono",
  "dirs",
  "eframe",
  "egui",

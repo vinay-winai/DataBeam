@@ -68,7 +68,7 @@ object MobilePolishRegression {
                 val receiving=args.getString("direction")=="receive"
                 val expectedCode="polish-${id.take(8)}"
                 main{
-                    (field("mode") as Spinner).setSelection(2)
+                    (field("mode") as Spinner).setSelection(0)
                 };r.waitForIdleSync()
                 main{
                     if(receiving){
@@ -99,7 +99,7 @@ object MobilePolishRegression {
                         render(s)
                         main{
                             if(!receiving)check((field("message") as EditText).text.isEmpty())
-                            check((field("restartSharing") as View).visibility==View.GONE)
+                            check((field("resend") as View).visibility==View.GONE)
                             check((field("receivedText") as View).visibility==if(receiving)View.VISIBLE else View.GONE)
                             if(!receiving)check((field("detail") as TextView).text.contains("Sent successfully"))
                         }
@@ -129,7 +129,7 @@ object MobilePolishRegression {
                 s.put("status","interrupted").put("message","Generated connection failure");render(s)
                 main{
                     check((field("bar") as View).visibility==View.VISIBLE)
-                    check((field("restartSharing") as View).visibility==View.GONE)
+                    check((field("resend") as View).visibility==View.GONE)
                     check((field("detail") as TextView).text.contains("reselect the exact same files"))
                 }
                 s.put("status","complete").put("action","receive").put("saveFolder","")

@@ -1,12 +1,55 @@
-"""Build the arm64 Android engines. Uses only the pinned Croc source/patch recipe."""
+"""Build the arm64 Android engines from pinned dependencies and patches."""
 import argparse, hashlib, json, os, shutil, subprocess, urllib.request, zipfile
-from pathlib import Path
+import tarfile, tempfile
+from pathlib import Path, PurePosixPath
 ANDROID=Path(__file__).resolve().parents[1]
 ROOT=ANDROID.parent
 
 def run(args,**kw):
     print('>',*map(str,args),flush=True)
     subprocess.run(list(map(str,args)),check=True,**kw)
+
+
+def prepare_iroh_blobs():
+    # Match android/native/Cargo.lock. The path override preserves the locked
+    # dependency graph and applies only to this Android engine build.
+    version = '0.103.1'
+    crate = f'iroh-blobs-{version}'
+    sha256 = 'a3148ad01585eb6b7cfb641e4100564f4f56db644f4cbed8c10ab2478663161f'
+    patch = ROOT / 'patches' / f'iroh-blobs-v{version}-android-sources.patch'
+    patch_hash = hashlib.sha256(patch.read_bytes()).hexdigest()
+    work = ANDROID / '.tools/iroh-blobs'
+    source = work / patch_hash / crate
+    if source.is_dir():
+        return source
+
+    source.parent.mkdir(parents=True, exist_ok=True)
+    cargo_home = Path(os.environ.get('CARGO_HOME', Path.home() / '.cargo'))
+    cached = next((cargo_home / 'registry/cache').glob(f'*/{crate}.crate'), None)
+    with tempfile.TemporaryDirectory(prefix='source-', dir=work) as temp:
+        destination = Path(temp)
+        archive = cached or destination / f'{crate}.crate'
+        if cached is None:
+            url = f'https://static.crates.io/crates/iroh-blobs/{crate}.crate'
+            urllib.request.urlretrieve(url, archive)
+        if hashlib.sha256(archive.read_bytes()).hexdigest() != sha256:
+            raise SystemExit('Iroh blobs source checksum mismatch')
+        with tarfile.open(archive, 'r:gz') as package:
+            for item in package.getmembers():
+                parts = PurePosixPath(item.name).parts
+                if (not parts or parts[0] != crate or '..' in parts or '\\' in item.name or ':' in item.name
+                        or not (item.isdir() or item.isfile())):
+                    raise SystemExit('Unsafe Iroh blobs archive entry')
+            package.extractall(destination)
+        extracted = destination / crate
+        run(['git', '-c', 'safe.directory=' + ROOT.as_posix(), 'apply',
+             '--directory=' + extracted.relative_to(ROOT).as_posix(), patch], cwd=ROOT)
+        try:
+            extracted.rename(source)
+        except OSError:
+            if not source.is_dir():
+                raise
+    return source
 
 def main():
     parser=argparse.ArgumentParser()
@@ -22,7 +65,10 @@ def main():
     env['CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER']=str(clang)
     env['CC_aarch64_linux_android']=str(clang)
     env['AR_aarch64_linux_android']=str(prebuilt/'bin'/('llvm-ar.exe' if os.name=='nt' else 'llvm-ar'))
-    run(['cargo','build','--manifest-path',ANDROID/'native/Cargo.toml','--target','aarch64-linux-android','--release'],env=env,cwd=ROOT)
+    iroh_blobs = prepare_iroh_blobs()
+    override = 'paths=' + json.dumps([iroh_blobs.as_posix()])
+    run(['cargo','build','--manifest-path',ANDROID/'native/Cargo.toml','--locked',
+         '--config',override,'--features','descriptor-sources','--target','aarch64-linux-android','--release'],env=env,cwd=ROOT)
     shutil.copy2(ANDROID/'native/target/aarch64-linux-android/release/libdatabeam_android.so',output)
     recipe=json.loads((ANDROID/'croc-engine.json').read_text())
     work=ANDROID/'.tools/croc';work.mkdir(parents=True,exist_ok=True)
@@ -58,6 +104,34 @@ def main():
         run(['git','-c','safe.directory='+ROOT.as_posix(),'apply','--directory='+source.relative_to(ROOT).as_posix(),route_patch],cwd=ROOT)
         route_stamp.write_text(route_digest)
     elif route_stamp.read_text()!=route_digest:raise SystemExit('Android local route patch changed; rebuild from fresh pinned Croc source')
+    receive_patch=ROOT/'patches'/recipe['receive_patch']
+    receive_stamp=source/'.databeam-receive-patch'
+    receive_digest=hashlib.sha256(receive_patch.read_bytes()).hexdigest()
+    if not receive_stamp.exists():
+        run(['git','-c','safe.directory='+ROOT.as_posix(),'apply','--directory='+source.relative_to(ROOT).as_posix(),receive_patch],cwd=ROOT)
+        receive_stamp.write_text(receive_digest)
+    elif receive_stamp.read_text()!=receive_digest:raise SystemExit('Croc receive patch changed; rebuild from fresh pinned Croc source')
+    downloads_patch=ROOT/'patches'/recipe['downloads_patch']
+    downloads_stamp=source/'.databeam-downloads-patch'
+    downloads_digest=hashlib.sha256(downloads_patch.read_bytes()).hexdigest()
+    if not downloads_stamp.exists():
+        run(['git','-c','safe.directory='+ROOT.as_posix(),'apply','--directory='+source.relative_to(ROOT).as_posix(),downloads_patch],cwd=ROOT)
+        downloads_stamp.write_text(downloads_digest)
+    elif downloads_stamp.read_text()!=downloads_digest:raise SystemExit('Croc Downloads patch changed; rebuild from fresh pinned Croc source')
+    revision_patch=ROOT/'patches'/recipe['revision_patch']
+    revision_stamp=source/'.databeam-revision-patch'
+    revision_digest=hashlib.sha256(revision_patch.read_bytes()).hexdigest()
+    if not revision_stamp.exists():
+        run(['git','-c','safe.directory='+ROOT.as_posix(),'apply','--directory='+source.relative_to(ROOT).as_posix(),revision_patch],cwd=ROOT)
+        revision_stamp.write_text(revision_digest)
+    elif revision_stamp.read_text()!=revision_digest:raise SystemExit('Croc batch revision patch changed; rebuild from fresh pinned Croc source')
+    fd_patch=ROOT/'patches'/recipe['source_fd_patch']
+    fd_stamp=source/'.databeam-source-fd-patch'
+    fd_digest=hashlib.sha256(fd_patch.read_bytes()).hexdigest()
+    if not fd_stamp.exists():
+        run(['git','-c','safe.directory='+ROOT.as_posix(),'apply','--directory='+source.relative_to(ROOT).as_posix(),fd_patch],cwd=ROOT)
+        fd_stamp.write_text(fd_digest)
+    elif fd_stamp.read_text()!=fd_digest:raise SystemExit('Croc descriptor adapter changed; rebuild from fresh pinned Croc source')
     env.update(GOOS='android',GOARCH='arm64',CGO_ENABLED='1',CC=str(clang),GOTOOLCHAIN='go'+recipe['go_version'])
     # Android satisfies Go's linux tag, but cannot use Tailcat's Linux netlink
     # monitor. Its optional netcheck panics with a nil InterfaceState. Upstream's

@@ -67,6 +67,7 @@ serde_json = "1.0.108"
 tempfile = "3.8.1"
 
 [features]
+descriptor-sources = []
 clipboard = ["dep:crossterm", "dep:windows-sys", "dep:libc"]
 default = ["clipboard"]
 

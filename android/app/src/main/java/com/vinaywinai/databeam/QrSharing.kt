@@ -6,11 +6,22 @@ import java.net.URI
 import java.net.URLDecoder
 
 object QrSharing {
-    data class Payload(val value:String,val sendme:Boolean,val crocLink:Boolean=false)
+    data class Payload(val value:String,val sendme:Boolean,val crocLink:Boolean=false,val easySendMe:Boolean=false)
+    fun easySendMeCode(text:String):String? {
+        val value=text.trim()
+        if(!value.endsWith("esm",ignoreCase=true))return null
+        return value.dropLast(3).trimEnd(' ','\t').takeIf{code->
+            code.codePointCount(0,code.length)>=7 && !code.contains("://") &&
+                code.none{it.isWhitespace() || it=='\u0000'}
+        }
+    }
+    fun sharedCode(mode:String,value:String):String =
+        if(mode=="EasySendMe" && value.isNotEmpty())"${value}esm" else value
     fun matrix(value:String)=QRCodeWriter().encode(value,BarcodeFormat.QR_CODE,640,640,mapOf(EncodeHintType.CHARACTER_SET to "UTF-8"))
     fun parse(raw:String):Payload {
         val text=raw.trim()
         require(text.isNotEmpty() && text.length<=8192){"QR code is empty or too large"}
+        easySendMeCode(text)?.let{return Payload(it,false,easySendMe=true)}
         if(text.startsWith("https://") || text.startsWith("http://")) {
             val uri=URI(text)
             require(uri.host?.lowercase() in listOf("getcroc.com","www.getcroc.com")){"This QR contains an unsupported link. Scan a Croc code or Sendme ticket."}

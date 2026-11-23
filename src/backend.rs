@@ -1386,6 +1386,11 @@ impl CrocAttemptOutput {
             || lower.contains("connection refused")
             || lower.contains("no public relay")
             || lower.contains("relay closed")
+            || lower.starts_with("the sender is sharing different files")
+            || lower.starts_with("cannot verify this sender")
+            || lower.starts_with("no saved file list")
+            || lower.starts_with("verification failed for")
+            || lower.contains("the saved partial transfer was kept")
             || lower == "eof"
         {
             // croc prints its returned error on stdout at exit. A stderr
@@ -1600,6 +1605,7 @@ fn replacement_croc_code(old: &str, relay: &str) -> Option<String> {
     (0..256).map(|_| random_croc_code()).find(|code| code != old && croc_relay_for_code(code) == relay)
 }
 
+#[cfg(test)]
 fn spawn_croc_transfer(
     initial_code: Option<String>,
     announce_code: bool,
@@ -1609,12 +1615,28 @@ fn spawn_croc_transfer(
     spawn_croc_transfer_with_probe(initial_code, announce_code, make_command, resolve_relay, probe_public_croc_relays)
 }
 
+#[cfg(test)]
 fn spawn_croc_transfer_with_probe(
     initial_code: Option<String>, announce_code: bool,
     make_command: impl Fn(Option<&str>, Option<&str>) -> Command + Send + 'static,
     resolve_relay: impl Fn(&str) -> Option<String> + Send + 'static,
     probe_relays: impl Fn(&Arc<AtomicBool>) -> Vec<&'static str> + Send + 'static,
 ) -> (mpsc::Receiver<TransferMsg>, ProcessHandle) {
+    spawn_prepared_croc_transfer(
+        initial_code, announce_code, None, move |_, _| Ok(make_command), resolve_relay, probe_relays,
+    )
+}
+
+fn spawn_prepared_croc_transfer<Build>(
+    initial_code: Option<String>, announce_code: bool,
+    configured_relay: Option<String>,
+    prepare: impl FnOnce(&mpsc::Sender<TransferMsg>, &AtomicBool) -> std::io::Result<Build> + Send + 'static,
+    resolve_relay: impl Fn(&str) -> Option<String> + Send + 'static,
+    probe_relays: impl Fn(&Arc<AtomicBool>) -> Vec<&'static str> + Send + 'static,
+) -> (mpsc::Receiver<TransferMsg>, ProcessHandle)
+where
+    Build: Fn(Option<&str>, Option<&str>) -> Command + Send + 'static,
+{
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel2 = cancel.clone();
@@ -1623,11 +1645,19 @@ fn spawn_croc_transfer_with_probe(
 
     thread::spawn(move || {
         let mut code = initial_code;
-        let mut relay_override: Option<String> = None;
+        let mut relay_override = configured_relay;
         let mut dns_retried = false;
         let mut health_checked = false;
-        let custom_relay = ["CROC_RELAY", "CROC_RELAY6"].iter().any(|key| std::env::var_os(key).is_some_and(|v| !v.is_empty()));
+        let custom_relay = relay_override.is_some() || ["CROC_RELAY", "CROC_RELAY6"]
+            .iter().any(|key| std::env::var_os(key).is_some_and(|v| !v.is_empty()));
         let _ = tx.send(TransferMsg::Started);
+        let make_command = match prepare(&tx, &cancel2) {
+            Ok(make_command) => make_command,
+            Err(error) => {
+                let _ = tx.send(TransferMsg::Error(error.to_string()));
+                return;
+            }
+        };
         // One code replacement plus the existing probe/DNS fallbacks, before
         // payload transfer only. Never replay a partially completed transfer.
         for _ in 0..4 {
@@ -1812,7 +1842,7 @@ fn spawn_croc_transfer_with_probe(
                     }
                 }
             }
-            if !dns_retried {
+            if !dns_retried && !custom_relay {
                 if let Some(endpoint) = output.dns_relay() {
                     dns_retried = true;
                     if code.is_some() {
@@ -1841,37 +1871,127 @@ fn spawn_croc_transfer_with_probe(
     (rx, ProcessHandle { cancel, child_pid })
 }
 
+#[cfg(test)]
 pub fn croc_send(
     opts: CrocSendOptions,
     binary_path: &str,
 ) -> (mpsc::Receiver<TransferMsg>, ProcessHandle) {
+    croc_send_with_duplicate_filter(opts, binary_path, false, None)
+}
+
+pub fn croc_send_with_duplicate_filter(
+    opts: CrocSendOptions, binary_path: &str, skip_duplicates: bool,
+    relay: Option<String>,
+) -> (mpsc::Receiver<TransferMsg>, ProcessHandle) {
     let binary = binary_path.to_owned();
     let code = opts.custom_code.clone().unwrap_or_else(random_croc_code);
-    spawn_croc_transfer(
+    spawn_prepared_croc_transfer(
         Some(code),
         true,
-        move |code, relay| {
-            let mut cmd = croc_transfer_command(&binary, code, relay);
-            cmd.arg("send");
-            if opts.text_mode {
-                if let Some(text) = &opts.text_value {
-                    cmd.arg("--text").arg(text);
-                }
+        relay,
+        move |tx, cancel| {
+            let paths = if skip_duplicates && !opts.text_mode {
+                without_duplicate_send_files(opts.paths, tx, cancel)?
             } else {
-                // Stop option parsing so a filename beginning with '-' is a path.
-                cmd.arg("--").args(&opts.paths);
-            }
-            cmd
+                opts.paths
+            };
+            Ok(move |code: Option<&str>, relay: Option<&str>| {
+                let mut cmd = croc_transfer_command(&binary, code, relay);
+                cmd.arg("send");
+                if opts.text_mode {
+                    if let Some(text) = &opts.text_value {
+                        cmd.arg("--text").arg(text);
+                    }
+                } else {
+                    cmd.env("DATABEAM_CROC_FILE_DIGEST", "1");
+                    // Stop option parsing so a filename beginning with '-' is a path.
+                    cmd.arg("--").args(&paths);
+                }
+                cmd
+            })
         },
         resolve_croc_relay,
+        probe_public_croc_relays,
     )
+}
+
+fn without_duplicate_send_files(
+    paths: Vec<PathBuf>, tx: &mpsc::Sender<TransferMsg>, cancel: &AtomicBool,
+) -> std::io::Result<Vec<PathBuf>> {
+    use std::io::{Error, ErrorKind};
+
+    let mut counts = HashMap::new();
+    let mut sizes = Vec::with_capacity(paths.len());
+    for path in &paths {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error::new(ErrorKind::Interrupted, "Transfer cancelled"));
+        }
+        let info = fs::metadata(path)?;
+        let size = info.is_file().then_some(info.len());
+        if let Some(size) = size {
+            *counts.entry(size).or_insert(0usize) += 1;
+        }
+        sizes.push(size);
+    }
+    if counts.values().all(|&count| count == 1) {
+        return Ok(paths);
+    }
+
+    let _ = tx.send(TransferMsg::Output("Checking for duplicate files…".into()));
+    let selected_count = paths.len();
+    let mut seen = HashSet::new();
+    let mut buffer = vec![0; 256 * 1024];
+    let mut keep = Vec::with_capacity(selected_count);
+    for (path, size) in paths.into_iter().zip(sizes) {
+        if let Some(size) = size.filter(|size| counts[size] > 1) {
+            let mut file = fs::File::open(&path)?;
+            let modified = file.metadata()?.modified().ok();
+            let mut digest = Sha256::new();
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(Error::new(ErrorKind::Interrupted, "Transfer cancelled"));
+                }
+                let count = file.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                digest.update(&buffer[..count]);
+            }
+            let after = fs::metadata(&path)?;
+            if after.len() != size || after.modified().ok() != modified {
+                return Err(Error::other("File changed while checking duplicates. Select it again."));
+            }
+            if !seen.insert(digest.finalize()) {
+                continue;
+            }
+        }
+        keep.push(path);
+    }
+    let skipped = selected_count - keep.len();
+    if skipped > 0 {
+        let message = if skipped == 1 { "Skipped 1 identical file".into() }
+            else { format!("Skipped {skipped} identical files") };
+        let _ = tx.send(TransferMsg::Output(message));
+    }
+    Ok(keep)
 }
 
 pub fn croc_receive(
     opts: CrocReceiveOptions,
     binary_path: &str,
 ) -> (mpsc::Receiver<TransferMsg>, ProcessHandle) {
-    spawn_croc_receive(opts, binary_path, None)
+    spawn_croc_receive(opts, binary_path, None, None, None)
+}
+
+pub fn croc_receive_working(
+    opts: CrocReceiveOptions,
+    binary_path: &str,
+    offer: PathBuf,
+    replacement_code: bool,
+    review_changes: bool,
+    relay: Option<String>,
+) -> (mpsc::Receiver<TransferMsg>, ProcessHandle) {
+    spawn_croc_receive(opts, binary_path, None, Some((offer, replacement_code, review_changes)), relay)
 }
 
 /// EasySendMe exchanges its ticket as Croc text. Croc still opens a receive
@@ -1880,6 +2000,7 @@ pub fn croc_receive(
 pub fn croc_receive_ticket(
     code: String,
     binary_path: &str,
+    relay: Option<String>,
 ) -> Result<(mpsc::Receiver<TransferMsg>, ProcessHandle), String> {
     let parent = dirs::cache_dir().unwrap_or_else(std::env::temp_dir)
         .join("databeam").join("ticket-receive");
@@ -1893,6 +2014,8 @@ pub fn croc_receive_ticket(
         CrocReceiveOptions { code, output_dir: None },
         binary_path,
         Some(directory),
+        None,
+        relay,
     ))
 }
 
@@ -1900,13 +2023,16 @@ fn spawn_croc_receive(
     opts: CrocReceiveOptions,
     binary_path: &str,
     ticket_directory: Option<tempfile::TempDir>,
+    managed: Option<(PathBuf, bool, bool)>,
+    configured_relay: Option<String>,
 ) -> (mpsc::Receiver<TransferMsg>, ProcessHandle) {
     let binary = binary_path.to_owned();
     let app_directory = std::env::current_dir().ok();
-    spawn_croc_transfer(
+    spawn_prepared_croc_transfer(
         Some(opts.code),
         false,
-        move |code, relay| {
+        configured_relay,
+        move |_, _| Ok(move |code: Option<&str>, relay: Option<&str>| {
             let mut cmd = croc_transfer_command(&binary, code, relay);
             if let Some(directory) = ticket_directory.as_ref() {
                 cmd.current_dir(directory.path());
@@ -1918,9 +2044,19 @@ fn spawn_croc_receive(
             if let Some(dir) = &opts.output_dir {
                 cmd.arg("--out").arg(dir);
             }
+            if let Some((offer, replacement_code, review_changes)) = &managed {
+                cmd.arg("--overwrite").env("DATABEAM_CROC_RECEIPT", offer);
+                if *replacement_code {
+                    cmd.env("DATABEAM_CROC_REPLACEMENT_CODE", "1");
+                }
+                if *review_changes {
+                    cmd.env("DATABEAM_CROC_REVIEW", "1");
+                }
+            }
             cmd
-        },
+        }),
         resolve_croc_relay,
+        probe_public_croc_relays,
     )
 }
 
@@ -1928,7 +2064,13 @@ fn spawn_croc_receive(
 
 pub fn sendme_send(
     opts: SendmeSendOptions,
-    _binary_path: &str,
+    binary_path: &str,
+) -> (mpsc::Receiver<TransferMsg>, ProcessHandle) {
+    sendme_send_with_duplicate_filter(opts, binary_path, false)
+}
+
+pub fn sendme_send_with_duplicate_filter(
+    opts: SendmeSendOptions, _binary_path: &str, skip_duplicates: bool,
 ) -> (mpsc::Receiver<TransferMsg>, ProcessHandle) {
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -1937,8 +2079,19 @@ pub fn sendme_send(
 
     let _worker = thread::spawn(move || {
         let _ = tx.send(TransferMsg::Started);
+        let paths = if skip_duplicates {
+            match without_duplicate_send_files(opts.paths, &tx, &cancel2) {
+                Ok(paths) => paths,
+                Err(error) => {
+                    let _ = tx.send(TransferMsg::Error(error.to_string()));
+                    return;
+                }
+            }
+        } else {
+            opts.paths
+        };
         let sender_blob_dir = sender_blob_base_dir(opts.blob_dir.as_deref());
-        let payload_root_name = match derive_payload_root_name(&opts.paths, &cancel2) {
+        let payload_root_name = match derive_payload_root_name(&paths, &cancel2) {
             Ok(name) => name,
             Err(e) => {
                 let message = if cancel2.load(Ordering::Relaxed) {
@@ -1950,8 +2103,6 @@ pub fn sendme_send(
                 return;
             }
         };
-
-        let paths = opts.paths.clone();
 
         let runtime = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -2851,7 +3002,8 @@ fn extract_croc_code(trimmed: &str) -> Option<String> {
 ///   not split those, so neither do we).
 /// Anything else (file announcements like `Sending 'f' (1 MB)`, progress,
 /// errors) yields `None`: unknown shapes stay silent, never guessed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum CrocRoute {
     Relay,
     Direct,
@@ -3334,6 +3486,30 @@ mod tests {
     const RELAY_CONNECT_ERROR: &str = "could not connect to 3.getcroc.com:9009: dial tcp 165.227.90.189:9009: i/o timeout";
 
     #[test]
+    fn configured_croc_relay_keeps_the_endpoint_and_code_on_failure() {
+        let endpoint = "3.getcroc.com:9009";
+        let (rx, _) = super::spawn_prepared_croc_transfer(
+            Some("original-code".into()),
+            true,
+            Some(endpoint.into()),
+            move |_, _| Ok(move |code: Option<&str>, relay: Option<&str>| {
+                assert_eq!(code, Some("original-code"));
+                assert_eq!(relay, Some(endpoint));
+                let command = super::croc_transfer_command("croc", code, relay);
+                let args: Vec<_> = command.get_args().collect();
+                assert!(args.windows(2).any(|pair| pair == ["--relay", endpoint]));
+                fake_croc(&[RELAY_CONNECT_ERROR], 1)
+            }),
+            |_| panic!("must not replace the configured relay"),
+            |_| panic!("must not probe the public pool for a configured relay"),
+        );
+        assert!(matches!(
+            croc_terminal_message(rx),
+            super::TransferMsg::Error(error) if error.contains("i/o timeout")
+        ));
+    }
+
+    #[test]
     fn croc_relay_recovery_replaces_sender_code_and_retries_once() {
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed = calls.clone();
@@ -3753,7 +3929,7 @@ mod tests {
 
         // Exercise the same receiver-first Croc text handoff used by the GUI.
         let code = random_croc_code();
-        let (receive_rx, receive_handle) = croc_receive_ticket(code.clone(), &binary).unwrap();
+        let (receive_rx, receive_handle) = croc_receive_ticket(code.clone(), &binary, None).unwrap();
         let _receive_guard = CancelOnDrop(receive_handle);
         thread::sleep(Duration::from_secs(3));
         let (send_rx, send_handle) = croc_send(CrocSendOptions {

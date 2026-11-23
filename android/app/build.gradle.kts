@@ -23,18 +23,17 @@ android {
         minSdk = 26
         targetSdk = 36
         testInstrumentationRunner = "com.vinaywinai.databeam.SmokeInstrumentation"
-        versionCode = 802
-        versionName = "0.8.0"
+        versionCode = 808
+        versionName = "0.8.8"
         ndk { abiFilters += "arm64-v8a" }
     }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
-    if(releaseSigningFile.exists())signingConfigs.create("betaRelease"){
+    if(releaseSigningFile.exists())signingConfigs.create("publicRelease"){
         storeFile=rootProject.file(".tools/signing/databeam-release.jks")
         storePassword=releaseSigning.getProperty("storePassword");keyAlias=releaseSigning.getProperty("keyAlias");keyPassword=releaseSigning.getProperty("keyPassword")
     }
     buildTypes.getByName("release"){
-        versionNameSuffix="-beta.1"
-        if(releaseSigningFile.exists())signingConfig=signingConfigs.getByName("betaRelease")
+        if(releaseSigningFile.exists())signingConfig=signingConfigs.getByName("publicRelease")
     }
     packaging { jniLibs { useLegacyPackaging = true } }
 }

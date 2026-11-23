@@ -7,6 +7,10 @@ import org.json.JSONArray
 /** Defaults for new transfers. A running/paused transfer retains its own destination. */
 object AppSettings {
     private fun prefs(c:Context)=c.getSharedPreferences("settings",Context.MODE_PRIVATE)
+    fun settingsSectionExpanded(c:Context,section:String)=prefs(c).getBoolean("settingsExpanded-$section",section=="transfers")
+    fun setSettingsSectionExpanded(c:Context,section:String,expanded:Boolean){
+        prefs(c).edit().putBoolean("settingsExpanded-$section",expanded).apply()
+    }
     fun disabledEngine(c:Context)=prefs(c).getString("disabledEngine","").orEmpty().takeIf{it in listOf("Sendme","Croc")} ?: ""
     fun modes(c:Context)=EngineOptions.modes(disabledEngine(c))
     fun engineEnabled(c:Context,engine:String)=engine in modes(c)
@@ -17,6 +21,12 @@ object AppSettings {
     fun setRelay(c:Context,value:String){prefs(c).edit().putString("relay",value.trim()).apply()}
     fun broadcast(c:Context)=prefs(c).getBoolean("sendmeBroadcast",false)
     fun setBroadcast(c:Context,value:Boolean){prefs(c).edit().putBoolean("sendmeBroadcast",value).apply()}
+    fun skipDuplicateFiles(c:Context)=prefs(c).getBoolean("skipDuplicateFiles",false)
+    fun unwrapCroc(c:Context)=prefs(c).getBoolean("unwrapCroc",false)
+    fun setUnwrapCroc(c:Context,value:Boolean){prefs(c).edit().putBoolean("unwrapCroc",value).apply()}
+    fun setSkipDuplicateFiles(c:Context,value:Boolean){prefs(c).edit().putBoolean("skipDuplicateFiles",value).apply()}
+    fun cleanupDays(c:Context)=prefs(c).getInt("transferCleanupDays",0).takeIf{it==7 || it==30} ?: 0
+    fun setCleanupDays(c:Context,days:Int){prefs(c).edit().putInt("transferCleanupDays",days).apply()}
     fun folder(c:Context)=prefs(c).getString("saveFolder","")!!
     fun folderLabel(c:Context)=prefs(c).getString("saveFolderLabel","Downloads / DataBeam")!!
     fun setFolder(c:Context,uri:Uri?,label:String="Downloads / DataBeam"){

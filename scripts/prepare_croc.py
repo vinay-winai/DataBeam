@@ -61,6 +61,15 @@ def main():
         run('git', '-c', 'safe.directory=' + ROOT.as_posix(), 'apply',
             '--directory=' + source.relative_to(ROOT).as_posix(),
             str(ROOT / 'patches' / RECIPE['patch']))
+        run('git', '-c', 'safe.directory=' + ROOT.as_posix(), 'apply',
+            '--directory=' + source.relative_to(ROOT).as_posix(),
+            str(ROOT / 'patches' / RECIPE['receive_patch']))
+        run('git', '-c', 'safe.directory=' + ROOT.as_posix(), 'apply',
+            '--directory=' + source.relative_to(ROOT).as_posix(),
+            str(ROOT / 'patches' / RECIPE['downloads_patch']))
+        run('git', '-c', 'safe.directory=' + ROOT.as_posix(), 'apply',
+            '--directory=' + source.relative_to(ROOT).as_posix(),
+            str(ROOT / 'patches' / RECIPE['revision_patch']))
         test_env = dict(os.environ)
         test_env['GOTOOLCHAIN'] = 'go' + RECIPE['go_version']
         for key in ('GOOS', 'GOARCH', 'CROC_SECRET', 'CROC_RELAY', 'CROC_RELAY6'):
@@ -88,6 +97,9 @@ def main():
             payload = gzip.compress(data, compresslevel=9, mtime=0)
             metadata = dict(version=RECIPE['engine_version'], target=target,
                 patch_sha256=hashlib.sha256((ROOT / 'patches' / RECIPE['patch']).read_bytes()).hexdigest(),
+                receive_patch_sha256=hashlib.sha256((ROOT / 'patches' / RECIPE['receive_patch']).read_bytes()).hexdigest(),
+                downloads_patch_sha256=hashlib.sha256((ROOT / 'patches' / RECIPE['downloads_patch']).read_bytes()).hexdigest(),
+                revision_patch_sha256=hashlib.sha256((ROOT / 'patches' / RECIPE['revision_patch']).read_bytes()).hexdigest(),
                 binary_sha256=hashlib.sha256(data).hexdigest(),
                 gzip_sha256=hashlib.sha256(payload).hexdigest())
             # Publish metadata last; build.rs verifies both identity and bytes.

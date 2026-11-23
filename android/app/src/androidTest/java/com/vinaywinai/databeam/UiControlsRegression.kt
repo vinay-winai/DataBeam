@@ -54,27 +54,80 @@ object UiControlsRegression {
                 fun quick(id:Int){
                     (field("quickActions") as Button).performClick()
                     val popup=field("quickMenu") as PopupMenu
-                    check(popup.menu.size()==3);check(popup.menu.performIdentifierAction(id,0));popup.dismiss()
+                    check(popup.menu.findItem(EngineOptions.CROC_HISTORY_ACTION).title=="Croc receive history")
+                    check(popup.menu.size()==5);check(popup.menu.performIdentifierAction(id,0));popup.dismiss()
                 }
                 quick(1)
                 check((field("mode") as Spinner).selectedItem=="Croc" && (field("message") as View).visibility==View.VISIBLE)
+                check((field("primary") as Button).background.let{it as android.graphics.drawable.GradientDrawable}.color?.defaultColor==android.graphics.Color.rgb(87,214,36))
+                check((field("historyButton") as View).visibility==View.GONE)
                 quick(2)
                 check((field("mode") as Spinner).selectedItem=="Sendme" && (field("broadcastChoice") as CheckBox).isChecked)
+                check((field("primary") as Button).background.let{it as android.graphics.drawable.GradientDrawable}.color?.defaultColor==android.graphics.Color.rgb(11,131,230))
+                (field("receiveTab") as Button).performClick()
+                check((field("historyButton") as View).visibility==View.GONE)
                 quick(3)
                 check((field("mode") as Spinner).selectedItem=="Croc" && (field("browserGuidance") as View).visibility==View.VISIBLE)
                 check((field("browserGuidance") as TextView).text.contains("https://getcroc.com"))
+                quick(4)
+                val selectedMode=MainActivity::class.java.getDeclaredMethod("selectedMode").apply{isAccessible=true}
+                check(selectedMode.invoke(activity)=="EasySendMe")
+                check((field("primary") as Button).background.let{it as android.graphics.drawable.GradientDrawable}.color?.defaultColor==android.graphics.Color.rgb(214,66,36))
                 quick(1)
                 check((field("browserGuidance") as View).visibility==View.GONE)
+                (field("receiveTab") as Button).performClick()
+                check((field("historyButton") as View).visibility==View.VISIBLE)
+                (field("sendTab") as Button).performClick()
                 (field("filesChoice") as Button).performClick()
             }
             main {
                 check((field("selectionList") as LinearLayout).childCount==2)
                 val root=activity!!.window.decorView
                 check(find(root){it is TextView && it.text.toString()==firstName}!=null){"Selected name missing"}
-                check(find(root){it.contentDescription=="Version 0.8.0"}!=null){"Version footer missing"}
+                check(find(root){it.contentDescription=="Version 0.8.8"}!=null){"Version footer missing"}
                 check(find(root){it.contentDescription=="DataBeam logo"}!=null){"Arrow branding missing"}
             }
             screenshot("ui-controls-files.png")
+            fun settingsRoot()=(field("settingsDialog") as AlertDialog).window!!.decorView
+            fun header(description:String)=find(settingsRoot()){it.contentDescription==description}
+            fun settingsScroll():ScrollView {
+                val transfers=find(settingsRoot()){it.contentDescription?.startsWith("Transfers, ")==true}!!
+                return (transfers.parent.parent as ScrollView)
+            }
+            main {
+                for((section,expanded) in listOf("transfers" to true,"storage" to false,"background" to false,"relays" to false)){
+                    AppSettings.setSettingsSectionExpanded(c,section,expanded)
+                }
+                invoke("showSettings")
+            }
+            Thread.sleep(250)
+            main {
+                check(settingsScroll().scrollY==0){"Settings scrolled with only Transfers expanded"}
+                check(header("Transfers, expanded")!!.performClick())
+                check(header("Files and storage, collapsed")!!.performClick())
+                check(header("Background transfers, collapsed")!!.performClick())
+                check(header("Relays, collapsed")!!.performClick())
+            }
+            Thread.sleep(250)
+            main {
+                check(settingsScroll().scrollY>0 && !settingsScroll().canScrollVertically(1)){
+                    "Expanding a lower Settings section did not scroll to the bottom"
+                }
+                (field("settingsDialog") as AlertDialog).dismiss()
+            }
+            runner.waitForIdleSync()
+            main{invoke("showSettings")}
+            Thread.sleep(250)
+            main {
+                val root=(field("settingsDialog") as AlertDialog).window!!.decorView
+                for(description in listOf("Transfers, collapsed","Files and storage, expanded","Background transfers, expanded","Relays, expanded")){
+                    check(find(root){it.contentDescription==description}!=null){"Settings forgot $description"}
+                }
+                check(settingsScroll().scrollY>0 && !settingsScroll().canScrollVertically(1)){
+                    "Settings did not reopen at the bottom with lower sections expanded"
+                }
+                (field("settingsDialog") as AlertDialog).dismiss()
+            }
             main{
                 check(find(activity!!.window.decorView){it is Button && it.text=="Clear all"}!!.performClick())
                 check((field("sources") as List<*>).isEmpty())
@@ -89,7 +142,7 @@ object UiControlsRegression {
                 check(find(activity!!.window.decorView){it.contentDescription=="Remove ${folder.name}"}!!.performClick())
                 check(find(activity!!.window.decorView){it.contentDescription=="Remove $secondName"}!!.performClick())
                 check((field("sources") as List<*>).isEmpty())
-                (field("mode") as Spinner).setSelection(2)
+                (field("mode") as Spinner).setSelection(0)
             }
             runner.waitForIdleSync()
             main {
@@ -134,12 +187,14 @@ object UiControlsRegression {
             main{(field("pause") as Button).performClick()}
             waitFor{it.optString("status")=="stopped" && it.optString("id")==firstSession.optString("id")}
             main {
-                check((field("restartSharing") as View).visibility==View.VISIBLE)
+                check((field("resend") as View).visibility==View.VISIBLE)
                 check((field("resumeButton") as View).visibility==View.GONE)
                 check(!(field("detail") as TextView).text.contains("Press Resume"))
                 check((field("route") as View).visibility==View.GONE){"Stopped share still said waiting for receiver"}
                 check((field("newTransfer") as Button).text=="Clear transfer card")
-                (field("restartSharing") as Button).performClick()
+                (field("message") as EditText).setText("")
+                (field("resend") as Button).performClick()
+                check((field("message") as EditText).text.toString()==text){"Resend did not restore the text"}
             }
             val restarted=waitFor{it.optString("status")=="running" && it.optString("phase")=="Waiting for receiver" && it.optString("id")!=firstSession.optString("id")}
             sessions.add(restarted.getString("id"))
@@ -157,19 +212,38 @@ object UiControlsRegression {
             main{(field("pause") as Button).performClick()}
             waitFor{it.optString("status")=="stopped" && it.optString("id")==fileSession.optString("id")}
             main{
-                check((field("restartSharing") as View).visibility==View.GONE){"File restart must require fresh picker access"}
-                check((field("sources") as List<*>).isEmpty())
-                check((field("detail") as TextView).text.contains("reselect the exact same files"))
-                runner.callActivityOnNewIntent(activity,Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_STREAM,first))
-                (field("primary") as Button).performClick()
+                check((field("resend") as View).visibility==View.VISIBLE){"Resend missing on stopped file transfer"}
+                check((field("sources") as List<*>)==listOf(first)){"Stopping cleared the file selection"}
+                check((field("detail") as TextView).text.contains("Tap Resend to share the same files"))
+                (field("clearFiles") as Button).performClick()
+                (field("resend") as Button).performClick()
+                check((field("sources") as List<*>)==listOf(first)){"Resend did not restore the original URI"}
             }
             val fileRestart=waitFor{it.optString("status")=="running" && it.optString("phase")=="Waiting for receiver" && it.optString("id")!=fileSession.optString("id")}
             sessions.add(fileRestart.getString("id"))
             check(fileRestart.optInt("referencedFiles")==1 && fileRestart.optInt("copiedFiles")==0){"Restart did not reopen the original URI"}
             check(fileRestart.getJSONArray("paths").toString()!=fileSession.getJSONArray("paths").toString()){"Restart reused closed descriptor aliases"}
             main{(field("pause") as Button).performClick()}
-            waitFor{it.optString("status")=="stopped" && it.optString("id")==fileRestart.optString("id")}
-            result.putString("result","PASS selection names/removal/add-folder, Files/Text isolation, version/logo, real transfer input/settings lock, three-word codes, ongoing notification progress, text retry and reselected-file new transfer without a staging copy")
+            val stopped=waitFor{it.optString("status")=="stopped" && it.optString("id")==fileRestart.optString("id")}
+            stopped.getJSONArray("uris").put(Uri.fromFile(File(c.cacheDir,"missing-$nonce.bin")).toString())
+            stopped.put("sourceNames",org.json.JSONArray().put(firstName).put("missing-$nonce.bin"))
+            transfer.edit().putString("state",stopped.toString()).commit()
+            main {
+                invoke("render")
+                (field("resend") as Button).performClick()
+                check((field("sources") as List<*>)==listOf(first)){"Resend lost the available part of the selection"}
+            }
+            runner.sendKeyDownUpSync(android.view.KeyEvent.KEYCODE_BACK)
+            check(TransferService.state(c).optString("id")==fileRestart.optString("id") && !TransferService.isBusy()){
+                "Resend started with an incomplete selection"
+            }
+            main {
+                val clear=field("clearFiles") as Button
+                check(clear.visibility==View.VISIBLE)
+                clear.performClick()
+                check((field("sources") as List<*>).isEmpty()){"Clear all retained the selected file"}
+            }
+            result.putString("result","PASS selection controls, engine accents, Settings section memory and bottom scroll, immediate file and text resend, missing-file guard, transfer lock and ongoing notification progress")
         }catch(error:Throwable){code=1;result.putString("error",error.stackTraceToString())}
         finally {
             if(TransferService.state(c).optString("id") in sessions && TransferService.state(c).optString("status") in listOf("running","stopping")){

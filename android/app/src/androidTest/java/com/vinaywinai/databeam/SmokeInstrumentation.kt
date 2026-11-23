@@ -2,6 +2,7 @@ package com.vinaywinai.databeam
 import android.app.Instrumentation
 import android.os.Bundle
 import android.content.Intent
+import android.provider.DocumentsContract as Docs
 import android.util.Base64
 import org.json.JSONObject
 import org.json.JSONArray
@@ -26,6 +27,7 @@ class SmokeInstrumentation:Instrumentation(){
    if(args.getString("storage_test")=="true"){StorageRegression.run(this);return}
    if(args.getString("share_test")=="true"){ShareEntryRegression.run(this);return}
    if(args.getString("camera_decoder_test")=="true"){CameraQrRegression.run(this);return}
+   if(args.getString("croc_history_qr_test")=="true"){CrocHistoryQrRegression.run(this);return}
    if(args.getString("relay_test")=="true"){
     NativeBridge.initialize(targetContext)
     val healthy=RelayRecovery.healthy({false})
@@ -35,6 +37,14 @@ class SmokeInstrumentation:Instrumentation(){
    val c=targetContext
    val config=JSONObject(String(Base64.decode(args.getString("config"),Base64.DEFAULT)))
    val activity=startActivitySync(Intent(c,MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+   if(config.has("revisionFixtureCollision")){
+    val tree=android.net.Uri.parse(config.getString("saveFolder"))
+    check(tree.authority=="com.vinaywinai.databeam.test.revisionfixture")
+    val root=Docs.buildDocumentUriUsingTree(tree,Docs.getTreeDocumentId(tree))
+    val wrapper=Docs.createDocument(c.contentResolver,root,Docs.Document.MIME_TYPE_DIR,config.getString("revisionFixtureCollision"))!!
+    val sentinel=Docs.createDocument(c.contentResolver,wrapper,"text/plain","existing.txt")!!
+    c.contentResolver.openOutputStream(sentinel)!!.use{it.write("existing destination".toByteArray())}
+   }
    if(config.optBoolean("folderFixture")) {
     val folder=File(c.filesDir,"smoke-folder-${config.getString("id")}").apply{mkdirs()}
     File(folder,"nested/empty directory").mkdirs()
@@ -62,10 +72,24 @@ class SmokeInstrumentation:Instrumentation(){
    var backgroundAt=0L
    var backgroundBytes=0L
    var cacheReuses=0
+   var reviewed=false
    while(System.currentTimeMillis()<end){
     Thread.sleep(300)
     val s=TransferService.state(c)
     if(s.optString("id")!=config.getString("id"))continue
+    if(!reviewed && s.has("crocReview") && config.optString("reviewDecision").isNotEmpty()){
+        val review=CrocBatchReview.read(c,s.getString("id"),s.getString("crocReview")) ?: error("Missing Croc review")
+        sendStatus(1,Bundle().apply{putString("revision_review",review.toString())})
+        runOnMainSync{
+            MainActivity::class.java.getDeclaredMethod("render").apply{isAccessible=true}.invoke(activity)
+            val dialog=MainActivity::class.java.getDeclaredField("crocReviewDialog").apply{isAccessible=true}
+                .get(activity) as android.app.AlertDialog
+            val button=if(config.getString("reviewDecision")=="apply")android.content.DialogInterface.BUTTON_POSITIVE
+                else android.content.DialogInterface.BUTTON_NEGATIVE
+            check(dialog.getButton(button).performClick())
+        }
+        reviewed=true
+    }
     check(!s.optBoolean("awaitingCacheChoice")){"Receive unexpectedly asked for cache confirmation"}
     if(s.optLong("cachedReceiveBytes")>0 && cacheReuses==0){
         cacheReuses++;sendStatus(1,Bundle().apply{putString("cached_receive_bytes",s.getLong("cachedReceiveBytes").toString())})
@@ -83,7 +107,12 @@ class SmokeInstrumentation:Instrumentation(){
         val deadline=System.currentTimeMillis()+20000
         while(TransferService.state(c).optString("status")!="paused" && System.currentTimeMillis()<deadline)Thread.sleep(50)
         val saved=TransferService.state(c);check(saved.optString("status")=="paused"){"Pause did not finish"}
-        val cache=File(c.filesDir,if(config.optString("mode")=="Croc")"received/${saved.getString("id")}" else "blobs/${saved.getString("id")}").walkTopDown().filter{it.isFile}.sumOf{it.length()}
+        val cache=if(saved.optBoolean("crocDirect")){
+            val rows=saved.getJSONObject("crocPending")
+            rows.keys().asSequence().sumOf{path->
+                c.contentResolver.openFileDescriptor(android.net.Uri.parse(rows.getString(path)),"r")!!.use{it.statSize}
+            }
+        }else File(c.filesDir,if(config.optString("mode")=="Croc")"received/${saved.getString("id")}" else "blobs/${saved.getString("id")}").walkTopDown().filter{it.isFile}.sumOf{it.length()}
         check(cache>0){"Pause discarded the partial cache"}
         sendStatus(1,Bundle().apply{putString("paused_cache_bytes",cache.toString())})
         saved.remove("log")

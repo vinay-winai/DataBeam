@@ -21,6 +21,30 @@ object StorageRegression {
     put(MediaStore.Downloads.DISPLAY_NAME,name);put(MediaStore.Downloads.RELATIVE_PATH,"Download/DataBeam/");put(MediaStore.Downloads.MIME_TYPE,"text/plain")
    })!!;created.add(old)
    c.contentResolver.openOutputStream(old)!!.use{it.write("existing file stays intact".toByteArray())}
+   val directName="direct-$name"
+   val wrapper=CrocDownloads.reserve(c,"${directName}_databeam")
+   val downloads=android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS)
+   val directRoot=File(downloads,"DataBeam")
+   cleanup.add(File(directRoot,wrapper))
+   val rows=JSONObject()
+   val offer=JSONObject().put("entries",org.json.JSONArray()
+       .put(JSONObject().put("path",directName).put("kind","file").put("size",1))
+       .put(JSONObject().put("path","$directName-empty/deep").put("kind","directory")))
+   val paths=CrocDownloads.prepare(c,offer,wrapper,rows,{false}){}
+   val physical=paths.getString(directName)
+   val pending=Uri.parse(rows.getString(directName));created.add(pending)
+   val descriptor=android.system.Os.open(physical,android.system.OsConstants.O_RDWR,0)
+   try{android.system.Os.pwrite(descriptor,byteArrayOf(42),0,1,0)}finally{android.system.Os.close(descriptor)}
+   val inode=android.system.Os.stat(physical).st_ino
+   val dirs=CrocDownloads.publish(c,offer,wrapper,rows){false}
+   check(android.system.Os.stat(File(directRoot,"$wrapper/$directName").path).st_ino==inode)
+   val targets=JSONObject()
+   CrocDownloads.moveOut(c,wrapper,rows,dirs,targets){}
+   val actual=File(directRoot,targets.getString(directName))
+   cleanup.add(File(directRoot,targets.getString("$directName-empty")))
+   check(!File(directRoot,wrapper).exists())
+   check(actual.isFile && android.system.Os.stat(actual.path).st_ino==inode){"Move files out made a copy"}
+   check(c.contentResolver.openInputStream(pending)!!.use{it.read()}==42)
    val source=File(c.filesDir,"storage-test-${UUID.randomUUID()}").apply{mkdirs()}
    cleanup.add(source)
    File(source,name).writeText("new incoming data")
@@ -55,7 +79,7 @@ object StorageRegression {
     check(c.contentResolver.openInputStream(Uri.parse(saved.getString(name)))!!.use{String(it.readBytes())}=="new incoming data")
     Storage.publishDownloads(c,source,saved,{false},folder){_,_->error("Repeat custom save created a duplicate")}
    }
-   result=Bundle().apply{putString("result","PASS nested automatic save, zero-byte files, empty directories, existing-file protection, idempotent publication; custom folder tested=$folder")}
+   result=Bundle().apply{putString("result","PASS nested automatic save, zero-byte files, empty directories, existing-file protection, idempotent publication; custom folder tested=$folder; Croc pending publish and Move files out preserved inode")}
   } catch(e:Throwable){resultCode=1;result=Bundle().apply{putString("error",e.stackTraceToString())}}
   finally{created.forEach{runCatching{targetContext.contentResolver.delete(it,null,null)}};cleanup.forEach{it.deleteRecursively()}}
   finish(resultCode,result)

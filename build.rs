@@ -21,7 +21,15 @@ fn prepare_croc_payload() {
         &fs::read("patches/croc-engine.json").expect("read Croc engine recipe"),
     )
     .expect("parse Croc engine recipe");
-    println!("cargo:rerun-if-changed=patches/{}", recipe["patch"].as_str().expect("Croc patch path"));
+    let patches = [
+        ("patch", "patch_sha256"),
+        ("receive_patch", "receive_patch_sha256"),
+        ("downloads_patch", "downloads_patch_sha256"),
+        ("revision_patch", "revision_patch_sha256"),
+    ];
+    for (key, _) in patches {
+        println!("cargo:rerun-if-changed=patches/{}", recipe[key].as_str().expect("Croc patch path"));
+    }
     let version = recipe["engine_version"]
         .as_str()
         .expect("Croc engine version");
@@ -54,17 +62,18 @@ fn prepare_croc_payload() {
             Some(target.as_str()),
             "Croc target mismatch"
         );
-        let patch =
-            fs::read(PathBuf::from("patches").join(recipe["patch"].as_str().unwrap())).unwrap();
-        let patch_hash: String = Sha256::digest(patch)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        assert_eq!(
-            metadata["patch_sha256"].as_str(),
-            Some(patch_hash.as_str()),
-            "stale Croc patch: rerun scripts/prepare_croc.py"
-        );
+        for (key, checksum) in patches {
+            let patch = fs::read(PathBuf::from("patches").join(recipe[key].as_str().unwrap())).unwrap();
+            let patch_hash: String = Sha256::digest(patch)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            assert_eq!(
+                metadata[checksum].as_str(),
+                Some(patch_hash.as_str()),
+                "stale Croc patch: rerun scripts/prepare_croc.py"
+            );
+        }
         let bytes = fs::read(&gzip).expect("read prepared Croc payload");
         let hash: String = Sha256::digest(&bytes)
             .iter()

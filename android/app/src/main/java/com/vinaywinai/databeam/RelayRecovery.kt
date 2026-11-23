@@ -46,7 +46,7 @@ object RelayRecovery {
         val ansi=Regex("\u001B\\[[0-?]*[ -/]*[@-~]")
         val error=output.lineSequence().map{it.replace(ansi,"").trim()}.filter{it.isNotEmpty()}.toList().asReversed().firstOrNull{line->
             val lower=line.lowercase()
-            !lower.startsWith("databeam_") && listOf("could not", "relay connection failed", "error:", "failed:", "password", "passphrase", "pake", "permission denied", "room not found", "room is full", "connection reset", "connection refused", "timed out", "i/o timeout", "decompress", "corrupt input", "no such file", "no public relay").any{lower.contains(it)}
+            !lower.startsWith("databeam_") && listOf("could not", "relay connection failed", "error:", "failed:", "password", "passphrase", "pake", "permission denied", "room not found", "room is full", "connection reset", "connection refused", "timed out", "i/o timeout", "decompress", "corrupt input", "no such file", "no public relay", "sharing different files", "cannot verify this sender", "no saved file list", "verification failed for", "the saved partial transfer was kept").any{lower.contains(it)}
         }
         return error?.take(600) ?: "Croc could not complete the transfer (exit $exit). Check the code, network connection, and that the sender is still sharing."
     }

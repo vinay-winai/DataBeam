@@ -4,10 +4,17 @@ import org.json.JSONObject
 
 /** Presentation depends on direction: a stopped sender starts a new session. */
 object TransferLabels {
-    private fun senderRetry(s:JSONObject)=if(s.optString("text").isNotEmpty())"Your text is kept. Edit it and tap Send text, or tap Restart sharing."
-        else "To resume, reselect the exact same files or folder and start a new transfer. "+
-            if(s.optString("mode")=="Croc")"Keep the same Croc code so the receiver can tap Resume with its partial files."
-            else "Share the new code or ticket with the receiver; it can continue using its saved data."
+    private fun hasSendPayload(s:JSONObject)=s.optString("text").isNotEmpty() || (s.optJSONArray("uris")?.length() ?: 0)>0
+    fun canResend(s:JSONObject)=s.optString("action")=="send" && s.optString("status") in listOf("paused","interrupted","stopped") && hasSendPayload(s)
+    private fun senderRetry(s:JSONObject,selectionRetained:Boolean=false):String {
+        if(s.optString("text").isNotEmpty())return "Tap Resend to share the same text again."
+        val retry=if(hasSendPayload(s))"Tap Resend to share the same files again. Select any missing items if prompted."
+            else if(selectionRetained)"To resume, send the same selected files or folder again."
+            else "To resume, reselect the exact same files or folder and start a new transfer."
+        val receiver=if(s.optString("mode")=="Croc")"Share your current Croc code so the receiver can resume from Croc receive history."
+            else "Share the new code or ticket with the receiver so they can continue using saved data."
+        return "$retry $receiver"
+    }
     fun broadcast(s:JSONObject)=s.optString("action")=="send" && s.optString("mode")=="Sendme" && s.optBoolean("broadcast")
     fun autoEnd(s:JSONObject)=s.optString("action")=="send" && s.optString("mode") in listOf("Sendme","EasySendMe") &&
         !broadcast(s) && s.optJSONObject("timing")?.optBoolean("complete")==true
@@ -39,18 +46,19 @@ object TransferLabels {
             else->"Preparing transfer"
         }
     }
-    fun message(s:JSONObject):String {
+    fun message(s:JSONObject,selectionRetained:Boolean=false):String {
         val receiving=s.optString("action")=="receive"
         val raw=s.optString("message")
         return when(s.optString("status")) {
-            "paused"->if(receiving)receiveRetry(s) else senderRetry(s)
-            "stopped"->senderRetry(s)
+            "paused"->if(receiving)receiveRetry(s) else senderRetry(s,selectionRetained)
+            "stopped"->senderRetry(s,selectionRetained)
             "interrupted"->when {
                 raw.startsWith("App restarted") || raw.startsWith("App closed") || raw.isBlank()->interruptedMessage(s)
+                raw.startsWith("Sharing stopped when the app closed.")->interruptedMessage(s)
                 raw.contains("Clear the transfer card",ignoreCase=true)->raw
                 receiving && (raw.contains("invalid ticket",ignoreCase=true) || raw.contains("did not supply",ignoreCase=true))->"$raw\nConfirm both devices use ${s.optString("mode")}. Paste the correct code or ticket, then tap Receive."
                 receiving->"$raw\n${receiveRetry(s)}"
-                else->"$raw\n${senderRetry(s)}"
+                else->"$raw\n${senderRetry(s,selectionRetained)}"
             }
             "complete"->if(receiving)if(raw in listOf("Complete",""))"Received successfully." else raw else "Sent successfully."
             "running"->when {
@@ -72,5 +80,8 @@ object TransferLabels {
     private fun receiveRetry(s:JSONObject)=if(s.optString("mode")=="EasySendMe")
         "Saved data is kept. Tap Resume. Use the current session if the sender is still sharing, or New code if they shared the same files again."
         else if(s.optString("mode")=="Sendme")"Saved data is kept. Tap Resume. Use the current session while it is still sharing, or New ticket after the sender shares the same files again."
-        else "Partial data is kept. Keep the sender sharing, then tap Resume. If its code or ticket changed, paste the new one first."
+        else if(s.optBoolean("connectionRetained"))"Tap Resume to continue the current connection."
+        else if(s.optJSONArray("payloadNames")?.length()?.let{it>0}==true)
+            "Open Croc receive history and tap Resume. Ask the sender to share the same files again."
+        else "Confirm the Croc code and ask the sender to keep sharing, then try Receive again."
 }

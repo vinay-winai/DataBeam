@@ -2,5 +2,6 @@
  <application>
   <!-- Synthetic fixture bytes only; removed with the instrumentation package. -->
   <provider android:name="com.vinaywinai.databeam.SourceFixtureProvider" android:authorities="com.vinaywinai.databeam.test.sourcefixture" android:exported="true" android:grantUriPermissions="true"/>
+  <provider android:name="com.vinaywinai.databeam.RevisionDestinationProvider" android:authorities="com.vinaywinai.databeam.test.revisionfixture" android:exported="true"/>
  </application>
 </manifest>

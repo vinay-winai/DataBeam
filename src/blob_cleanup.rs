@@ -83,6 +83,30 @@ pub fn scan(
     result
 }
 
+pub fn clear_expired(roots: Vec<PathBuf>, kept: &HashSet<String>, cutoff: std::time::SystemTime) {
+    fn is_old(path: &Path, cutoff: std::time::SystemTime) -> bool {
+        let Ok(metadata) = fs::symlink_metadata(path) else { return false; };
+        if !metadata.modified().is_ok_and(|modified| modified <= cutoff) {
+            return false;
+        }
+        !metadata.is_dir() || fs::read_dir(path).is_ok_and(|mut children| {
+            children.all(|child| child.is_ok_and(|child| is_old(&child.path(), cutoff)))
+        })
+    }
+
+    for root in roots {
+        for entry in fs::read_dir(root).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            let Some(hash) = name.to_str().and_then(|name| name.strip_prefix(".sendme-recv-")) else { continue; };
+            if hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && !kept.contains(hash) && entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && is_old(&entry.path(), cutoff) {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

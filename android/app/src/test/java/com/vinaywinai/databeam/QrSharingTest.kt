@@ -7,6 +7,17 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class QrSharingTest {
+    @Test fun easySendMeMarkRoutesTheUnderlyingCode() {
+        val shared=QrSharing.sharedCode("EasySendMe","oatmilk")
+        assertEquals("oatmilkesm",shared)
+        val parsed=QrSharing.parse(shared)
+        assertTrue(parsed.easySendMe)
+        assertEquals("oatmilk",parsed.value)
+        assertFalse(QrSharing.parse("oatmilk").easySendMe)
+        assertEquals("oatmilk",QrSharing.easySendMeCode("oatmilk ESM"))
+        assertEquals("oatmilkesm",QrSharing.easySendMeCode("oatmilkesmesm"))
+        assertNull(QrSharing.easySendMeCode("shortesm"))
+    }
     @Test fun generatedQrPreservesCodesAndTicketsExactly() {
         for(value in listOf("birch-coral-otter","custom123", "blob"+"a".repeat(220), "custom-\u03b1\u03b2\u03b3")) {
             val matrix=QrSharing.matrix(value)

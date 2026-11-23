@@ -1,0 +1,208 @@
+--- a/src/croc/croc.go
++++ b/src/croc/croc.go
+@@ -1385,12 +1385,12 @@
+ // two percent of the input is treated as incompressible, avoiding codec work
+ // and slight wire expansion for archives, media, and encrypted files.
+ func shouldCompressFile(path string, sample, compressedOutput []byte) (bool, []byte) {
+-	file, err := os.Open(path)
++	file, err := utils.DataBeamOpenSource(path)
+ 	if err != nil {
+ 		return true, compressedOutput
+ 	}
+ 	defer file.Close()
+-	n, err := file.Read(sample)
++	n, err := file.ReadAt(sample, 0)
+ 	if err != nil && err != io.EOF {
+ 		return true, compressedOutput
+ 	}
+@@ -3563,7 +3563,7 @@
+ 		if err = c.validateSourceUnchanged(c.FilesToTransferCurrentNum); err != nil {
+ 			return err
+ 		}
+-		c.fread, err = os.Open(pathToFile)
++		c.fread, err = utils.DataBeamOpenSource(pathToFile)
+ 		c.numfinished = 0
+ 		if err != nil {
+ 			return
+--- a/src/utils/ctx.go
++++ b/src/utils/ctx.go
+@@ -119,7 +119,7 @@
+ 		return []byte(SHA256(target)), nil
+ 	}
+ 
+-	f, err := os.Open(fname)
++	f, err := DataBeamOpenSource(fname)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+--- a/src/utils/databeam_source_adapter.go
++++ b/src/utils/databeam_source_adapter.go
+@@ -1,34 +1,56 @@
+ package utils
+ 
+ import (
+-    "os"
+-    "path/filepath"
+-    "runtime"
+-    "strconv"
+-    "strings"
++	"os"
++	"path/filepath"
++	"runtime"
++	"strconv"
++	"strings"
+ )
+ 
+-// Only the Android recipe applies this adapter. Only named descriptors beneath
+-// the declared private source tree represent regular bytes, not symlink text.
++// Only aliases beneath the app's private source tree can represent provider files.
++func dataBeamSourceAlias(path string) string {
++	root := os.Getenv("DATABEAM_ANDROID_SOURCE_ROOT")
++	if runtime.GOOS != "android" || !filepath.IsAbs(root) {
++		return ""
++	}
++	abs, err := filepath.Abs(path)
++	if err != nil {
++		return ""
++	}
++	rel, err := filepath.Rel(root, abs)
++	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
++		return ""
++	}
++	target, _ := os.Readlink(abs)
++	return target
++}
++
++func DataBeamOpenSource(path string) (*os.File, error) {
++	if id, ok := strings.CutPrefix(dataBeamSourceAlias(path), "databeam-fd:"); ok {
++		return openDataBeamDescriptor(path, id)
++	}
++	return os.Open(path)
++}
++
+ func DataBeamSourceStat(path string) (os.FileInfo, error) {
+-    if runtime.GOOS == "android" {
+-        root := os.Getenv("DATABEAM_ANDROID_SOURCE_ROOT")
+-        if filepath.IsAbs(root) {
+-            abs, err := filepath.Abs(path)
+-            rel, relErr := filepath.Rel(filepath.Clean(root), abs)
+-            if err == nil && relErr == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+-                target, linkErr := os.Readlink(abs)
+-                prefix := "/proc/"+strconv.Itoa(os.Getppid())+"/fd/"
+-                if linkErr == nil && strings.HasPrefix(target, prefix) {
+-                    fd, parseErr := strconv.Atoi(strings.TrimPrefix(target, prefix))
+-                    if parseErr == nil && fd >= 0 {
+-                        info, statErr := os.Stat(abs)
+-                        if statErr != nil { return nil, statErr }
+-                        if info.Mode().IsRegular() { return info, nil }
+-                    }
+-                }
+-            }
+-        }
+-    }
+-    return os.Lstat(path)
++	target := dataBeamSourceAlias(path)
++	if id, ok := strings.CutPrefix(target, "databeam-fd:"); ok {
++		file, err := openDataBeamDescriptor(path, id)
++		if err != nil {
++			return nil, err
++		}
++		defer file.Close()
++		return file.Stat()
++	}
++	prefix := "/proc/" + strconv.Itoa(os.Getppid()) + "/fd/"
++	if id, ok := strings.CutPrefix(target, prefix); ok {
++		if fd, err := strconv.Atoi(id); err == nil && fd >= 0 {
++			info, err := os.Stat(path)
++			if err != nil || info.Mode().IsRegular() {
++				return info, err
++			}
++		}
++	}
++	return os.Lstat(path)
+ }
+--- /dev/null
++++ b/src/utils/databeam_source_fd_android.go
+@@ -0,0 +1,70 @@
++package utils
++
++import (
++	"encoding/binary"
++	"fmt"
++	"net"
++	"os"
++	"strconv"
++	"strings"
++	"time"
++
++	"golang.org/x/sys/unix"
++)
++
++func openDataBeamDescriptor(path, id string) (*os.File, error) {
++	fail := func(reason error) (*os.File, error) {
++		return nil, fmt.Errorf("could not read selected Android file %q: %w", path, reason)
++	}
++	requested, err := strconv.ParseUint(id, 10, 31)
++	broker := os.Getenv("DATABEAM_ANDROID_SOURCE_BROKER")
++	if err != nil || !strings.HasPrefix(broker, "databeam-croc-") {
++		return fail(os.ErrInvalid)
++	}
++	conn, err := net.DialTimeout("unix", "@"+broker, 3*time.Second)
++	if err != nil {
++		return fail(err)
++	}
++	defer conn.Close()
++	socket := conn.(*net.UnixConn)
++	if err := socket.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
++		return fail(err)
++	}
++	var request [4]byte
++	binary.BigEndian.PutUint32(request[:], uint32(requested))
++	if _, err := socket.Write(request[:]); err != nil {
++		return fail(err)
++	}
++	var response [1]byte
++	control := make([]byte, unix.CmsgSpace(4))
++	n, controlSize, flags, _, err := socket.ReadMsgUnix(response[:], control)
++	if err != nil {
++		return fail(err)
++	}
++	messages, err := unix.ParseSocketControlMessage(control[:controlSize])
++	if err != nil {
++		return fail(err)
++	}
++	var descriptors []int
++	for _, message := range messages {
++		fds, err := unix.ParseUnixRights(&message)
++		if err == nil {
++			descriptors = append(descriptors, fds...)
++		}
++	}
++	if n != 1 || response[0] != 1 || flags&unix.MSG_CTRUNC != 0 || len(descriptors) != 1 {
++		for _, fd := range descriptors {
++			_ = unix.Close(fd)
++		}
++		return fail(os.ErrPermission)
++	}
++	fd := descriptors[0]
++	unix.CloseOnExec(fd)
++	file := os.NewFile(uintptr(fd), path)
++	info, err := file.Stat()
++	if err != nil || !info.Mode().IsRegular() {
++		file.Close()
++		return fail(os.ErrInvalid)
++	}
++	return file, nil
++}
+--- /dev/null
++++ b/src/utils/databeam_source_fd_other.go
+@@ -0,0 +1,9 @@
++//go:build !android
++
++package utils
++
++import "os"
++
++func openDataBeamDescriptor(path, _ string) (*os.File, error) {
++	return nil, &os.PathError{Op: "open", Path: path, Err: os.ErrInvalid}
++}

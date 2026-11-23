@@ -43,6 +43,9 @@ pub struct SendOptions {
     pub jobs: Option<usize>,
     /// Cooperative GUI cancellation, including directory scanning and imports.
     pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Session-local read-only source handles, keyed by their staged filenames.
+    #[cfg(feature = "descriptor-sources")]
+    pub source_files: Arc<std::collections::HashMap<PathBuf, Arc<std::fs::File>>>,
 }
 
 #[derive(Debug, Default)]

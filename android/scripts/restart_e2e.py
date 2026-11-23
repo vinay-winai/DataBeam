@@ -18,8 +18,10 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--serial',default='RZCT9012X2V')
     parser.add_argument('--case',action='append',help='MODE:SCENARIO, e.g. Sendme:stop')
-    parser.add_argument('--kind',choices=('flat','folder','provider'),help='Override fixture: references, folder paths, or private/stream/bounded provider fallbacks')
+    parser.add_argument('--kind',choices=('flat','folder','provider','text'),help='Override the generated transfer fixture')
     parser.add_argument('--mib',type=int,help='Override generated payload size for a bounded network repeat')
+    parser.add_argument('--test-apk',type=Path,default=ROOT/'android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk',
+                        help='Instrumentation APK signed for the installed development app')
     parser.add_argument('--broadcast',action='store_true',help='Sendme only: verify two real receivers and retain sharing until Stop')
     parser.add_argument('--work',type=Path)
     parser.add_argument('--relay',default='1.getcroc.com:9009',help='Croc rendezvous endpoint shared by phone and desktop')
@@ -160,7 +162,7 @@ def main():
         restore()
     try:
         print('Backup:',work,flush=True)
-        print(adb('install','-r','-t',ROOT/'android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk').decode().strip(),flush=True)
+        print(adb('install','-r','-t',args.test_apk).decode().strip(),flush=True)
         relay_binary=work/'croc-relay.exe';shutil.copyfile(CROC,relay_binary)
         defaults=[(m,s) for s in ('stop','closed') for m in ('Croc','Sendme','EasySendMe')]+[('Croc','text')]+[(m,'mid') for m in ('Croc','Sendme','EasySendMe')]
         cases=[tuple(c.split(':',1)) for c in args.case] if args.case else defaults
@@ -168,7 +170,7 @@ def main():
             assert mode in ('Croc','Sendme','EasySendMe') and scenario in ('stop','closed','text','mid')
             assert not args.broadcast or mode=='Sendme','Broadcast is supported for Sendme tickets'
             case=str(uuid.uuid4());case_ids.append(case);started=time.monotonic();case_procs=len(procs)
-            kind='text' if scenario=='text' else args.kind or ('folder' if scenario=='closed' else 'flat')
+            kind='text' if scenario=='text' else args.kind or 'flat'
             print('START',mode,scenario,flush=True)
             record=dict(mode=mode,scenario=scenario,kind=kind,run=case,status='FAIL')
             try:

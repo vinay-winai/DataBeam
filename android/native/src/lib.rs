@@ -1,6 +1,6 @@
 use jni::{
     objects::{JClass, JString},
-    sys::jstring,
+    sys::{jboolean, jstring},
     JNIEnv,
 };
 use serde::Deserialize;
@@ -134,10 +134,52 @@ struct Config {
     output: PathBuf,
     #[serde(default = "root_name")]
     root: String,
+    #[cfg(all(target_os = "android", feature = "descriptor-sources"))]
+    #[serde(default, rename = "sourceRoot")]
+    source_root: PathBuf,
+    #[cfg(all(target_os = "android", feature = "descriptor-sources"))]
+    #[serde(default, rename = "sourceDescriptors")]
+    source_descriptors: std::collections::HashMap<PathBuf, i32>,
 }
 fn root_name() -> String {
     "DataBeam_databeam".into()
 }
+#[cfg(all(target_os = "android", feature = "descriptor-sources"))]
+fn source_files(config: &Config) -> anyhow::Result<Arc<std::collections::HashMap<PathBuf, Arc<std::fs::File>>>> {
+    use std::{collections::HashMap, fs::File, os::fd::FromRawFd};
+
+    let mut files = HashMap::new();
+    if config.source_descriptors.is_empty() {
+        return Ok(Arc::new(files));
+    }
+    let root = config.source_root.canonicalize()?;
+    for (path, &fd) in &config.source_descriptors {
+        anyhow::ensure!(path.is_absolute() && fd >= 0, "Invalid selected file descriptor");
+        let parent = path.parent().ok_or_else(|| anyhow::anyhow!("Selected file has no parent"))?;
+        anyhow::ensure!(parent.starts_with(&root) && parent.canonicalize()? == parent,
+            "Selected file is outside the transfer source folder");
+        anyhow::ensure!(std::fs::read_link(path)? == PathBuf::from(format!("databeam-fd:{fd}")),
+            "Selected file descriptor changed");
+        // Kotlin holds the original until this operation ends. Own a duplicate
+        // so the store can finish reads and close its handles independently.
+        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if duplicate < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let file = unsafe { File::from_raw_fd(duplicate) };
+        anyhow::ensure!(file.metadata()?.is_file(), "Selected source is not a regular file");
+        files.insert(path.clone(), Arc::new(file));
+    }
+    Ok(Arc::new(files))
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vinaywinai_databeam_NativeBridge_supportsSendmeFileDescriptors(
+    _: JNIEnv, _: JClass,
+) -> jboolean {
+    u8::from(cfg!(all(target_os = "android", feature = "descriptor-sources")))
+}
+
 fn run(c: Config) -> anyhow::Result<Value> {
     let cancel = Arc::new(AtomicBool::new(STOP_REQUESTED.load(Ordering::SeqCst)));
     {
@@ -159,6 +201,8 @@ fn run(c: Config) -> anyhow::Result<Value> {
     rt.block_on(async {
         let app: sendme::AppHandle = Some(Arc::new(Emitter));
         if c.action == "send" {
+            #[cfg(all(target_os = "android", feature = "descriptor-sources"))]
+            let source_files = source_files(&c)?;
             let share = sendme::start_share(
                 c.paths,
                 c.root,
@@ -166,6 +210,8 @@ fn run(c: Config) -> anyhow::Result<Value> {
                     blob_dir: Some(c.cache),
                     cancel: Some(cancel.clone()),
                     ticket_type: sendme::AddrInfoOptions::RelayAndAddresses,
+                    #[cfg(all(target_os = "android", feature = "descriptor-sources"))]
+                    source_files,
                     ..Default::default()
                 },
                 app,

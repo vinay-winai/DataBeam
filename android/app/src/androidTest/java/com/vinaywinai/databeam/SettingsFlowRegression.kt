@@ -49,7 +49,7 @@ object SettingsFlowRegression {
                 try{method.invoke(activity,"generated-short-code");error("Disabled Croc code was accepted")}catch(e:java.lang.reflect.InvocationTargetException){check(e.cause is IllegalArgumentException)}
             }
             settingsOpen();main{(field("crocEngineToggle") as Switch).isChecked=true;(field("sendmeEngineToggle") as Switch).isChecked=false}
-            check(modeNames()==listOf("Croc"));screenshot("settings-engines-test.png");closeSettings();check(menuIds()==listOf(1,3))
+            check(modeNames()==listOf("Croc"));screenshot("settings-engines-test.png");closeSettings();check(menuIds()==listOf(1,3,EngineOptions.CROC_HISTORY_ACTION))
             main{check((field("broadcastChoice") as View).visibility==View.GONE)}
             val ticket=args.getString("ticket")!!;check(NativeBridge.hash(ticket).isNotEmpty())
             render(JSONObject().put("id",UUID.randomUUID().toString()).put("mode","Croc").put("action","receive").put("status","complete").put("text",ticket))
@@ -57,7 +57,7 @@ object SettingsFlowRegression {
             render(JSONObject().put("id",UUID.randomUUID().toString()).put("mode","Sendme").put("action","receive").put("status","paused").put("ticket",ticket))
             main{check((field("transferPanel") as View).visibility==View.GONE)}
             settingsOpen();main{(field("sendmeEngineToggle") as Switch).isChecked=true};closeSettings()
-            check(modeNames()==listOf("EasySendMe","Sendme","Croc"));check(menuIds()==listOf(1,2,3))
+            check(modeNames()==listOf("Croc","Sendme"));check(menuIds()==listOf(1,2,3,4,EngineOptions.CROC_HISTORY_ACTION))
             for(mode in listOf("Sendme","EasySendMe")){
                 render(JSONObject().put("id",UUID.randomUUID().toString()).put("mode",mode).put("action","receive").put("status","paused").put("ticket",ticket).put("code","same-short-code"))
                 main{
@@ -77,11 +77,11 @@ object SettingsFlowRegression {
                 check(!TransferService.isBusy())
             }
             // Both Settings Open and completed-card Open call this same method.
-            val method=MainActivity::class.java.getDeclaredMethod("openDownloadFolder",String::class.java).apply{isAccessible=true}
-            main{method.invoke(activity,AppSettings.folder(c))};Thread.sleep(1200)
+            val method=MainActivity::class.java.getDeclaredMethod("openDownloadFolder",String::class.java,String::class.java).apply{isAccessible=true}
+            main{method.invoke(activity,AppSettings.folder(c),"")};Thread.sleep(1200)
             val first=resumed();check(!first.second.startsWith(c.packageName+"/"))
             main{(c.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager).appTasks.first{it.taskInfo.taskId==activity!!.taskId}.moveToFront()}
-            Thread.sleep(600);main{method.invoke(activity,AppSettings.folder(c))};Thread.sleep(1000)
+            Thread.sleep(600);main{method.invoke(activity,AppSettings.folder(c),"")};Thread.sleep(1000)
             val second=resumed();check(first.second==second.second)
             if(first==second)out.putString("folder_reused",second.second+" task "+second.third)
             else {

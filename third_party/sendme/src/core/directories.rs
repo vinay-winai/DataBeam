@@ -15,7 +15,10 @@ struct Manifest {
     directories: Vec<String>,
 }
 
-pub fn collect(paths: &[PathBuf], cancel: Option<&AtomicBool>) -> anyhow::Result<Vec<String>> {
+pub fn collect<'a>(
+    paths: impl IntoIterator<Item = &'a PathBuf>,
+    cancel: Option<&AtomicBool>,
+) -> anyhow::Result<Vec<String>> {
     let mut result = Vec::new();
     for source in paths {
         super::send::check_cancelled(cancel)?;

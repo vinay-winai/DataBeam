@@ -17,7 +17,9 @@ Select files/folder or Croc text
            next receiver -> Connecting / Sending; new completion summary
            Stop sharing -> Sent; session ends; clear selected payload; retain concise completion card
            app closes -> Sent; session ends; clear selected payload; retain concise completion card
-  stopped/failed before acknowledgement -> Sharing stopped; retain reason/progress; reselect exact original files for a new transfer (text stays editable)
+  stopped/failed before acknowledgement -> Sharing stopped; retain reason/progress
+       Resend with accessible original sources or text -> start a new sharing session
+       Resend with missing or inaccessible sources -> restore available items and ask to reselect missing items
 ```
 
 | Evidence/state | UI and behavior | Regression coverage |
@@ -29,7 +31,7 @@ Select files/folder or Croc text
 | Another receiver connects | Use the new connection's path; remove the idle Sent presentation; start a new summary when payload begins | `TransferRouteTest`, `TransferTimingTest`, `TransferLabelsTest` |
 | Explicit Sendme Broadcast remains open after completion | Keep the foreground notification and configuration lock; notification says Sent; serve additional receivers until Stop | sender restart E2E, UI controls regression |
 | Stop or app closure after acknowledged completion | Keep Sent; clear payload and reselect files for a new session | sender restart E2E, `SenderClosureRegression` |
-| Stop/failure/app closure before completion | Sharing stopped; preserve filenames/reason/progress; clear file selection and require fresh selection; keep failed text editable | `TransferLabelsTest`, sender restart E2E |
+| Stop/failure/app closure before completion | Sharing stopped. Preserve filenames, reason and progress. Keep the selection during the app session. On Resend, reopen saved source URIs or restore text and start only if the whole payload is available. | `TransferLabelsTest`, `UiControlsRegression`, sender restart E2E |
 | Activity reopened while sender service remains alive | Restore selected items and their names from the session | sender restart E2E |
 | Older completed sender lacks a completion-time snapshot | Omit an unreliable elapsed value; do not invent its finish time | `TransferTimingTest` |
 
@@ -41,7 +43,7 @@ Broadcast is off by default and is available only for Sendme ticket sharing, as 
 | --- | --- | --- |
 | Matching partial/full native cache | Automatically reuse matching verified data on Receive and Resume; no confirmation prompt | receive-cache E2E, EasySendMe UI resume E2E |
 | Receiver paused or interrupted | Preserve current data; manual Resume requires a sharing sender | receive-cache E2E, Croc reconnect E2E |
-| Source/reference restart | No file Restart button. Freshly reselected originals issue a new native ticket with the same hash for unchanged content; expired grants are never silently reused | source/restart E2E |
+| Source/reference restart | Resend validates original URI access. If a URI is unavailable, ask the sender to select that item again. A new native ticket for unchanged sources keeps the same collection hash. | source/restart E2E, `UiControlsRegression` |
 | Saving completed files | Protect existing destination files, verify publication, then remove private working duplicates | storage/cleanup regressions, receive-cache E2E |
 | Idle storage cleanup | Preserve current resume/restart data; ask before deleting unknown orphan data; expire eligible known inactive data after seven days when checked | `CleanupRegression`, `TransferCleanupTest` |
 
@@ -59,7 +61,7 @@ Native card Resume belongs to its saved transfer and ignores unrelated text in t
 
 - Initial zero/cached byte samples, preparation and receiver wait do not start elapsed time. The first advancing payload sample starts it. Pauses, process downtime and reconnect waits are excluded. Native samples carry their emission timestamp.
 - Latest known selected Direct/Relay replaces the initial path for both directions; teardown unknown/closed events do not erase it. Route and completion events survive telemetry bursts in the JNI queue.
-- Successful sends clear files/text in the draft and saved session. Completion retains filenames, success, elapsed and the latest path. Failed files clear only the unreliable selection; the card retains names, progress and cause, and asks to reselect the exact originals. Failed text stays editable. Receive completion opens its original saved directory, including empty-folder-only transfers.
+- Successful sends clear files and text from the draft. Completion retains filenames, success, elapsed time and the latest path. Failed sends retain names, progress and cause. Receive completion opens its original saved directory, including empty-folder-only transfers.
 - Croc stdin carries text independently of argument limits. stdout remains exact text and is never parsed as telemetry; stderr supplies live status events, and stdout is inspected for terminal errors only after a failed exit. Oversize capture fails explicitly rather than reporting truncated text as success.
 - A bare public-relay connection failure enables bounded relay troubleshooting before payload begins; authentication, file and payload errors do not generate replacement codes. No general auto-retry is enabled.
 

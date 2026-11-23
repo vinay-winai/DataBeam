@@ -14,12 +14,13 @@ object Storage {
         } ?: error("Cannot read the selected save folder. Choose it again in Settings.")
         return list
     }
-    private fun uniqueName(name:String,existing:Set<String>):String {
-        if(name !in existing)return name
+    fun uniqueName(name:String,existing:Set<String>):String = uniqueName(name){it in existing}
+    fun uniqueName(name:String,isTaken:(String)->Boolean):String {
+        if(!isTaken(name))return name
         val dot=name.lastIndexOf('.').takeIf{it>0} ?: name.length
         val base=name.substring(0,dot);val extension=name.substring(dot)
         var number=1
-        while("$base ($number)$extension" in existing)number++
+        while(isTaken("$base ($number)$extension"))number++
         return "$base ($number)$extension"
     }
     private fun createFresh(c:Context,parent:Uri,type:String,name:String):Uri {
@@ -36,7 +37,8 @@ object Storage {
             parent=found?.uri ?: createFresh(c,parent,D.Document.MIME_TYPE_DIR,part)
         }
         check(!stopped()){"Paused"}
-        val uri=createFresh(c,parent,java.net.URLConnection.guessContentTypeFromName(file.name) ?: "application/octet-stream",file.name)
+        val name=relative.substringAfterLast('/')
+        val uri=createFresh(c,parent,java.net.URLConnection.guessContentTypeFromName(name) ?: "application/octet-stream",name)
         try {
             file.inputStream().use{input->c.contentResolver.openOutputStream(uri,"w")!!.use{out->
                 val buffer=ByteArray(256*1024)
@@ -48,6 +50,36 @@ object Storage {
     private fun safe(s:String):String {
         require(s.isNotBlank() && s!="." && s!=".." && !s.contains('/') && !s.contains('\\') && !s.contains('\u0000')) {"Unsafe file name"}
         return s
+    }
+    private fun destinationNames(c:Context,folder:String):Set<String> =
+        if(folder.isNotEmpty()){
+            val tree=Uri.parse(folder)
+            val parent=D.buildDocumentUriUsingTree(tree,D.getTreeDocumentId(tree))
+            children(c,parent).map{it.name}.toSet()
+        }else{
+            val downloads=android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS)
+            File(downloads,"DataBeam").list().orEmpty().toSet()
+        }
+
+    fun availableWrapper(c:Context,folder:String,name:String):String =
+        uniqueName(safe(name),destinationNames(c,folder))
+
+    fun unwrappedNames(c:Context,folder:String,source:File):org.json.JSONObject {
+        val names=source.list() ?: error("Received files are not ready")
+        val occupied=destinationNames(c,folder).toMutableSet()
+        val result=org.json.JSONObject()
+        for(name in names.sorted()){
+            val target=uniqueName(safe(name),occupied)
+            result.put(name,target)
+            occupied.add(target)
+        }
+        return result
+    }
+    fun folderDocument(c:Context,folder:String,wrapper:String):Uri {
+        val tree=Uri.parse(folder)
+        val parent=D.buildDocumentUriUsingTree(tree,D.getTreeDocumentId(tree))
+        if(wrapper.isEmpty())return parent
+        return children(c,parent).firstOrNull{it.name==wrapper && it.type==D.Document.MIME_TYPE_DIR}?.uri ?: parent
     }
     fun name(c:Context,u:Uri):String = c.contentResolver.query(u,arrayOf(OpenableColumns.DISPLAY_NAME),null,null,null)?.use {
         if(it.moveToFirst())it.getString(0) else null
@@ -89,12 +121,18 @@ object Storage {
     }
 
     /** Publish completed files automatically; record each URI to make export retries idempotent. */
-    fun publishDownloads(c:Context,source:File,published:org.json.JSONObject,stopped:()->Boolean,folder:String="",directories:org.json.JSONObject=org.json.JSONObject(),recordDirectory:(String,String)->Unit={_,_->},record:(String,String)->Unit) {
+    fun publishDownloads(c:Context,source:File,published:org.json.JSONObject,stopped:()->Boolean,folder:String="",directories:org.json.JSONObject=org.json.JSONObject(),recordDirectory:(String,String)->Unit={_,_->},wrapper:String="",topLevelNames:org.json.JSONObject?=null,record:(String,String)->Unit) {
         require(source.isDirectory){"Received files are not ready"}
+        fun destination(relative:String):String {
+            if(wrapper.isNotEmpty())return "${safe(wrapper)}/$relative"
+            if(topLevelNames==null)return relative
+            val name=relative.substringBefore('/')
+            return safe(topLevelNames.getString(name))+relative.substring(name.length)
+        }
         source.walkTopDown().filter{it.isDirectory && it!=source && it.list()?.isEmpty()==true}.forEach{directory->
             check(!stopped()){"Paused"}
             val relative=directory.relativeTo(source).invariantSeparatorsPath
-            val parts=relative.split('/').map{safe(it)}
+            val parts=destination(relative).split('/').map{safe(it)}
             val uri=if(folder.isNotEmpty()) {
                 val tree=Uri.parse(folder)
                 var parent=D.buildDocumentUriUsingTree(tree,D.getTreeDocumentId(tree))
@@ -119,12 +157,12 @@ object Storage {
             val known=published.optString(relative)
             if(known.isNotEmpty() && TransferCleanup.matches(c,file,Uri.parse(known)){check(!stopped()){"Paused"}})return@forEach
             if(folder.isNotEmpty()) {
-                val uri=publishTree(c,file,relative,Uri.parse(folder),stopped).toString()
+                val uri=publishTree(c,file,destination(relative),Uri.parse(folder),stopped).toString()
                 published.put(relative,uri);record(relative,uri)
             } else if(android.os.Build.VERSION.SDK_INT>=29) {
-                val parent=relative.substringBeforeLast('/',"")
+                val parent=destination(relative).substringBeforeLast('/',"")
                 val values=android.content.ContentValues().apply{
-                    put(android.provider.MediaStore.Downloads.DISPLAY_NAME,file.name)
+                    put(android.provider.MediaStore.Downloads.DISPLAY_NAME,destination(relative).substringAfterLast('/'))
                     put(android.provider.MediaStore.Downloads.MIME_TYPE,java.net.URLConnection.guessContentTypeFromName(file.name) ?: "application/octet-stream")
                     put(android.provider.MediaStore.Downloads.RELATIVE_PATH,"Download/DataBeam/"+parent)
                     put(android.provider.MediaStore.Downloads.IS_PENDING,1)
@@ -139,9 +177,10 @@ object Storage {
                     published.put(relative,uri.toString());record(relative,uri.toString())
                 }catch(e:Throwable){c.contentResolver.delete(uri,null,null);throw e}
             } else {
-                val folder=File(android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS),"DataBeam/"+relative.substringBeforeLast('/',""));check(folder.exists() || folder.mkdirs())
-                var dest=File(folder,file.name);var suffix=1
-                while(dest.exists()){dest=File(folder,"${suffix++}_${file.name}")}
+                val folder=File(android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS),"DataBeam/"+destination(relative).substringBeforeLast('/',""));check(folder.exists() || folder.mkdirs())
+                val name=destination(relative).substringAfterLast('/')
+                var dest=File(folder,name);var suffix=1
+                while(dest.exists()){dest=File(folder,"${suffix++}_$name")}
                 file.inputStream().use{input->dest.outputStream().use{input.copyTo(it)}}
                 android.media.MediaScannerConnection.scanFile(c,arrayOf(dest.absolutePath),null,null)
                 val uri=Uri.fromFile(dest).toString();published.put(relative,uri);record(relative,uri)

@@ -74,25 +74,28 @@ object RestartE2eRegression {
         fun stop(){
             val before=TransferService.state(c)
             main{(field("pause") as Button).performClick()}
-            waitFor{it.optString("id")==before.optString("id") && it.optString("status") in listOf("stopped","complete")}
-            main{check((field("restartSharing") as View).visibility==if(record.optString("kind")=="text")View.VISIBLE else View.GONE)}
+            val stopped=waitFor{it.optString("id")==before.optString("id") && it.optString("status") in listOf("stopped","complete")}
+            main{check((field("resend") as View).visibility==if(TransferLabels.canResend(stopped))View.VISIBLE else View.GONE)}
         }
         fun restart():JSONObject {
             val before=TransferService.state(c)
             main{
-                // Fresh selection is the supported file recovery flow. Never
-                // reopen a potentially expired share-sheet grant behind a button.
                 val uris=record.getJSONArray("uris")
-                if(record.optString("kind")=="text"){
-                    (field("textChoice") as Button).performClick()
-                    (field("message") as EditText).setText(record.getString("text"))
+                if(TransferLabels.canResend(before)){
+                    (field("resend") as Button).performClick()
+                    if(record.optString("kind")=="text"){
+                        check((field("message") as EditText).text.toString()==record.getString("text"))
+                    } else {
+                        check((field("sources") as List<*>).map(Any?::toString)==(0 until uris.length()).map(uris::getString))
+                    }
                 }else{
+                    // Legacy fixture sessions without original URI metadata cannot use Resend.
                     val selected=if(uris.length()>0)(0 until uris.length()).map{Uri.parse(uris.getString(it))}
                         else record.getJSONArray("paths").let{a->(0 until a.length()).map{Uri.fromFile(File(a.getString(it)))}}
                     runner.callActivityOnNewIntent(activity,Intent(Intent.ACTION_SEND_MULTIPLE).setType("*/*").putParcelableArrayListExtra(Intent.EXTRA_STREAM,ArrayList(selected)))
+                    (field("sendCode") as EditText).setText(before.optString("code"))
+                    (field("primary") as Button).performClick()
                 }
-                (field("sendCode") as EditText).setText(before.optString("code"))
-                (field("primary") as Button).performClick()
             }
             val s=ready(before.getString("id"))
             check(s.optString("code")==before.optString("code")){"Short code unexpectedly changed"}
@@ -143,7 +146,8 @@ object RestartE2eRegression {
                 activity=runner.startActivitySync(Intent(c,MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                 runner.waitForIdleSync()
                 main{
-                    (field("mode") as Spinner).setSelection(listOf("EasySendMe","Sendme","Croc").indexOf(mode))
+                    activity!!.selectEngineForTest(mode)
+                    (field("sendTab") as Button).performClick()
                     (field("broadcastChoice") as CheckBox).isChecked=args.optBoolean("broadcast") && mode=="Sendme"
                 }
                 runner.waitForIdleSync()
@@ -187,10 +191,6 @@ object RestartE2eRegression {
                         "restart"->{
                             val direct=TransferService.state(c).optBoolean("referencedSources")
                             stop()
-                            if(record.getString("kind") in listOf("flat","provider") && !direct){
-                                val uris=record.getJSONArray("uris");for(i in 0 until uris.length())c.contentResolver.delete(Uri.parse(uris.getString(i)),null,null)
-                                record.put("originals_deleted",true)
-                            }
                             if(direct)record.put("originals_kept_for_reference",true)
                             emit("restarted",restart())
                         }

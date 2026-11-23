@@ -1,16 +1,22 @@
 const API_URL = "https://api.github.com/repos/vinay-winai/DataBeam/releases/latest";
-const ANDROID_APK_URL = "https://github.com/vinay-winai/DataBeam/releases/download/android-v0.8.0-beta.1/DataBeam_android-arm64_beta.apk";
+const ANDROID_RELEASES_URL = "https://github.com/vinay-winai/DataBeam/releases";
+
+function androidApkUrl() {
+    return gReleaseData?.assets?.find(asset => asset.name.toLowerCase() === "databeam_android-arm64.apk")?.browser_download_url;
+}
 
 function showAndroidDownload() {
     const button = document.getElementById("download-btn");
-    button.href = ANDROID_APK_URL;
-    button.querySelector(".btn-text").textContent = "Download Android beta APK";
-    document.getElementById("download-status").textContent = "Android v0.8.0-beta.1 · Android 8.0+ · ARM64";
+    const apk = androidApkUrl();
+    const url = apk || ANDROID_RELEASES_URL;
+    button.href = url;
+    button.querySelector(".btn-text").textContent = apk ? "Download Android APK" : "View Android downloads";
+    document.getElementById("download-status").textContent = "Android 8.0+ · ARM64";
     const badge = document.getElementById("version-badge");
-    if (badge) badge.textContent = "Android beta now available";
+    if (badge) badge.textContent = apk ? gReleaseData.tag_name : "Android";
     const secondary = document.getElementById("secondary-download");
     if (secondary) { secondary.style.display = "block"; secondary.textContent = "Native Android app. Download the APK to install."; }
-    gAutoDownloadUrl = ANDROID_APK_URL;
+    gAutoDownloadUrl = url;
 }
 
 let gReleaseData = null;
@@ -91,6 +97,7 @@ async function setupOSLinks() {
 }
 
 function updateDownloadLinks() {
+    document.getElementById("link-android").href = androidApkUrl() || ANDROID_RELEASES_URL;
     if (gUserOS === "android") showAndroidDownload();
     if (!gReleaseData || !gReleaseData.assets) return;
 

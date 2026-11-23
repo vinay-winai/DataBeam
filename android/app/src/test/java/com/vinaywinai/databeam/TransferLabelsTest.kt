@@ -48,11 +48,17 @@ class TransferLabelsTest {
     }
     @Test fun failedCrocFilesKeepTheirCodeWhileTextRemainsEditable(){
         val s=state("send","stopped").put("mode","Croc")
-        assertTrue(TransferLabels.message(s).contains("Keep the same Croc code"))
+        assertTrue(TransferLabels.message(s).contains("resume from Croc receive history"))
         assertTrue(TransferLabels.message(s).contains("reselect the exact same files"))
         s.put("text","generated text")
-        assertTrue(TransferLabels.message(s).contains("Your text is kept"))
+        assertTrue(TransferLabels.message(s).contains("Tap Resend to share the same text again"))
         assertFalse(TransferLabels.message(s).contains("reselect"))
+        assertTrue(TransferLabels.canResend(s))
+        s.remove("text")
+        s.put("uris",org.json.JSONArray().put("content://example/picked-file"))
+        assertTrue(TransferLabels.canResend(s))
+        s.put("status","complete")
+        assertFalse(TransferLabels.canResend(s))
     }
     @Test fun invalidContentAndTicketErrorsOfferTheActionThatCanResolveThem(){
         val changed=state("receive","interrupted").put("message","This code points to different files. Clear the transfer card and start a new receive.")

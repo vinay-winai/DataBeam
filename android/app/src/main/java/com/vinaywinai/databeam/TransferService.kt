@@ -53,6 +53,7 @@ class TransferService : Service() {
     private var lastProgressNotice=0L
     private var timing=TransferTiming()
     private var outgoingSources:OutgoingSources?=null
+    private var reviewCrocChanges=false
     private val poll = object : Runnable {
         override fun run() {
             runCatching {
@@ -94,7 +95,16 @@ class TransferService : Service() {
                     log("$kind $payload")
                 }
                 val now=SystemClock.elapsedRealtime()
-                if(busy.get() && now-lastProgressNotice>=1000){lastProgressNotice=now;synchronized(this@TransferService){timing.checkpoint(now);timing.save(state);persist()};getSystemService(NotificationManager::class.java).notify(1,notification(""))}
+                if(busy.get() && now-lastProgressNotice>=1000){
+                    lastProgressNotice=now
+                    synchronized(this@TransferService){
+                        timing.checkpoint(now);timing.save(state)
+                        if(state.optString("mode")=="Croc" && state.optString("action")=="receive" && !state.optBoolean("workingCleaned") &&
+                            (state.optJSONArray("payloadNames")?.length() ?: 0)>0)checkpointCroc()
+                        else persist()
+                    }
+                    getSystemService(NotificationManager::class.java).notify(1,notification(""))
+                }
             }
             if(busy.get()) main.postDelayed(this,300)
         }
@@ -105,7 +115,8 @@ class TransferService : Service() {
             android.system.Os.kill(crocPid!!,android.system.OsConstants.SIGCONT)
             synchronized(this){timing.resume(SystemClock.elapsedRealtime());timing.save(state);state.put("connectionRetained",false)};update("running","Continuing transfer…");return START_NOT_STICKY
         }
-        if(intent?.action=="pause" && state.optString("action")=="receive" && state.optString("mode")=="Croc" && process!=null && crocPid!=null) {
+        if(intent?.action=="pause" && state.optString("action")=="receive" && state.optString("mode")=="Croc" &&
+            !state.has("crocReview") && process!=null && crocPid!=null) {
             android.system.Os.kill(crocPid!!,android.system.OsConstants.SIGSTOP)
             synchronized(this){timing.pause(SystemClock.elapsedRealtime());timing.save(state);state.put("connectionRetained",true)};update("paused","Paused · connection retained");return START_NOT_STICKY
         }
@@ -142,8 +153,14 @@ class TransferService : Service() {
                 .put("action",intent?.getStringExtra("action").orEmpty()).put("status","interrupted").put("message","Could not open transfer settings: ${error.message}")
             persist();busy.set(false);stopForeground(STOP_FOREGROUND_REMOVE);stopSelf();return START_NOT_STICKY
         }
+        reviewCrocChanges=state.optBoolean("reviewCrocChanges")
+        state.remove("reviewCrocChanges")
+        state.remove("crocReview")
         timing=TransferTiming(state.optJSONObject("timing")).apply{resume(SystemClock.elapsedRealtime());save(state)}
         if(!state.has("saveFolder"))state.put("saveFolder",AppSettings.folder(this)).put("saveFolderLabel",AppSettings.folderLabel(this))
+        if(state.optString("mode")=="Croc" && state.optString("action")=="receive" && !state.has("unwrapCroc")){
+            state.put("unwrapCroc",!state.optBoolean("crocReadyToSave") && AppSettings.unwrapCroc(this))
+        }
         state.remove("route");state.remove("senderRoutes")
         state.remove("timingConcurrent")
         state.put("preparing",false).put("speed",0).put("prepSpeed",0)
@@ -170,8 +187,10 @@ class TransferService : Service() {
                 check(!stopping.get()) {"Stopped"}
                 val mode=config.getString("mode")
                 if(mode=="Croc") {
-                    val out=croc(config,config.getString("action"),null)
-                    if(config.getString("action")=="receive") synchronized(this) {state.put("text",out)}
+                    if(!config.optBoolean("crocReadyToSave") || config.getString("action")!="receive"){
+                        val out=croc(config,config.getString("action"),null)
+                        if(config.getString("action")=="receive" && !crocReceipt(config).isFile) synchronized(this) {state.put("text",out)}
+                    }
                 } else if(mode=="EasySendMe") {
                     if(config.getString("action")=="send") {
                         var advertised=false
@@ -209,19 +228,71 @@ class TransferService : Service() {
                 AppSettings.remember(this,config.getString("mode"),config.getString("action"),config.optString("code"))
                 if(config.getString("action")=="receive") {
                     val output=synchronized(this){state.optString("output")}
-                    if(output.isNotEmpty() && File(output).listFiles()?.isNotEmpty()==true) {
+                    if(mode=="Croc" && state.optBoolean("crocDirect")){
+                        val offer=JSONObject(crocReceipt(config).readText())
+                        val wrapper=state.getString("crocWrapper")
+                        val rows=state.getJSONObject("crocPending")
+                        synchronized(this){state.put("phase","Saving files").put("crocReadyToSave",true)}
+                        checkpointCroc()
+                        val directories=if(state.optBoolean("crocUnwrapPending"))state.getJSONObject("publishedDirectories")
+                            else CrocDownloads.publish(this,offer,wrapper,rows){stopping.get()}
+                        val unwrap=config.optBoolean("unwrapCroc")
+                        if(unwrap){
+                            val targets=state.optJSONObject("crocMoveTargets") ?: JSONObject()
+                            synchronized(this){
+                                state.put("published",rows).put("publishedDirectories",directories)
+                                    .put("crocUnwrapPending",true).put("crocMoveTargets",targets)
+                            }
+                            checkpointCroc()
+                            CrocDownloads.moveOut(this,wrapper,rows,directories,targets,{stopping.get()}){checkpointCroc()}
+                        }
+                        synchronized(this){
+                            state.put("published",rows).put("publishedDirectories",directories).put("workingCleaned",true)
+                            if(unwrap)state.put("crocMoved",true)
+                            state.remove("crocUnwrapPending")
+                        }
+                        TransferCleanup.record(this,state,"complete")
+                        TransferCleanup.remove(filesDir,"received/${config.getString("id")}")
+                        CrocBatchReview.clear(this,config.getString("id"))
+                        synchronized(this){state.remove("crocPending");state.remove("crocReadyToSave");state.remove("code");state.remove("receiveCode")}
+                        persist()
+                        terminalMessage=if(unwrap)"Saved to Downloads / DataBeam" else "Saved to Downloads / DataBeam / $wrapper"
+                    } else if(output.isNotEmpty() && File(output).listFiles()?.isNotEmpty()==true) {
                         synchronized(this){state.put("phase","Saving files")};persist()
                         val published=synchronized(this){state.optJSONObject("published") ?: JSONObject()}
                         val directories=synchronized(this){state.optJSONObject("publishedDirectories") ?: JSONObject()}
+                        val crocFiles=mode=="Croc" && crocReceipt(config).isFile
+                        val unwrap=crocFiles && config.optBoolean("unwrapCroc")
+                        val wrapper=if(crocFiles && !unwrap){
+                            state.optString("crocWrapper").ifBlank {
+                                val preferred=JSONObject(crocReceipt(config).readText()).getString("wrapper")
+                                Storage.availableWrapper(this,config.optString("saveFolder"),preferred)
+                            }.also {
+                                synchronized(this){state.put("crocWrapper",it).put("crocReadyToSave",true)}
+                                checkpointCroc()
+                            }
+                        }else ""
+                        val topLevelNames=if(unwrap){
+                            (state.optJSONObject("crocMoveTargets") ?: Storage.unwrappedNames(this,config.optString("saveFolder"),File(output))).also{
+                                synchronized(this){state.put("crocMoveTargets",it).put("crocReadyToSave",true)}
+                                checkpointCroc()
+                            }
+                        }else null
                         Storage.publishDownloads(this,File(output),published,{stopping.get()},config.optString("saveFolder"),directories,{_,_->
-                            synchronized(this){state.put("publishedDirectories",directories)};persist()
-                        }){_,_->
-                            synchronized(this){state.put("published",published)};persist()
+                            synchronized(this){state.put("publishedDirectories",directories)}
+                            if(crocFiles)checkpointCroc() else persist()
+                        },wrapper,topLevelNames){_,_->
+                            synchronized(this){state.put("published",published)}
+                            if(crocFiles)checkpointCroc() else persist()
                         }
+                        if(unwrap)synchronized(this){state.put("crocMoved",true)}
                         val receipt=synchronized(this){JSONObject(state.toString())}
                         TransferCleanup.saved(this,receipt)
-                        synchronized(this){state.put("workingCleaned",true)};persist()
-                        terminalMessage="Saved to ${config.optString("saveFolderLabel","Downloads / DataBeam")}"
+                        synchronized(this){
+                            state.put("workingCleaned",true)
+                            if(mode=="Croc"){state.remove("crocReadyToSave");state.remove("code");state.remove("receiveCode")}
+                        };persist()
+                        terminalMessage="Saved to ${config.optString("saveFolderLabel","Downloads / DataBeam")}${if(wrapper.isEmpty())"" else " / $wrapper"}"
                     } else terminalMessage="Text received"
                 }
             } catch(e:Throwable) {
@@ -247,6 +318,7 @@ class TransferService : Service() {
                     main.removeCallbacks(poll)
                     if(sentSuccessfully.get()){terminal="complete";terminalMessage="Files sent successfully. Sharing ended automatically."}
                     synchronized(this){
+                        state.remove("crocReview")
                         if(terminal=="complete"){
                             timing.finishPayload(SystemClock.elapsedRealtime())
                             if(state.optString("action")=="send"){
@@ -274,16 +346,26 @@ class TransferService : Service() {
         }
         val uris=c.optJSONArray("uris") ?: error("Select files or a folder")
         synchronized(this){state.put("phase","Opening selected files").put("preparing",true).put("prepDone",0).put("prepTotal",0)};persist()
-        val folder=File(filesDir,"outgoing/${c.getString("id")}").apply{mkdirs()}
-        val sources=OutgoingSources(this,folder,{stopping.get()}){synchronized(this){state.put("phase","Copying provider file")};persist()}
+        val folder=File(filesDir,"outgoing/${c.getString("id")}").apply{mkdirs()}.canonicalFile
+        val useCroc=c.optString("mode")=="Croc"
+        val sources=OutgoingSources(this,folder,{stopping.get()},
+            {synchronized(this){state.put("phase","Copying provider file")};persist()},
+            allowRestrictedDescriptors=useCroc || runCatching{NativeBridge.supportsSendmeFileDescriptors()}.getOrDefault(false))
         outgoingSources=sources
-        val paths=JSONArray()
-        for(i in 0 until uris.length()) {
-            val file=sources.add(android.net.Uri.parse(uris.getString(i)))
-            paths.put(file.absolutePath)
-        }
-        require(paths.length()>0){"No files selected"};c.put("paths",paths).put("referencedSources",sources.referenced>0).put("sourceRoot",folder.absolutePath)
-        synchronized(this){state.put("referencedSources",sources.referenced>0).put("sourceRoot",folder.absolutePath).put("referencedFiles",sources.referenced).put("copiedFiles",sources.copied)};persist()
+        val selected=sources.addAll((0 until uris.length()).map{android.net.Uri.parse(uris.getString(it))})
+        val files=if(c.optBoolean("skipDuplicateFiles",AppSettings.skipDuplicateFiles(this)))
+            withoutDuplicateFiles(selected,{stopping.get()},sources::descriptor){
+                synchronized(this){state.put("phase","Checking for duplicate files")};persist()
+            } else selected
+        require(files.isNotEmpty()){"No files selected"}
+        c.remove("crocSourceBroker")
+        if(useCroc)sources.startCrocDescriptorBroker()?.let{c.put("crocSourceBroker",it)}
+        c.put("paths",JSONArray(files.map{it.absolutePath})).put("referencedSources",sources.referenced>0).put("sourceRoot",folder.absolutePath)
+        synchronized(this){
+            state.put("payloadNames",JSONArray(files.map{it.name})).put("referencedSources",sources.referenced>0)
+                .put("sourceRoot",folder.absolutePath).put("referencedFiles",sources.referenced).put("copiedFiles",sources.copied)
+                .put("skippedDuplicateFiles",selected.size-files.size)
+        };persist()
     }
     private fun runNative(c:JSONObject) {
         check(!stopping.get()){ "Stopped" }
@@ -300,17 +382,32 @@ class TransferService : Service() {
         c.put("cache",cache.apply{mkdirs()}.absolutePath)
         c.put("output",File(filesDir,"received/${c.getString("id")}").apply{mkdirs()}.absolutePath)
         synchronized(this){state.put("output",c.getString("output")).put("cacheBase",c.getString("cache"))};TransferCleanup.record(this,synchronized(this){JSONObject(state.toString())})
+        val nativeConfig=JSONObject(c.toString())
         if(c.optString("action")=="send"){
             val paths=c.getJSONArray("paths")
-            c.put("root",PayloadNaming.root((0 until paths.length()).map{File(paths.getString(it))}){stopping.get()})
+            val selected=(0 until paths.length()).map{File(paths.getString(it))}
+            val sources=outgoingSources
+            nativeConfig.put("root",PayloadNaming.root(selected,{file->
+                sources?.descriptor(file)?.let{android.system.Os.fstat(it).st_size} ?: file.length()
+            }){stopping.get()})
+            sources?.sendmeDescriptors(selected)?.takeIf{it.isNotEmpty()}?.let{
+                nativeConfig.put("sourceDescriptors",JSONObject(it))
+            }
         }
-        val result=JSONObject(NativeBridge.run(c.toString()))
+        val result=JSONObject(NativeBridge.run(nativeConfig.toString()))
         if(result.optString("status")=="error") error(result.optString("message"))
         synchronized(this) { state.put("output",c.getString("output")) }
     }
     private fun croc(c:JSONObject,action:String,text:String?):String {
         return crocAttempt(c,action,text,true)
     }
+    private fun crocReceipt(c:JSONObject):File {
+        return CrocBatchReview.receipt(this,c.getString("id"))
+    }
+    private fun checkpointCroc(){
+        synchronized(this){persist();TransferCleanup.record(this,state)}
+    }
+
     private fun crocAttempt(c:JSONObject,action:String,text:String?,allowRecovery:Boolean):String {
         val code=c.optString("code").ifEmpty {
             RelayRecovery.newCode().also { c.put("code",it);synchronized(this){state.put("code",it)};persist() }
@@ -320,6 +417,9 @@ class TransferService : Service() {
         val output=File(filesDir,"received/${c.getString("id")}").apply{mkdirs()}
         if(action=="receive"){synchronized(this){state.put("output",output.absolutePath)};persist()}
         val sendText=if(action=="send")text ?: c.optString("text").takeIf{it.isNotEmpty()} else null
+        val direct=action=="receive" && c.optString("mode")=="Croc" && android.os.Build.VERSION.SDK_INT>=29 &&
+            c.optString("saveFolder").isEmpty() && (c.optBoolean("crocDirect") || (!c.optBoolean("crocStaged") && output.list().orEmpty().isEmpty()))
+        val downloadMap=if(direct)File(cacheDir,"croc-downloads-${c.getString("id")}.json") else null
         val args=mutableListOf(File(applicationInfo.nativeLibraryDir,"libcroc.so").absolutePath,"--yes","--relay",relay)
         if(sendText==null)args.add("--ignore-stdin")
         if(action=="send") {
@@ -333,8 +433,9 @@ class TransferService : Service() {
         } else {
             args.addAll(listOf("--out",output.absolutePath))
             if(c.optString("mode")=="Croc") {
-                require(c.optString("receiveCode",code)==code){"Use the original Croc code to resume. For a different code, start a new receive."}
-                c.put("receiveCode",code);synchronized(this){state.put("receiveCode",code)};persist()
+                val original=c.optString("receiveCode",code)
+                require(original==code || crocReceipt(c).isFile){"Use the original Croc code to resume this transfer."}
+                c.put("receiveCode",original);synchronized(this){state.put("receiveCode",original)};persist()
                 // This directory is private working storage for this one session.
                 // --yes does not answer Croc's separate resume question. Public
                 // destination conflicts remain protected by Storage.publishDownloads.
@@ -344,17 +445,88 @@ class TransferService : Service() {
         val command=listOf("/system/bin/sh","-c","echo DATABEAM_CHILD_PID=$$; exec \"$@\"","databeam-croc")+args
         val builder=ProcessBuilder(command).directory(output)
         builder.environment().putAll(mapOf("CROC_SECRET" to code,"HOME" to filesDir.absolutePath,"TMPDIR" to cacheDir.absolutePath,"DATABEAM_CROC_PROGRESS" to "1","CROC_NO_UPDATE_CHECK" to "1"))
-        if(action=="send" && c.optBoolean("referencedSources"))builder.environment()["DATABEAM_ANDROID_SOURCE_ROOT"]=c.getString("sourceRoot")
+        if(c.optString("mode")=="Croc"){
+            if(action=="send" && sendText==null)builder.environment()["DATABEAM_CROC_FILE_DIGEST"]="1"
+            if(action=="receive"){
+                val receipt=crocReceipt(c)
+                CrocBatchReview.clearDraft(receipt)
+                builder.environment()["DATABEAM_CROC_RECEIPT"]=receipt.absolutePath
+                downloadMap?.let{builder.environment()["DATABEAM_CROC_DOWNLOAD_MAP"]=it.absolutePath}
+                if(c.optString("receiveCode")!=code)builder.environment()["DATABEAM_CROC_REPLACEMENT_CODE"]="1"
+                if(reviewCrocChanges)builder.environment()["DATABEAM_CROC_REVIEW"]="1"
+            }
+        }
+        if(action=="send" && c.optBoolean("referencedSources")){
+            builder.environment()["DATABEAM_ANDROID_SOURCE_ROOT"]=c.getString("sourceRoot")
+            c.optString("crocSourceBroker").takeIf(String::isNotEmpty)?.let{
+                builder.environment()["DATABEAM_ANDROID_SOURCE_BROKER"]=it
+            }
+        }
         val p=builder.start();process=p;if(stopping.get())p.destroy()
         val writeFailure=java.util.concurrent.atomic.AtomicReference<Exception?>()
         val writer=if(sendText!=null)Thread{
             try{p.outputStream.use{it.write(sendText.toByteArray(Charsets.UTF_8))}}
             catch(error:Exception){if(!stopping.get())writeFailure.compareAndSet(null,error)}
         }.apply{start()} else null
-        if(writer==null)p.outputStream.close()
+        if(writer==null && downloadMap==null)p.outputStream.close()
         val errors=StringBuffer()
         val payloadStarted=AtomicBoolean(false)
         fun observe(line:String) {
+            val managedReceive=action=="receive" && c.optString("mode")=="Croc"
+            if(managedReceive && line.startsWith("DATABEAM_REVIEW_V1 ")){
+                val token=line.substringAfter(' ').trim()
+                check(CrocBatchReview.read(this,c.getString("id"),token)!=null){"Could not read the updated Croc file list"}
+                synchronized(this){state.put("crocReview",token).put("phase","Review updated files").put("message","")}
+                persist()
+                return
+            }
+            if(managedReceive && downloadMap!=null && line.startsWith("DATABEAM_RESET_V1 ")){
+                val token=line.substringAfter(' ').trim()
+                val revision=JSONObject(File(crocReceipt(c).path+".revision").readText())
+                check(token.matches(Regex("[0-9a-f]{32}")) && token==revision.getString("id")){"The saved Croc update changed"}
+                val wrapper=state.getString("crocWrapper")
+                val rows=state.getJSONObject("crocPending")
+                synchronized(this){state.remove("crocReview");state.put("phase","Updating partial files")}
+                checkpointCroc()
+                CrocDownloads.resetRevision(this,wrapper,rows,revision,::checkpointCroc)
+                p.outputStream.write("reset $token\n".toByteArray(Charsets.UTF_8))
+                p.outputStream.flush()
+                return
+            }
+            if(managedReceive && line.startsWith("DATABEAM_OFFER_V1 ")){
+                val offer=JSONObject(crocReceipt(c).readText())
+                val names=offer.getJSONArray("entries")
+                synchronized(this){
+                    state.remove("crocReview")
+                    state.put("total",offer.getLong("total")).put("phase","Checking saved files")
+                        .put("payloadNames",JSONArray((0 until names.length()).map{names.getJSONObject(it).getString("path")}))
+                }
+                if(downloadMap!=null){
+                    val rows=state.optJSONObject("crocPending") ?: JSONObject()
+                    val previouslyDirect=state.optBoolean("crocDirect")
+                    val paths=try{
+                        val wrapper=state.optString("crocWrapper").ifBlank{CrocDownloads.reserve(this,offer.getString("wrapper"))}
+                        synchronized(this){state.put("crocDirect",true).put("crocWrapper",wrapper).put("crocPending",rows)}
+                        checkpointCroc()
+                        CrocDownloads.prepare(this,offer,wrapper,rows,{stopping.get()},::checkpointCroc)
+                    }catch(error:Exception){
+                        if(previouslyDirect || stopping.get())throw error
+                        val wrapper=state.optString("crocWrapper")
+                        if(wrapper.isNotEmpty())CrocDownloads.discard(this,wrapper,rows)
+                        synchronized(this){
+                            state.put("crocStaged",true)
+                            state.remove("crocDirect");state.remove("crocPending");state.remove("crocWrapper")
+                        }
+                        checkpointCroc()
+                        log("Croc Downloads fallback: ${error.message}")
+                        JSONObject()
+                    }
+                    downloadMap.writeText(paths.toString())
+                    p.outputStream.write("ready\n".toByteArray())
+                    p.outputStream.flush()
+                }
+                persist();return
+            }
             if(c.optString("mode")=="Croc")ProgressEvents.croc(line)?.let{event->
                 synchronized(this){
                     event.preparation?.let{sample->state.put("preparing",true).put("phase","Preparing files").put("prepDone",sample.done).put("prepTotal",sample.total).put("prepSpeed",sample.speed)}
@@ -392,7 +564,9 @@ class TransferService : Service() {
             }
         }}
         catch(error:Exception){if(!stopping.get())readFailure.compareAndSet(null,error);p.destroy()}
-        val exit=try{p.waitFor()}finally{err.join();writer?.join();process=null;crocPid=null}
+        val exit=try{p.waitFor()}finally{
+            err.join();writer?.join();runCatching{p.outputStream.close()};downloadMap?.delete();process=null;crocPid=null
+        }
         check(!stopping.get()){"Stopped"}
         // Croc prints its terminal error to stdout. Successful stdout is
         // payload text; inspect it as an error only after a failed exit.

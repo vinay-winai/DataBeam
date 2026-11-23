@@ -1,0 +1,136 @@
+--- a/src/store/fs/options.rs
++++ b/src/store/fs/options.rs
+@@ -1,5 +1,11 @@
+ //! Options for configuring the file store.
+-use std::path::{Path, PathBuf};
++use std::{
++    collections::HashMap,
++    fs::File,
++    io,
++    path::{Path, PathBuf},
++    sync::Arc,
++};
+ 
+ use n0_future::time::Duration;
+ 
+@@ -112,6 +118,7 @@
+     pub batch: BatchOptions,
+     /// Gc configuration.
+     pub gc: Option<GcConfig>,
++    pub(super) source_files: Arc<HashMap<PathBuf, Arc<File>>>,
+ }
+ 
+ impl Options {
+@@ -122,6 +129,20 @@
+             inline: InlineOptions::default(),
+             batch: BatchOptions::default(),
+             gc: None,
++            source_files: Arc::default(),
++        }
++    }
++
++    /// Associate session-local files with the absolute source names used by the store.
++    pub fn with_source_files(mut self, files: Arc<HashMap<PathBuf, Arc<File>>>) -> Self {
++        self.source_files = files;
++        self
++    }
++
++    pub(super) fn open_source_file(&self, path: &Path) -> io::Result<File> {
++        match self.source_files.get(path) {
++            Some(file) => file.try_clone(),
++            None => File::open(path),
+         }
+     }
+ 
+--- a/src/store/fs/import.rs
++++ b/src/store/fs/import.rs
+@@ -369,6 +369,23 @@
+     }
+ }
+ 
++/// A duplicated descriptor shares its seek cursor with its original. Hashing
++/// uses a private offset so other imports and range reads stay independent.
++struct SourceFileReader<'a> {
++    file: &'a File,
++    offset: u64,
++    size: u64,
++}
++
++impl io::Read for SourceFileReader<'_> {
++    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
++        let length = self.size.saturating_sub(self.offset).min(buf.len() as u64) as usize;
++        let count = bao_tree::io::sync::ReadAt::read_at(self.file, self.offset, &mut buf[..length])?;
++        self.offset += count as u64;
++        Ok(count)
++    }
++}
++
+ async fn compute_outboard(
+     source: ImportSource,
+     format: BlobFormat,
+@@ -381,8 +398,16 @@
+     let root = bao_tree::blake3::Hash::from_bytes([0; 32]);
+     let outboard_size = raw_outboard_size(size);
+     let send_progress = OutboardProgress::ref_cast_mut(tx);
+-    let mut data = source.read();
+-    data.rewind()?;
++    let data: Box<dyn io::Read + Send + '_> = match &source {
++        ImportSource::External(path, file, _) if options.source_files.contains_key(path) => {
++            Box::new(SourceFileReader { file, offset: 0, size })
++        }
++        _ => {
++            let mut reader = source.read();
++            reader.rewind()?;
++            Box::new(reader)
++        }
++    };
+     let (hash, outboard) = if outboard_size > options.inline.max_outboard_inlined {
+         // outboard will eventually be stored as a file, so compute it directly to a file
+         // we don't know the hash yet, so we need to create a temp file
+@@ -452,6 +477,13 @@
+             io::ErrorKind::InvalidInput,
+             "path must be absolute",
+         ));
++    }
++    if mode == ImportMode::TryReference && options.source_files.contains_key(&path) {
++        let file = options.open_source_file(&path)?;
++        let size = file.metadata()?.len();
++        tx.send(AddProgressItem::Size(size)).await?;
++        let source = ImportSource::External(path, file, size);
++        return compute_outboard(source, format, batch, options, tx).await;
+     }
+     if !path.is_file() && !path.is_symlink() {
+         return Err(io::Error::new(
+--- a/src/store/fs.rs
++++ b/src/store/fs.rs
+@@ -1024,8 +1024,8 @@
+         ImportSource::Memory(data) => {
+             debug_assert!(options.is_inlined_data(data.len() as u64));
+         }
+-        ImportSource::External(_, _, size) => {
+-            debug_assert!(!options.is_inlined_data(*size));
++        ImportSource::External(path, _, size) => {
++            debug_assert!(!options.is_inlined_data(*size) || options.source_files.contains_key(path));
+         }
+         ImportSource::TempFile(_, _, size) => {
+             debug_assert!(!options.is_inlined_data(*size));
+@@ -1093,7 +1093,7 @@
+             let Some(path) = paths.iter().next() else {
+                 return Err(io::Error::other("no external data path"));
+             };
+-            let file = fs::File::open(path)?;
++            let file = options.open_source_file(path)?;
+             MemOrFile::File(FixedSize::new(file, *size))
+         }
+     };
+--- a/src/store/fs/bao_file.rs
++++ b/src/store/fs/bao_file.rs
+@@ -593,7 +593,7 @@
+                         let Some(path) = paths.into_iter().next() else {
+                             return Err(io::Error::other("no external data path"));
+                         };
+-                        let file = std::fs::File::open(&path)?;
++                        let file = options.open_source_file(&path)?;
+                         MemOrFile::File(FixedSize::new(file, size))
+                     }
+                 };

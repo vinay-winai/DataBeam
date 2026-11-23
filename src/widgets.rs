@@ -377,85 +377,31 @@ pub fn tool_card(
     color: Color32,
     selected: bool,
 ) -> egui::Response {
-    let desired_size = Vec2::new(ui.available_width(), 56.0);
-    let (rect, response) = ui.allocate_exact_size(desired_size, Sense::click());
+    let mut card = egui::Frame::NONE
+        .fill(if selected { BG_CARD_HOVER } else { BG_CARD })
+        .stroke(Stroke::new(1.0, if selected { color } else { BORDER_SUBTLE }))
+        .corner_radius(CARD_ROUNDING)
+        .inner_margin(egui::Margin::symmetric(14, 10))
+        .begin(ui);
+    let content = &mut card.content_ui;
+    content.set_min_width(content.available_width());
+    content.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(name).size(14.0).strong().color(TEXT_PRIMARY));
+        if !available {
+            ui.label(RichText::new("Unavailable").size(11.0).color(WARNING));
+        } else if let Some(version) = version {
+            ui.label(RichText::new(version).monospace().size(10.0).color(TEXT_MUTED));
+        }
+    });
+    content.add_space(2.0);
+    content.label(RichText::new(description).size(12.0).color(TEXT_SECONDARY));
 
-    if ui.is_rect_visible(rect) {
-        let bg = if selected {
-            Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), 200)
-        } else if response.hovered() {
-            BG_CARD_HOVER
-        } else {
-            BG_CARD
-        };
-
-        let stroke = if selected {
-            Stroke::new(1.5_f32, color)
-        } else {
-            Stroke::new(1.0_f32, BORDER_SUBTLE)
-        };
-
-        ui.painter().rect_filled(rect, CARD_ROUNDING, bg);
-        ui.painter()
-            .rect_stroke(rect, CARD_ROUNDING, stroke, StrokeKind::Inside);
-
-        // Dot
-        let dot_center = Pos2::new(rect.left() + 16.0, rect.center().y);
-        ui.painter()
-            .circle_filled(dot_center, 3.5, if available { color } else { TEXT_MUTED });
-
-        // Name
-        let title_color = if selected {
-            Color32::BLACK
-        } else {
-            TEXT_PRIMARY
-        };
-        ui.painter().text(
-            Pos2::new(rect.left() + 30.0, rect.top() + 12.0),
-            egui::Align2::LEFT_TOP,
-            name,
-            FontId::new(13.0, FontFamily::Proportional),
-            title_color,
-        );
-
-        // Description
-        let desc_color = if selected {
-            Color32::from_rgb(26, 26, 26)
-        } else {
-            TEXT_MUTED
-        };
-        ui.painter().text(
-            Pos2::new(rect.left() + 30.0, rect.top() + 30.0),
-            egui::Align2::LEFT_TOP,
-            description,
-            FontId::new(11.0, FontFamily::Proportional),
-            desc_color,
-        );
-
-        // Version
-        let status_text = if available {
-            version.unwrap_or("ok")
-        } else {
-            "missing"
-        };
-        let status_color = if available {
-            if selected {
-                Color32::BLACK
-            } else {
-                color
-            }
-        } else {
-            WARNING
-        };
-        ui.painter().text(
-            Pos2::new(rect.right() - 12.0, rect.center().y),
-            egui::Align2::RIGHT_CENTER,
-            status_text,
-            FontId::new(10.0, FontFamily::Monospace),
-            status_color,
-        );
+    let response = card.allocate_space(ui).interact(Sense::click());
+    if available && (response.hovered() || response.has_focus()) {
+        card.frame.fill = BG_CARD_HOVER;
+        card.frame.stroke.color = color;
     }
-
+    card.paint(ui);
     response
 }
 
@@ -498,7 +444,7 @@ pub fn log_area(ui: &mut egui::Ui, lines: &[String], max_height: f32, stick_bott
 // ── Code/Ticket Display ────────────────────────────────────────────
 
 /// Display a code/ticket with a copy button. Long tickets are truncated.
-pub fn code_display(ui: &mut egui::Ui, label: &str, code: &str, color: Color32) -> bool {
+pub fn code_display(ui: &mut egui::Ui, label: &str, code: &str, color: Color32, marked: bool) -> bool {
     let mut copied = false;
     let id = ui.id().with(code);
     let mut btn_text = "📋 Copy";
@@ -539,12 +485,18 @@ pub fn code_display(ui: &mut egui::Ui, label: &str, code: &str, color: Color32) 
             let width = ui.available_width().max(120.0);
             let budget = ((width / 8.0) as usize).clamp(20, 72);
             let display_code = truncate_middle_for_ui(code, budget);
-            ui.label(
-                RichText::new(&display_code)
-                    .monospace()
-                    .size(13.0)
-                    .color(Color32::BLACK),
-            );
+            let base = if marked { display_code.strip_suffix("esm") } else { None };
+            if let Some(base) = base {
+                let font_id = egui::FontId::monospace(13.0);
+                let mut text = egui::text::LayoutJob::default();
+                text.append(base, 0.0, egui::TextFormat::simple(font_id.clone(), TEXT_PRIMARY));
+                text.append("esm", 0.0, egui::TextFormat {
+                    font_id, color: Color32::BLACK, background: color, ..Default::default()
+                });
+                ui.label(text);
+            } else {
+                ui.label(RichText::new(&display_code).monospace().size(13.0).color(Color32::BLACK));
+            }
         });
 
     copied

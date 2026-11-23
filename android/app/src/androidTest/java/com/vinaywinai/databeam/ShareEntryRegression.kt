@@ -62,21 +62,37 @@ object ShareEntryRegression {
             activity=runner.waitForMonitorWithTimeout(monitor,10000) ?: error("Share recreation did not return")
             opened.add(activity);runner.removeMonitor(monitor);runner.waitForIdleSync();checkText(activity)
             activity=open(Intent(Intent.ACTION_PROCESS_TEXT).setType("text/plain").putExtra(Intent.EXTRA_PROCESS_TEXT,text).putExtra(Intent.EXTRA_PROCESS_TEXT_READONLY,true));checkText(activity)
-            fun document():Uri {
+            val fixtureFolder="share-entry-${UUID.randomUUID()}"
+            fun document(folder:String,name:String,text:String):Uri {
                 val uri=context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI,ContentValues().apply{
-                    put(MediaStore.Downloads.DISPLAY_NAME,"share-entry-${UUID.randomUUID()}.txt");put(MediaStore.Downloads.MIME_TYPE,"text/plain");put(MediaStore.Downloads.RELATIVE_PATH,"Download/DataBeam/")
-                })!!;created.add(uri);context.contentResolver.openOutputStream(uri)!!.use{it.write("generated share fixture".toByteArray())};return uri
+                    put(MediaStore.Downloads.DISPLAY_NAME,name)
+                    put(MediaStore.Downloads.MIME_TYPE,"text/plain")
+                    put(MediaStore.Downloads.RELATIVE_PATH,"Download/DataBeam/$fixtureFolder/$folder/")
+                })!!;created.add(uri);context.contentResolver.openOutputStream(uri)!!.use{it.write(text.toByteArray())};return uri
             }
-            val first=document();val second=document()
+            val first=document("first","report.txt","first source")
+            val second=document("second","report.txt","second source")
+            val third=document("third","report (1).txt","original suffix")
+            val fourth=document("fourth","REPORT.txt","case-only name")
             activity=open(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_STREAM,first).putExtra(Intent.EXTRA_TEXT,"caption must not replace the attachment"))
             runner.runOnMainSync{check((field(activity,"sources") as List<*>).size==1);check((field(activity,"message") as EditText).text.isEmpty());check(field(activity,"tab")=="send")}
             val staged=java.io.File(context.cacheDir,"share-entry-stage-${UUID.randomUUID()}").apply{mkdirs()}
             try {
-                OutgoingSources(context,staged,{false},{error("Accessible share attachment was copied")}).use{sources->
-                    val reference=sources.add(first)
-                    check(reference.readText()=="generated share fixture")
-                    check(sources.referenced==1 && sources.copied==0)
+                fun stageBatch(batch:List<Uri>):Map<String,String> {
+                    return OutgoingSources(context,staged,{false},{error("Accessible share attachment was copied")}).use{sources->
+                        val files=sources.addAll(batch)
+                        check(sources.referenced==4 && sources.copied==0)
+                        check(files.map{it.name.lowercase()}.toSet().size==4)
+                        files.associate{it.readText() to it.name}
+                    }
                 }
+                val batch=listOf(first,second,third,fourth)
+                val names=stageBatch(batch)
+                check(names.values.map{it.lowercase()}.toSet()==setOf("report.txt","report (1).txt","report (2).txt","report (3).txt"))
+                check(names["original suffix"]=="report (1).txt")
+                check(names.keys==setOf("first source","second source","original suffix","case-only name"))
+                check(stageBatch(batch.reversed())==names){"Naming changed when the same files were reselected in reverse"}
+                check(context.contentResolver.openInputStream(second)!!.use{String(it.readBytes())}=="second source")
             } finally{staged.delete()}
             activity=open(Intent(Intent.ACTION_SEND_MULTIPLE).setType("text/plain").putParcelableArrayListExtra(Intent.EXTRA_STREAM,arrayListOf(first,second,first)))
             runner.runOnMainSync{check((field(activity,"sources") as List<*>).size==2)}
@@ -87,7 +103,7 @@ object ShareEntryRegression {
             check(ProgressEvents.croc("DATABEAM_PREPARE_V1 {\"done\":50,\"total\":100,\"speed_bps\":20}")?.preparation?.done==50L)
             check(ProgressEvents.croc("DATABEAM_PREPARE_V1 {\"done\":200,\"total\":100,\"speed_bps\":20}")==null)
             check(ProgressEvents.croc("DATABEAM_RATE_V1 {\"speed_bps\":-1}")==null)
-            result.putString("result","PASS share target, selected text, files/multiple files, referenced attachment bytes, caption protection, draft recreation and structured preparation progress")
+            result.putString("result","PASS share target, text, duplicate filenames, stable aliases, referenced bytes, draft recreation and preparation progress")
         }catch(error:Throwable){resultCode=1;result.putString("error",error.stackTraceToString())}
         finally {
             runner.runOnMainSync{opened.forEach{it.finish()}}

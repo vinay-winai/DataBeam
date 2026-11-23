@@ -3,6 +3,7 @@ object NativeBridge {
     init { System.loadLibrary("databeam_android") }
     @JvmStatic external fun initialize(context: android.content.Context)
     @JvmStatic external fun run(config: String): String
+    @JvmStatic external fun supportsSendmeFileDescriptors():Boolean
     @JvmStatic external fun poll(): String
     @JvmStatic external fun hash(ticket: String): String
     @JvmStatic external fun inspectCache(ticket: String, base: String): String

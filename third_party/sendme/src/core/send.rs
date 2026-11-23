@@ -21,13 +21,20 @@ use n0_future::{task::AbortOnDropHandle, BufferedStreamExt};
 use rand::Rng;
 use serde::Serialize;
 use std::{
+    collections::HashMap,
+    fs::File,
     path::{Component, Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tokio::{select, sync::mpsc};
 use tracing::trace;
 use walkdir::WalkDir;
+
+type SourceFiles = HashMap<PathBuf, Arc<File>>;
 
 fn emit_event(app_handle: &AppHandle, event_name: &str) {
     if let Some(handle) = app_handle {
@@ -154,7 +161,11 @@ pub async fn start_share(
     let (progress_tx, progress_rx) = mpsc::channel(32);
     let app_handle_clone = app_handle.clone();
     anyhow::ensure!(!paths.is_empty(), "no valid paths to share");
-    let entry_type = if paths.len() == 1 && paths[0].is_file() {
+    #[cfg(feature = "descriptor-sources")]
+    let source_files = options.source_files.as_ref();
+    #[cfg(not(feature = "descriptor-sources"))]
+    let source_files = &SourceFiles::new();
+    let entry_type = if paths.len() == 1 && (source_files.contains_key(&paths[0]) || paths[0].is_file()) {
         "file"
     } else {
         "directory"
@@ -179,6 +190,13 @@ pub async fn start_share(
         setup_endpoint = Some(endpoint.clone());
         check_cancelled(cancel.as_deref())?;
 
+        #[cfg(feature = "descriptor-sources")]
+        let store = {
+            let store_options = iroh_blobs::store::fs::options::Options::new(&blobs_data_dir2)
+                .with_source_files(Arc::clone(&options.source_files));
+            FsStore::load_with_opts(blobs_data_dir2.join("blobs.db"), store_options).await?
+        };
+        #[cfg(not(feature = "descriptor-sources"))]
         let store = FsStore::load(&blobs_data_dir2).await?;
         setup_store = Some(store.clone());
         check_cancelled(cancel.as_deref())?;
@@ -200,6 +218,7 @@ pub async fn start_share(
                 paths2,
                 payload_root2,
                 blobs.store(),
+                source_files,
                 options.jobs,
                 cancel.as_deref(),
                 &app_handle,
@@ -358,12 +377,16 @@ async fn import(
     paths: Vec<PathBuf>,
     payload_root: String,
     db: &Store,
+    source_files: &SourceFiles,
     jobs: Option<usize>,
     cancel: Option<&AtomicBool>,
     app_handle: &AppHandle,
 ) -> anyhow::Result<(TempTag, u64, Collection, Vec<u64>)> {
-    let directories = super::directories::collect(&paths, cancel)?;
-    let data_sources = build_virtual_data_sources(paths, &payload_root, cancel)?;
+    let directories = super::directories::collect(
+        paths.iter().filter(|path| !source_files.contains_key(*path)),
+        cancel,
+    )?;
+    let data_sources = build_virtual_data_sources(paths, &payload_root, source_files, cancel)?;
     anyhow::ensure!(!data_sources.is_empty() || !directories.is_empty(), "no valid files or folders to share");
     let manifest_name = format!("{payload_root}/{}", super::directories::NAME);
     anyhow::ensure!(!data_sources.iter().any(|(name, _)| name == &manifest_name), "{} is reserved for DataBeam folder metadata; rename that file before sharing", super::directories::NAME);
@@ -371,7 +394,10 @@ async fn import(
     let mut total = 0_u64;
     for (name, path) in data_sources {
         check_cancelled(cancel)?;
-        let size = std::fs::metadata(&path)?.len();
+        let size = match source_files.get(&path) {
+            Some(file) => file.metadata()?.len(),
+            None => std::fs::metadata(&path)?.len(),
+        };
         total = total.saturating_add(size);
         sized_sources.push((name, path, size));
     }
@@ -482,18 +508,20 @@ async fn import(
 fn build_virtual_data_sources(
     paths: Vec<PathBuf>,
     payload_root: &str,
+    source_files: &SourceFiles,
     cancel: Option<&AtomicBool>,
 ) -> anyhow::Result<Vec<(String, PathBuf)>> {
     let mut data_sources = Vec::new();
 
     for source in paths {
         check_cancelled(cancel)?;
+        let registered = source_files.contains_key(&source);
+        let alias = registered;
         #[cfg(target_os = "android")]
-        let canonical = if android_fd_alias(&source) { std::path::absolute(&source)? } else { source.canonicalize()? };
-        #[cfg(not(target_os = "android"))]
-        let canonical = source.canonicalize()?;
+        let alias = alias || android_fd_alias(&source);
+        let canonical = if alias { std::path::absolute(&source)? } else { source.canonicalize()? };
         anyhow::ensure!(
-            canonical.exists(),
+            registered || canonical.exists(),
             "path {} does not exist",
             canonical.display()
         );
@@ -503,7 +531,7 @@ fn build_virtual_data_sources(
             .context("shared path has no file name")?;
         let source_name = canonicalized_path_to_string(Path::new(source_name), true)?;
 
-        if canonical.is_file() {
+        if registered || canonical.is_file() {
             data_sources.push((format!("{payload_root}/{source_name}"), canonical));
             continue;
         }
@@ -517,7 +545,7 @@ fn build_virtual_data_sources(
                     continue;
                 }
             };
-            let regular = entry.file_type().is_file();
+            let regular = entry.file_type().is_file() || source_files.contains_key(entry.path());
             #[cfg(target_os = "android")]
             let regular = regular || (android_fd_alias(entry.path()) && entry.path().is_file());
             if !regular {
@@ -634,6 +662,59 @@ mod tests {
             assert_eq!(events.iter().filter(|name| *name == "transfer-failed").count(), usize::from(!probe));
             assert!(!events.iter().any(|name| name == "transfer-completed"));
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "descriptor-sources")]
+    #[tokio::test]
+    async fn registered_files_stay_external_and_reopen_without_a_path() -> anyhow::Result<()> {
+        use iroh_blobs::store::fs::options::Options;
+        use std::io::{Seek, SeekFrom};
+
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().canonicalize()?;
+        let original = root.join("original");
+        let data: Vec<u8> = (0..65536).map(|n| (n % 251) as u8).collect();
+        std::fs::write(&original, &data)?;
+        let mut file = File::open(original)?;
+        file.seek(SeekFrom::End(0))?;
+        let file = Arc::new(file);
+
+        let selected = root.join("picked.bin");
+        let folder = root.join("Picked folder");
+        std::fs::create_dir(&folder)?;
+        let nested = folder.join("nested.bin");
+        std::fs::write(&nested, [])?;
+        let files = Arc::new(SourceFiles::from([
+            (selected.clone(), Arc::clone(&file)),
+            (nested, file),
+        ]));
+        let store_root = root.join("store");
+        std::fs::create_dir(&store_root)?;
+        let db = store_root.join("blobs.db");
+        let options = Options::new(&store_root).with_source_files(Arc::clone(&files));
+        let store = FsStore::load_with_opts(db.clone(), options.clone()).await?;
+        let (tag, size, collection, _) = import(
+            vec![selected.clone(), folder],
+            "payload".into(),
+            store.as_ref(),
+            &files,
+            Some(2),
+            None,
+            &None,
+        )
+        .await?;
+        assert_eq!(size, 2 * data.len() as u64);
+        let hash = iroh_blobs::Hash::new(&data);
+        assert_eq!(collection.iter().filter(|(_, entry)| *entry == hash).count(), 2);
+        assert!(!selected.exists());
+        assert!(!options.path.data_path(&hash).exists());
+        assert_eq!(store.get_bytes(hash).await?.as_ref(), data.as_slice());
+        drop(tag);
+        store.shutdown().await?;
+        let reopened = FsStore::load_with_opts(db, options).await?;
+        assert_eq!(reopened.get_bytes(hash).await?.as_ref(), data.as_slice());
+        reopened.shutdown().await?;
         Ok(())
     }
 

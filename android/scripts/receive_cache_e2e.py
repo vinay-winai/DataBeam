@@ -29,7 +29,6 @@ def main():
             if 'No such file or directory' not in error:raise RuntimeError(error)
             snapshots[name]=b''
         else:ET.fromstring(read.stdout);snapshots[name]=read.stdout
-    for name,data in snapshots.items():(work/name).write_bytes(data)
     procs=[];handles=[];sessions=[];records=[];results=[]
     def spawn(command,label,env=None):
         out=(work/(label+'.out')).open('wb');err=(work/(label+'.err')).open('wb');handles.extend([out,err])
@@ -71,15 +70,16 @@ def main():
     try:
         if args.croc_only:
             fixture=work/('croc-reconnect-'+uuid.uuid4().hex[:8]+'.bin')
-            block=bytes(i%251 for i in range(1024*1024));digest=hashlib.sha256()
+            digest=hashlib.sha256()
             with fixture.open('wb') as f:
-                for _ in range(64):f.write(block);digest.update(block)
+                for _ in range(48):
+                    block=os.urandom(1024*1024);f.write(block);digest.update(block)
             expected=digest.hexdigest();case=str(uuid.uuid4());sessions.append(case)
             code='reconnect-'+uuid.uuid4().hex[:12];relay='1.getcroc.com:9009'
-            env=dict(os.environ,CROC_SECRET=code,CROC_NO_UPDATE_CHECK='1')
-            send_command=[CROC,'--yes','--ignore-stdin','--relay',relay,'--throttleUpload','10m','send','--',fixture]
+            env=dict(os.environ,CROC_SECRET=code,CROC_NO_UPDATE_CHECK='1',DATABEAM_CROC_FILE_DIGEST='1')
+            send_command=[CROC,'--yes','--ignore-stdin','--relay',relay,'--throttleUpload','6m','send','--',fixture]
             peer=spawn(send_command,'croc-initial',env)
-            config=dict(id=case,mode='Croc',action='receive',code=code,relay=relay)
+            config=dict(id=case,mode='Croc',action='receive',code=code,relay=relay,saveFolder='',saveFolderLabel='Downloads / DataBeam')
             payload=base64.b64encode(json.dumps(config).encode()).decode()
             phone=spawn([ADB,'shell','am','instrument','-w','-e','config',payload,APP+'.test/'+APP+'.SmokeInstrumentation'],'croc-initial-phone')
             end=time.monotonic()+65
@@ -92,9 +92,41 @@ def main():
             else:raise AssertionError('No Croc payload before interruption')
             adb('shell','am','force-stop',APP);phone.wait(timeout=15);stop(peer)
             saved=state();records.append(saved)
+            assert saved.get('crocDirect'),saved.get('message','Direct Downloads not enabled')
+            assert saved.get('crocPending'), 'No pending Downloads rows'
+            original_rows=saved['crocPending']
+            assert not adb('shell','run-as',APP,'ls','-A',f'files/received/{case}').strip(),'Payload duplicated in private storage'
             print('Croc interrupted at',saved.get('done'),flush=True)
-            spawn(send_command,'croc-restarted',env)
-            receive('Croc','','croc-app-close-resume',fixture,expected,session=case,code=code,relay=relay,requireCachedResume=True)
+            wrong_fixture=work/'different-content'/fixture.name
+            wrong_fixture.parent.mkdir()
+            with fixture.open('rb') as original, wrong_fixture.open('wb') as changed:
+                changed.write(bytes([original.read(1)[0]^1]))
+                while block:=original.read(1024*1024):changed.write(block)
+            prior=dict(config,receiveCode=code,crocDirect=True,crocPending=original_rows,crocWrapper=saved['crocWrapper'])
+            for label, command in (
+                ('different-file',send_command[:-1]+[wrong_fixture]),
+                ('text',send_command[:-2]+['--text','Generated Croc resume test']),
+            ):
+                different='different-'+uuid.uuid4().hex[:12]
+                wrong_sender=spawn(command,'croc-'+label,dict(env,CROC_SECRET=different))
+                payload=base64.b64encode(json.dumps(dict(prior,code=different)).encode()).decode()
+                wrong_phone=spawn([ADB,'shell','am','instrument','-w','-e','config',payload,APP+'.test/'+APP+'.SmokeInstrumentation'],'croc-'+label+'-phone')
+                wrong_phone.wait(timeout=70)
+                rejected=state()
+                assert rejected.get('id')==case and rejected.get('status')=='interrupted', 'Mismatched payload was accepted'
+                assert 'sharing different files' in rejected.get('message',''),rejected.get('message')
+                assert rejected.get('crocPending')==original_rows,'Mismatched payload changed the stored files'
+                stop(wrong_sender)
+                print('PASS rejected mismatched sender offering '+label,flush=True)
+            replacement='reconnect-'+uuid.uuid4().hex[:12]
+            spawn(send_command,'croc-restarted',dict(env,CROC_SECRET=replacement))
+            completed=receive('Croc','','croc-app-close-new-code-resume',fixture,expected,session=case,
+                code=replacement,receiveCode=code,relay=relay,requireCachedResume=True,
+                saveFolder='',saveFolderLabel='Downloads / DataBeam',crocDirect=True,
+                crocPending=original_rows,crocWrapper=saved['crocWrapper'])
+            assert completed.get('published')==original_rows,'Resume changed the download row'
+            assert completed.get('firstPayloadDone',0)>=4*1024*1024,'Resume did not preserve the partial byte range'
+            assert not adb('shell','run-as',APP,'ls',f'files/croc-resume/{case}.json',check=False).strip(),'Resume metadata kept after success'
         for mode in (() if args.croc_only else (args.mode,) if args.mode else ('Sendme','EasySendMe')):
             label=mode.lower();fixture=work/(label+'-'+uuid.uuid4().hex[:8]+'.bin')
             block=bytes(i%251 for i in range(1024*1024));digest=hashlib.sha256()
@@ -108,11 +140,15 @@ def main():
         for p in reversed(procs):stop(p)
         adb('shell','am','force-stop',APP,check=False)
         for s in records:
-            for uri in s.get('published',{}).values():
+            for uri in {*s.get('published',{}).values(),*s.get('crocPending',{}).values()}:
                 if re.fullmatch(r'content://media/(external|external_primary)/downloads/\d+',uri):adb('shell','content','delete','--uri',uri,check=False)
+            wrapper=s.get('crocWrapper','')
+            if re.fullmatch(r'croc-reconnect-[a-z0-9]{5}_databeam(?: \(\d+\))?',wrapper):
+                adb('shell','rmdir','/sdcard/Download/DataBeam/'+wrapper,check=False)
         for case in sessions:
             uuid.UUID(case)
             adb('shell','run-as',APP,'rm','-f',f'files/transfer-records/{case}.json',f'files/transfer-records/{case}.tmp',check=False)
+            adb('shell','run-as',APP,'rm','-f',f'files/croc-resume/{case}.json',check=False)
             for parent in ('blobs','received'):
                 path=f'files/{parent}/{case}'
                 real=adb('shell','run-as',APP,'readlink','-f',path,check=False).decode().strip()

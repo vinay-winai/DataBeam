@@ -21,10 +21,10 @@ object CleanupRegression {
         }
         val uris=mutableSetOf<String>();var code=1;val result=Bundle()
         fun directory(kind:String,id:String)=File(root,"$kind/$id").apply{mkdirs()}
-        fun record(id:String,kind:String="receive",status:String="interrupted",paths:JSONArray=JSONArray()):JSONObject {
+        fun record(id:String,kind:String="receive",status:String="interrupted",paths:JSONArray=JSONArray(),daysOld:Int=8):JSONObject {
             val s=JSONObject().put("id",id).put("action",kind).put("status",status).put("paths",paths)
             TransferCleanup.record(fake,s)
-            val file=File(root,"transfer-records/$id.json");val saved=JSONObject(file.readText()).put("updatedAt",System.currentTimeMillis()-TransferCleanup.RETENTION_MS-1000);file.writeText(saved.toString());return s
+            val file=File(root,"transfer-records/$id.json");val saved=JSONObject(file.readText()).put("updatedAt",System.currentTimeMillis()-daysOld*TransferCleanup.DAY_MS);file.writeText(saved.toString());return s
         }
         try {
             check(!TransferService.isBusy()){"A transfer is active"}
@@ -46,9 +46,13 @@ object CleanupRegression {
 
             val paused=directory("received","paused");File(paused,"partial").writeText("keep partial")
             val pausedBlob=directory("blobs","paused");File(pausedBlob,"data").writeText("keep blobs")
-            val pausedState=record("paused").put("status","paused").put("cacheBase",pausedBlob.absolutePath)
+            val pausedState=record("paused",daysOld=0).put("status","paused").put("cacheBase",pausedBlob.absolutePath)
             fake.getSharedPreferences("transfer",0).edit().putString("state",pausedState.toString()).commit()
             val expired=directory("blobs","expired");File(expired,"data").writeBytes(ByteArray(8192){3});record("expired")
+            TransferCleanup.clearAgedTransfers(fake);check(expired.isDirectory){"Auto-clear should default to Off"}
+            AppSettings.setCleanupDays(fake,30)
+            TransferCleanup.clearAgedTransfers(fake);check(expired.isDirectory){"Monthly cleanup removed an eight-day-old partial"}
+            AppSettings.setCleanupDays(fake,7)
             val unknown=directory("blobs","unknown");File(unknown,"data").writeBytes(ByteArray(8192){7})
             val zero=directory("received","unknown-zero");File(zero,"zero.bin").writeBytes(byteArrayOf());File(zero,"empty folder").mkdirs()
             val otherName=directory("received","different-name");File(otherName,"not-a-saved-name-$nonce.txt").writeText("verified published bytes")
@@ -81,6 +85,7 @@ object CleanupRegression {
             File(root,"received/escape").delete()
             check(root.canonicalFile.parentFile==c.filesDir.canonicalFile)
             root.deleteRecursively();fake.getSharedPreferences("transfer",0).edit().clear().commit()
+            fake.getSharedPreferences("settings",0).edit().clear().commit()
         }
         runner.finish(code,result)
     }

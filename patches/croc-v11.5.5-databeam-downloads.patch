@@ -1,0 +1,234 @@
+--- a/src/receivefs/root.go
++++ b/src/receivefs/root.go
+@@ -16,8 +16,9 @@
+ // os.Root keeps operations contained even when path components are replaced
+ // concurrently.
+ type Root struct {
+-	root *os.Root
+-	name string
++	root         *os.Root
++	name         string
++	managedFiles map[string]string
+ }
+ 
+ // OpenRoot opens an existing destination directory.
+@@ -36,6 +37,34 @@
+ func (r *Root) Close() error { return r.root.Close() }
+ func (r *Root) Name() string { return r.name }
+ 
++// SetManagedFiles installs the Android app's pending Downloads files after
++// the offer has been validated. All unmapped paths retain normal root checks.
++func (r *Root) SetManagedFiles(paths map[string]string) {
++	r.managedFiles = paths
++}
++
++func (r *Root) DataPath(name string) string {
++	if physical, ok := r.managedFiles[name]; ok {
++		return physical
++	}
++	return filepath.Join(r.name, filepath.FromSlash(name))
++}
++
++func (r *Root) managedPath(name string) (string, error) {
++	physical := r.managedFiles[name]
++	if physical == "" {
++		return "", nil
++	}
++	info, err := os.Lstat(physical)
++	if err != nil {
++		return "", err
++	}
++	if !info.Mode().IsRegular() {
++		return "", fmt.Errorf("pending receive file is not regular: %q", name)
++	}
++	return physical, nil
++}
++
+ func native(name string, allowRoot bool) (string, error) {
+ 	clean, err := Normalize(name, allowRoot)
+ 	if err != nil {
+@@ -45,6 +74,12 @@
+ }
+ 
+ func (r *Root) Open(name string) (*os.File, error) {
++	if physical, err := r.managedPath(name); physical != "" || err != nil {
++		if err != nil {
++			return nil, err
++		}
++		return os.Open(physical)
++	}
+ 	clean, err := native(name, false)
+ 	if err != nil {
+ 		return nil, err
+@@ -57,6 +92,12 @@
+ 
+ // OpenFile opens a validated path while preserving os.OpenFile flag behavior.
+ func (r *Root) OpenFile(name string, flag int, perm fs.FileMode) (*os.File, error) {
++	if physical, err := r.managedPath(name); physical != "" || err != nil {
++		if err != nil {
++			return nil, err
++		}
++		return os.OpenFile(physical, flag&^(os.O_CREATE|os.O_EXCL), 0)
++	}
+ 	clean, err := native(name, false)
+ 	if err != nil {
+ 		return nil, err
+@@ -68,6 +109,12 @@
+ }
+ 
+ func (r *Root) Lstat(name string) (fs.FileInfo, error) {
++	if physical, err := r.managedPath(name); physical != "" || err != nil {
++		if err != nil {
++			return nil, err
++		}
++		return os.Lstat(physical)
++	}
+ 	clean, err := native(name, true)
+ 	if err != nil {
+ 		return nil, err
+@@ -98,6 +145,12 @@
+ }
+ 
+ func (r *Root) Remove(name string) error {
++	if physical, err := r.managedPath(name); physical != "" || err != nil {
++		if err != nil {
++			return err
++		}
++		return os.Truncate(physical, 0)
++	}
+ 	clean, err := native(name, false)
+ 	if err != nil {
+ 		return err
+@@ -144,6 +197,12 @@
+ }
+ 
+ func (r *Root) Chtimes(name string, atime, mtime time.Time) error {
++	if physical, err := r.managedPath(name); physical != "" || err != nil {
++		if err != nil {
++			return err
++		}
++		return nil
++	}
+ 	clean, err := native(name, false)
+ 	if err != nil {
+ 		return err
+--- a/src/croc/databeam_managed_receive.go
++++ b/src/croc/databeam_managed_receive.go
+@@ -1,17 +1,20 @@
+ package croc
+ 
+ import (
++	"bufio"
+ 	"bytes"
+ 	"crypto/sha256"
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
+ 	"io"
++	"math"
+ 	"os"
+ 	"path"
+ 	"path/filepath"
+ 	"reflect"
+ 	"sort"
++	"strings"
+ )
+ 
+ type managedItem struct {
+@@ -72,6 +75,9 @@
+ 		if f.Size == 0 {
+ 			digest = nil
+ 		}
++		if f.Size < 0 || f.Size > math.MaxInt64-r.Total {
++			return errors.New("Croc transfer size is too large")
++		}
+ 		add(managedItem{Path: path.Join(f.FolderRemote, f.Name), Size: f.Size, Kind: "file", Digest: digest})
+ 	}
+ 	for _, f := range c.EmptyFoldersToTransfer {
+@@ -125,6 +131,38 @@
+ 	}
+ 	c.managedReceive = &r
+ 	fmt.Fprintf(os.Stderr, "\nDATABEAM_OFFER_V1 %s\n", file)
++	mapping := os.Getenv("DATABEAM_CROC_DOWNLOAD_MAP")
++	if mapping == "" {
++		return nil
++	}
++	reply, err := bufio.NewReader(os.Stdin).ReadString('\n')
++	if err != nil || reply != "ready\n" {
++		return errors.New("Android did not prepare the download destination")
++	}
++	encoded, err := os.ReadFile(mapping)
++	if err != nil {
++		return err
++	}
++	var files map[string]string
++	if err := json.Unmarshal(encoded, &files); err != nil {
++		return err
++	}
++	if len(files) != 0 {
++		for _, item := range r.Entries {
++			if item.Kind != "file" {
++				continue
++			}
++			physical := files[item.Path]
++			if !filepath.IsAbs(physical) || !strings.HasPrefix(filepath.Base(physical), ".pending-") {
++				return fmt.Errorf("Invalid pending download for %q", item.Path)
++			}
++		}
++	}
++	root, err := c.receiveFilesystem()
++	if err != nil {
++		return err
++	}
++	root.SetManagedFiles(files)
+ 	return nil
+ }
+ 
+@@ -164,7 +202,7 @@
+ 			err = closeErr
+ 		}
+ 		if item.Size > 0 && !r.Strong && len(item.Digest) > 0 && err == nil {
+-			digest, err = receiveFileHash(c.clientContext(), filepath.Join(root.Name(), filepath.FromSlash(item.Path)), r.Algorithm, false)
++			digest, err = receiveFileHash(c.clientContext(), root.DataPath(item.Path), r.Algorithm, false)
+ 		}
+ 		if err != nil {
+ 			return err
+--- a/src/croc/croc.go
++++ b/src/croc/croc.go
+@@ -3156,7 +3160,7 @@
+ 			// recipient requests the file and chunks (if empty, then should receive all chunks)
+ 			// TODO: determine the missing chunks
+ 			c.CurrentFileChunkRanges = utils.MissingChunks(
+-				pathToFile,
++				root.DataPath(pathToFile),
+ 				c.FilesToTransfer[c.FilesToTransferCurrentNum].Size,
+ 				models.TCP_BUFFER_SIZE/2,
+ 			)
+@@ -3414,7 +3418,7 @@
+ 		if destinationExists && fileInfo.Size > 0 && fileInfo.Symlink == "" && recipientFileInfo.Mode().IsRegular() && recipientFileInfo.Size() == fileInfo.Size {
+ 			// the file exists, but is same size, so hash it
+ 			c.dataBeamVerifying()
+-			fileHash, err = receiveFileHash(c.clientContext(), destination, c.Options.HashAlgorithm, !c.Options.SendingText)
++			fileHash, err = receiveFileHash(c.clientContext(), root.DataPath(destination), c.Options.HashAlgorithm, !c.Options.SendingText)
+ 			if err != nil {
+ 				return fmt.Errorf("hash existing destination %q: %w", destination, err)
+ 			}
+@@ -3433,7 +3437,7 @@
+ 			case pending:
+ 				return nil
+ 			default:
+-				if err := c.beginExactHash(i, path.Join(fileInfo.FolderRemote, fileInfo.Name)); err != nil {
++				if err := c.beginExactHash(i, root.DataPath(destination)); err != nil {
+ 					return err
+ 				}
+ 				return nil
+@@ -3498,8 +3502,7 @@
+ 			break
+ 		}
+ 	}
+-	c.recipientGetFileReady(finished)
+-	return
++	return c.recipientGetFileReady(finished)
+ }
+ 
+ func (c *Client) fmtPrintUpdate() {

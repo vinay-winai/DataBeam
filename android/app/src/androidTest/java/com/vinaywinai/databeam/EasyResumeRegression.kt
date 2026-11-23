@@ -75,7 +75,7 @@ object EasyResumeRegression {
             AppSettings.setEngineEnabled(c,"Sendme",true);AppSettings.setEngineEnabled(c,"Croc",true)
             AppSettings.setRelay(c,"127.0.0.1:19009");AppSettings.setFolder(c,null)
             activity=r.startActivitySync(Intent(c,MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) as MainActivity
-            main{(field("mode") as Spinner).setSelection(if(nativeMode=="Sendme")1 else 0);(field("receiveTab") as Button).performClick();(field("code") as EditText).setText(args.getString(if(nativeMode=="Sendme")"ticket" else "code"));(field("primary") as Button).performClick()}
+            main{activity!!.selectEngineForTest(nativeMode);(field("receiveTab") as Button).performClick();(field("code") as EditText).setText(args.getString(if(nativeMode=="Sendme")"ticket" else "code"));(field("primary") as Button).performClick()}
             val start=System.currentTimeMillis()+10000
             while(System.currentTimeMillis()<start){val s=TransferService.state(c);if(s.optString(if(nativeMode=="Sendme")"ticket" else "code")==args.getString(if(nativeMode=="Sendme")"ticket" else "code")){session=s.getString("id");break};Thread.sleep(50)}
             check(session.isNotEmpty());sessions.add(session);mark("started")
@@ -112,7 +112,7 @@ object EasyResumeRegression {
             check(ready.exists());val nextCode=JSONObject(ready.readText()).getString("code")
             render();main{
                 (field("newTransfer") as Button).performClick()
-                (field("mode") as Spinner).setSelection(0)
+                activity!!.selectEngineForTest("EasySendMe")
                 (field("code") as EditText).setText(nextCode)
                 (field("primary") as Button).performClick()
             }

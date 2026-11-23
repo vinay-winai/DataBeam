@@ -14,7 +14,10 @@ iroh = "1.4.1"
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 [target.'cfg(target_os = "android")'.dependencies]
 jni22 = { package = "jni", version = "0.22.4" }
+libc = "0.2"
 rustls-platform-verifier = "=0.7.1"
+[features]
+descriptor-sources = ["sendme/descriptor-sources"]
 [profile.release]
 strip = true
 [dev-dependencies]

@@ -1,0 +1,477 @@
+--- a/src/receivefs/root.go
++++ b/src/receivefs/root.go
+@@ -37,6 +37,10 @@
+ func (r *Root) Close() error { return r.root.Close() }
+ func (r *Root) Name() string { return r.name }
+ 
++func (r *Root) Walk(visit fs.WalkDirFunc) error {
++	return fs.WalkDir(r.root.FS(), ".", visit)
++}
++
+ // SetManagedFiles installs the Android app's pending Downloads files after
+ // the offer has been validated. All unmapped paths retain normal root checks.
+ func (r *Root) SetManagedFiles(paths map[string]string) {
+--- a/src/croc/databeam_managed_receive.go
++++ b/src/croc/databeam_managed_receive.go
+@@ -42,6 +42,10 @@
+ 	if file == "" {
+ 		return nil
+ 	}
++	input := bufio.NewReader(os.Stdin)
++	if err := c.finishManagedRevision(file, input); err != nil {
++		return err
++	}
+ 	if c.Options.SendingText {
+ 		if _, err := os.Stat(file); err == nil {
+ 			return errors.New("The sender is sharing different files. The saved partial transfer was kept.")
+@@ -116,24 +120,22 @@
+ 		if !r.Strong && (!managedFullHash(r.Algorithm) || os.Getenv("DATABEAM_CROC_REPLACEMENT_CODE") == "1") {
+ 			return errors.New("Cannot verify this sender's files for resume. Use the original code with a full-hash sender, or start a separate receive.")
+ 		}
+-		if json.Unmarshal(prior, &previous) != nil || previous.Version != 1 || previous.Algorithm != r.Algorithm || !reflect.DeepEqual(previous.Entries, r.Entries) {
+-			return errors.New("The sender is sharing different files. The saved partial transfer was kept.")
++		if json.Unmarshal(prior, &previous) != nil || previous.Version != 1 {
++			return errors.New("Invalid saved Croc file list")
+ 		}
+ 		r.Wrapper = previous.Wrapper
++		if previous.Algorithm != r.Algorithm || !reflect.DeepEqual(previous.Entries, r.Entries) {
++			if err := c.reviseManagedOffer(file, previous, r, input); err != nil {
++				return err
++			}
++		}
+ 	} else if !os.IsNotExist(err) {
+ 		return err
+ 	} else {
+ 		if os.Getenv("DATABEAM_CROC_REPLACEMENT_CODE") == "1" {
+ 			return errors.New("No saved file list is available for this replacement code")
+ 		}
+-		payload, err := json.Marshal(r)
+-		if err != nil {
+-			return err
+-		}
+-		if err = os.WriteFile(file+".tmp", payload, 0600); err != nil {
+-			return err
+-		}
+-		if err = os.Rename(file+".tmp", file); err != nil {
++		if err = writeManagedJSON(file, r); err != nil {
+ 			return err
+ 		}
+ 	}
+@@ -143,7 +145,7 @@
+ 	if mapping == "" {
+ 		return nil
+ 	}
+-	reply, err := bufio.NewReader(os.Stdin).ReadString('\n')
++	reply, err := input.ReadString('\n')
+ 	if err != nil || reply != "ready\n" {
+ 		return errors.New("Android did not prepare the download destination")
+ 	}
+@@ -184,6 +186,9 @@
+ 	}
+ 	root, err := c.receiveFilesystem()
+ 	if err != nil {
++		return err
++	}
++	if err := verifyManagedWorkspace(root, *r); err != nil {
+ 		return err
+ 	}
+ 	c.dataBeamVerifying()
+--- /dev/null
++++ b/src/croc/databeam_revision.go
+@@ -0,0 +1,303 @@
++package croc
++
++import (
++	"bufio"
++	"bytes"
++	"crypto/rand"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io/fs"
++	"net"
++	"os"
++	"path"
++	"reflect"
++	"sort"
++	"time"
++
++	"github.com/schollz/croc/v11/src/comm"
++	"github.com/schollz/croc/v11/src/receivefs"
++)
++
++type managedReview struct {
++	ID       string   `json:"id"`
++	Replaced []string `json:"replaced"`
++	Added    []string `json:"added"`
++	Removed  []string `json:"removed"`
++}
++
++type managedRevision struct {
++	ID       string         `json:"id"`
++	Previous managedReceipt `json:"previous"`
++	Next     managedReceipt `json:"next"`
++	Files    []string       `json:"files"`
++	Dirs     []string       `json:"directories"`
++}
++
++func managedTree(offer managedReceipt) map[string]managedItem {
++	items := make(map[string]managedItem, len(offer.Entries))
++	for _, item := range offer.Entries {
++		items[item.Path] = item
++		for parent := path.Dir(item.Path); parent != "."; parent = path.Dir(parent) {
++			items[parent] = managedItem{Path: parent, Kind: "directory"}
++		}
++	}
++	return items
++}
++
++func diffManagedOffers(previous, next managedReceipt) (managedReview, []string, []string) {
++	before, after := managedTree(previous), managedTree(next)
++	review := managedReview{Replaced: []string{}, Added: []string{}, Removed: []string{}}
++	retiredFiles, retiredDirs := []string{}, []string{}
++	for name, old := range before {
++		item, exists := after[name]
++		if exists && reflect.DeepEqual(old, item) {
++			continue
++		}
++		if !exists {
++			review.Removed = append(review.Removed, name)
++		} else {
++			review.Replaced = append(review.Replaced, name)
++		}
++		if old.Kind == "file" {
++			retiredFiles = append(retiredFiles, name)
++		} else {
++			retiredDirs = append(retiredDirs, name)
++		}
++	}
++	for name := range after {
++		if _, exists := before[name]; !exists {
++			review.Added = append(review.Added, name)
++		}
++	}
++	sort.Strings(review.Replaced)
++	sort.Strings(review.Added)
++	sort.Strings(review.Removed)
++	sort.Strings(retiredFiles)
++	sort.Slice(retiredDirs, func(i, j int) bool {
++		if len(retiredDirs[i]) == len(retiredDirs[j]) {
++			return retiredDirs[i] < retiredDirs[j]
++		}
++		return len(retiredDirs[i]) > len(retiredDirs[j])
++	})
++	return review, retiredFiles, retiredDirs
++}
++
++func validRevisionOffer(offer managedReceipt) bool {
++	if offer.Version != 1 || !offer.Strong || offer.Algorithm != "sha256" {
++		return false
++	}
++	for _, item := range offer.Entries {
++		normalized, err := receivefs.Normalize(item.Path, false)
++		if err != nil || item.Path != normalized || item.Size < 0 {
++			return false
++		}
++		switch item.Kind {
++		case "directory":
++			if item.Size != 0 || len(item.Digest) != 0 {
++				return false
++			}
++		case "file":
++			if item.Size > 0 && len(item.Digest) != sha256.Size {
++				return false
++			}
++		default:
++			return false
++		}
++	}
++	return true
++}
++
++func writeManagedJSON(filename string, value any) error {
++	payload, err := json.Marshal(value)
++	if err != nil {
++		return err
++	}
++	tmp := filename + ".tmp"
++	file, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
++	if err != nil {
++		return err
++	}
++	if _, err = file.Write(payload); err == nil {
++		err = file.Sync()
++	}
++	if closeErr := file.Close(); err == nil {
++		err = closeErr
++	}
++	if err != nil {
++		return err
++	}
++	return os.Rename(tmp, filename)
++}
++
++// At the end of the file list the sender is waiting for a file request.
++// Read only relay keepalives while waiting for a local decision.
++func (c *Client) approveManagedRevision(filename string, review managedReview) error {
++	const kept = "The saved partial transfer was kept."
++	if err := writeManagedJSON(filename+".review", review); err != nil {
++		return err
++	}
++	defer os.Remove(filename + ".review")
++	defer os.Remove(filename + ".decision")
++	fmt.Fprintf(os.Stderr, "\nDATABEAM_REVIEW_V1 %s\n", review.ID)
++
++	conn := c.connection(0).Connection()
++	defer conn.SetReadDeadline(time.Time{})
++	end := time.Now().Add(60 * time.Second)
++	ping := append(append([]byte(nil), comm.MAGIC_BYTES...), 1, 0, 0, 0, 1)
++	frame := make([]byte, len(ping))
++	used := 0
++	for time.Now().Before(end) {
++		if err := c.ctxErr(); err != nil {
++			return err
++		}
++		if err := conn.SetReadDeadline(time.Now().Add(120 * time.Millisecond)); err != nil {
++			return fmt.Errorf("The sender disconnected. %s", kept)
++		}
++		n, err := conn.Read(frame[used:])
++		used += n
++		if err != nil {
++			var timeout net.Error
++			if !errors.As(err, &timeout) || !timeout.Timeout() {
++				return fmt.Errorf("The sender disconnected. %s", kept)
++			}
++			if used == 0 {
++				answer, readErr := os.ReadFile(filename + ".decision")
++				switch {
++				case readErr == nil && string(answer) == "apply "+review.ID:
++					if time.Now().Before(end) {
++						return c.ctxErr()
++					}
++				case readErr == nil && string(answer) == "keep "+review.ID:
++					return fmt.Errorf("Updated batch declined. %s", kept)
++				case readErr != nil && !os.IsNotExist(readErr):
++					return readErr
++				}
++			}
++		}
++		if used == len(frame) {
++			if !bytes.Equal(frame, ping) {
++				return fmt.Errorf("The sender ended the review. %s", kept)
++			}
++			used = 0
++		}
++	}
++	return fmt.Errorf("File review timed out. %s", kept)
++}
++
++func (c *Client) reviseManagedOffer(filename string, previous, next managedReceipt, input *bufio.Reader) error {
++	if os.Getenv("DATABEAM_CROC_REVIEW") != "1" || !validRevisionOffer(previous) || !validRevisionOffer(next) {
++		return errors.New("The sender is sharing different files. The saved partial transfer was kept.")
++	}
++	review, files, dirs := diffManagedOffers(previous, next)
++	token := make([]byte, 16)
++	if _, err := rand.Read(token); err != nil {
++		return err
++	}
++	review.ID = hex.EncodeToString(token)
++	if err := c.approveManagedRevision(filename, review); err != nil {
++		return err
++	}
++	if err := writeManagedJSON(filename+".revision", managedRevision{review.ID, previous, next, files, dirs}); err != nil {
++		return err
++	}
++	return c.finishManagedRevision(filename, input)
++}
++
++func (c *Client) finishManagedRevision(filename string, input *bufio.Reader) error {
++	journal := filename + ".revision"
++	payload, err := os.ReadFile(journal)
++	if os.IsNotExist(err) {
++		return nil
++	}
++	if err != nil {
++		return err
++	}
++	var revision managedRevision
++	if json.Unmarshal(payload, &revision) != nil || !validRevisionOffer(revision.Previous) || !validRevisionOffer(revision.Next) {
++		return errors.New("Invalid saved Croc batch update")
++	}
++	receipt, err := os.ReadFile(filename)
++	if err != nil {
++		return err
++	}
++	var current managedReceipt
++	if json.Unmarshal(receipt, &current) != nil {
++		return errors.New("Invalid saved Croc file list")
++	}
++	if reflect.DeepEqual(current, revision.Next) {
++		// The receipt is the commit marker. New data may have arrived already.
++		return os.Remove(journal)
++	}
++	if !reflect.DeepEqual(current, revision.Previous) {
++		return errors.New("The saved Croc file list changed during the batch update")
++	}
++	root, err := c.receiveFilesystem()
++	if err != nil {
++		return err
++	}
++	_, files, dirs := diffManagedOffers(revision.Previous, revision.Next)
++	if !reflect.DeepEqual(revision.Files, files) || !reflect.DeepEqual(revision.Dirs, dirs) {
++		return errors.New("Invalid stored Croc reset paths")
++	}
++	if err = verifyManagedWorkspace(root, current); err != nil {
++		return err
++	}
++	if err = pruneManagedWorkspace(root, revision.Files, revision.Dirs); err != nil {
++		return err
++	}
++	if os.Getenv("DATABEAM_CROC_DOWNLOAD_MAP") != "" {
++		fmt.Fprintf(os.Stderr, "\nDATABEAM_RESET_V1 %s\n", revision.ID)
++		if reply, err := input.ReadString('\n'); err != nil || reply != "reset "+revision.ID+"\n" {
++			return errors.New("Could not update the pending Android downloads")
++		}
++	}
++	if err = writeManagedJSON(filename, revision.Next); err != nil {
++		return err
++	}
++	return os.Remove(journal)
++}
++
++func pruneManagedWorkspace(root *receivefs.Root, files, dirs []string) error {
++	for _, group := range []struct {
++		names []string
++		dir   bool
++	}{{files, false}, {dirs, true}} {
++		for _, name := range group.names {
++			info, err := root.Lstat(name)
++			if os.IsNotExist(err) {
++				continue
++			}
++			if err != nil {
++				return err
++			}
++			if (group.dir && !info.IsDir()) || (!group.dir && !info.Mode().IsRegular()) {
++				return fmt.Errorf("The saved partial path changed: %s", name)
++			}
++			if err = root.RejectSymlinkPath(name); err != nil {
++				return err
++			}
++			if err := root.Remove(name); err != nil && !os.IsNotExist(err) {
++				return fmt.Errorf("Could not clear superseded partial path %q: %w", name, err)
++			}
++		}
++	}
++	return nil
++}
++
++func verifyManagedWorkspace(root *receivefs.Root, offer managedReceipt) error {
++	items := managedTree(offer)
++	return root.Walk(func(name string, entry fs.DirEntry, err error) error {
++		if err != nil || name == "." {
++			return err
++		}
++		item, exists := items[name]
++		if !exists || (item.Kind == "directory" && !entry.IsDir()) ||
++			(item.Kind == "file" && !entry.Type().IsRegular()) {
++			return fmt.Errorf("Unexpected data in the partial transfer: %s", name)
++		}
++		return nil
++	})
++}
+--- /dev/null
++++ b/src/croc/databeam_revision_test.go
+@@ -0,0 +1,90 @@
++package croc
++
++import (
++	"bufio"
++	"bytes"
++	"crypto/sha256"
++	"os"
++	"path/filepath"
++	"reflect"
++	"strings"
++	"testing"
++
++	"github.com/schollz/croc/v11/src/receivefs"
++)
++
++func revisionItem(name, contents string) managedItem {
++	hash := sha256.Sum256([]byte(contents))
++	return managedItem{Path: name, Kind: "file", Size: int64(len(contents)), Digest: hash[:]}
++}
++
++func TestDataBeamRevisionRecovery(t *testing.T) {
++	t.Setenv("DATABEAM_CROC_DOWNLOAD_MAP", "")
++	keep := revisionItem("keep.bin", "unchanged")
++	old := managedReceipt{Version: 1, Strong: true, Algorithm: "sha256", Entries: []managedItem{
++		keep, revisionItem("updated.bin", "old"), revisionItem("folder/removed.bin", "old"),
++	}}
++	next := managedReceipt{Version: 1, Strong: true, Algorithm: "sha256", Entries: []managedItem{
++		keep, revisionItem("updated.bin", "new"), revisionItem("renamed.bin", "old"),
++	}}
++	review, retired, dirs := diffManagedOffers(old, next)
++	if !reflect.DeepEqual(review.Replaced, []string{"updated.bin"}) ||
++		!reflect.DeepEqual(review.Added, []string{"renamed.bin"}) ||
++		!reflect.DeepEqual(review.Removed, []string{"folder", "folder/removed.bin"}) {
++		t.Fatalf("wrong review: %+v", review)
++	}
++	destination := t.TempDir()
++	receipt := filepath.Join(t.TempDir(), "receipt")
++	write := func(name, contents string) {
++		t.Helper()
++		full := filepath.Join(destination, name)
++		if err := os.MkdirAll(filepath.Dir(full), 0700); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.WriteFile(full, []byte(contents), 0600); err != nil {
++			t.Fatal(err)
++		}
++	}
++	write("keep.bin", "partial")
++	write("updated.bin", "old")
++	write("folder/removed.bin", "old")
++	if err := writeManagedJSON(receipt, old); err != nil {
++		t.Fatal(err)
++	}
++	update := managedRevision{ID: "example", Previous: old, Next: next, Files: retired, Dirs: dirs}
++	if err := writeManagedJSON(receipt+".revision", update); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Remove(filepath.Join(destination, "updated.bin")); err != nil {
++		t.Fatal(err)
++	}
++	root, err := receivefs.OpenRoot(destination)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer root.Close()
++	c := &Client{receiveRoot: root}
++	input := bufio.NewReader(strings.NewReader(""))
++	if err := c.finishManagedRevision(receipt, input); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := os.Stat(filepath.Join(destination, "folder")); !os.IsNotExist(err) {
++		t.Fatalf("retired directory remains: %v", err)
++	}
++	kept, err := os.ReadFile(filepath.Join(destination, "keep.bin"))
++	if err != nil || !bytes.Equal(kept, []byte("partial")) {
++		t.Fatalf("partial data was lost: %q, %v", kept, err)
++	}
++	// The commit succeeded before a crash, but the journal wasn't removed.
++	write("updated.bin", "new")
++	if err := writeManagedJSON(receipt+".revision", update); err != nil {
++		t.Fatal(err)
++	}
++	if err := c.finishManagedRevision(receipt, input); err != nil {
++		t.Fatal(err)
++	}
++	retained, err := os.ReadFile(filepath.Join(destination, "updated.bin"))
++	if err != nil || string(retained) != "new" {
++		t.Fatalf("a committed revision was reset again: %q, %v", retained, err)
++	}
++}
