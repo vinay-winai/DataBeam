@@ -17,14 +17,14 @@ The Linux AArch64 AppImage also runs through DroidDeck on Android; it is separat
 
 [Download DataBeam](https://wisesloth.pages.dev/DataBeam/)
 
-## v0.8.0 released
-
-- croc and iroh relay checks and croc auto relay fail handling added.
-- qr code style changed
-- Croc remains pinned to the tested 11.5.5 engine.
-- Fix EasySendMe ticket reception when the Windows system Temp folder cannot be opened. Files still save to the chosen destination.
-
-[Release notes](https://github.com/vinay-winai/DataBeam/releases/tag/v0.8.0)
+DataBeam 0.8.8
+- Stable Android release for Android 8.0 and newer on ARM64. The APK uses the same signing certificate as the public beta.
+- Croc is the default engine. Sendme offers EasySendMe short codes and Broadcast. DataBeam recognizes the esm suffix when receiving an EasySendMe code.
+- Receive history resumes interrupted Croc, Sendme, and EasySendMe batches and individual transfers. If the sender changes the batch, a preview lists replacements, additions and removals. Unchanged files keep their download progress.
+- On desktop and Android, Resend starts a new session from an interrupted transfer when its full payload is accessible. It prompts for missing files before starting.
+- Android can send supported picker and Share Sheet sources directly from their file descriptors. Settings remember expanded sections and can automatically unwrap completed Croc, Sendme, and EasySendMe receives.
+- Desktop includes a custom Croc relay setting. Both platforms can skip identical files selected individually and optionally expire old receive history and partial data.
+- Startup prompts on desktop offer Continue transfer for remembered Sendme and EasySendMe partial downloads. EasySendMe and one-shot Sendme senders keep sharing active after a receiver disconnects so downloads can resume seamlessly.
 
 # Troubleshooting DataBeam
 
