@@ -54,7 +54,7 @@ object UiControlsRegression {
                 fun quick(id:Int){
                     (field("quickActions") as Button).performClick()
                     val popup=field("quickMenu") as PopupMenu
-                    check(popup.menu.findItem(EngineOptions.CROC_HISTORY_ACTION).title=="Croc receive history")
+                    check(popup.menu.findItem(EngineOptions.CROC_HISTORY_ACTION).title=="Receive history")
                     check(popup.menu.size()==5);check(popup.menu.performIdentifierAction(id,0));popup.dismiss()
                 }
                 quick(1)

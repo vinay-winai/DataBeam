@@ -84,6 +84,15 @@ enum TransferState {
     Failed(String),
 }
 
+#[derive(Default)]
+enum EasyReceiveAttempt {
+    #[default]
+    New,
+    SavedTicket,
+    NeedsFreshTicket(String),
+    RefreshingTicket(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum TransferPhase {
     Preparing,
@@ -209,6 +218,8 @@ struct UserSettings {
     #[serde(default)]
     always_unwrap_croc: bool,
     #[serde(default)]
+    always_unwrap_sendme: bool,
+    #[serde(default)]
     croc_custom_relay: String,
     #[serde(default)]
     native_engines_always_expanded: bool,
@@ -216,7 +227,7 @@ struct UserSettings {
     eazysendme_custom_code: String,
     #[serde(default)]
     eazysendme_random_code: bool,
-    #[serde(default)]
+    #[serde(default = "default_transfer_cleanup_days")]
     transfer_cleanup_days: u32,
     #[serde(default = "default_true")]
     eazysendme_auto_retry: bool,
@@ -243,6 +254,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_transfer_cleanup_days() -> u32 {
+    7
+}
+
 fn default_sendme_one_shot() -> bool {
     true
 }
@@ -255,6 +270,8 @@ struct DataBeamApp {
     history_discard: Option<croc_history::ReceiveEntry>,
     history_code: String,
     history_review_entry: Option<String>,
+    native_receive_entry: Option<croc_history::ReceiveEntry>,
+    native_receive_draft: Option<croc_history::ReceiveEntry>,
 
     tool_statuses: Vec<ToolStatus>,
     bundled_croc: Option<PathBuf>,
@@ -277,6 +294,7 @@ struct DataBeamApp {
     receive_code: String,
     receive_output_dir: Option<PathBuf>,
     always_unwrap_croc: bool,
+    always_unwrap_sendme: bool,
     croc_custom_relay: String,
     sendme_blob_dir_mode: SendmeBlobDirMode,
     sendme_blob_custom_dir: Option<PathBuf>,
@@ -330,6 +348,7 @@ struct DataBeamApp {
     eazy_retry_count: u8,
     eazy_next_retry_time: Option<f64>,
     eazy_local_check_started_at: Option<f64>,
+    easy_receive_attempt: EasyReceiveAttempt,
     croc_qr_popup_open: bool,
     croc_text_popup_open: bool,
     croc_text_copied_until: Option<f64>,
@@ -431,7 +450,7 @@ struct DataBeamApp {
 impl Drop for DataBeamApp {
     fn drop(&mut self) {
         if let Some(handle) = &self.transfer_handle {
-            handle.request_cancel();
+            handle.cancel_on_exit();
         }
         if let Some(handle) = &self.eazysendme_croc_handle {
             handle.request_cancel();
@@ -449,6 +468,8 @@ impl Default for DataBeamApp {
             history_discard: None,
             history_code: String::new(),
             history_review_entry: None,
+            native_receive_entry: None,
+            native_receive_draft: None,
             tool_statuses: Vec::new(),
             bundled_croc: None,
             bundled_sendme: None,
@@ -466,6 +487,7 @@ impl Default for DataBeamApp {
             receive_code: String::new(),
             receive_output_dir: None,
             always_unwrap_croc: false,
+            always_unwrap_sendme: false,
             croc_custom_relay: String::new(),
             sendme_blob_dir_mode: SendmeBlobDirMode::SystemTemp,
             sendme_blob_custom_dir: None,
@@ -509,6 +531,7 @@ impl Default for DataBeamApp {
             eazy_retry_count: 0,
             eazy_next_retry_time: None,
             eazy_local_check_started_at: None,
+            easy_receive_attempt: EasyReceiveAttempt::New,
             croc_qr_popup_open: false,
             croc_text_popup_open: false,
             croc_text_copied_until: None,
@@ -538,7 +561,7 @@ impl Default for DataBeamApp {
             initialized_once: false,
             eazysendme_custom_code: String::new(),
             eazysendme_random_code: false,
-            transfer_cleanup_days: 0,
+            transfer_cleanup_days: default_transfer_cleanup_days(),
             last_transfer_cleanup: None,
             eazysendme_recent_codes: Vec::new(),
             eazysendme_ticket: None,
@@ -852,6 +875,7 @@ impl DataBeamApp {
         self.sendme_one_shot = settings.sendme_one_shot;
         self.skip_duplicate_files = settings.skip_duplicate_files;
         self.always_unwrap_croc = settings.always_unwrap_croc;
+        self.always_unwrap_sendme = settings.always_unwrap_sendme;
         self.croc_custom_relay = settings.croc_custom_relay;
         self.native_engines_always_expanded = settings.native_engines_always_expanded;
         self.native_engines_expanded = self.native_engines_always_expanded;
@@ -894,6 +918,7 @@ impl DataBeamApp {
             sendme_one_shot: self.sendme_one_shot,
             skip_duplicate_files: self.skip_duplicate_files,
             always_unwrap_croc: self.always_unwrap_croc,
+            always_unwrap_sendme: self.always_unwrap_sendme,
             croc_custom_relay: self.croc_custom_relay.trim().to_owned(),
             native_engines_always_expanded: self.native_engines_always_expanded,
             eazysendme_custom_code: self.eazysendme_custom_code.clone(),
@@ -931,7 +956,8 @@ impl DataBeamApp {
         if let Some(ticket) = ticket_to_cleanup {
             crate::backend::cleanup_sendme_receive_artifacts_for_ticket(
                 &ticket,
-                self.effective_sendme_blob_dir().as_deref(),
+                self.native_receive_entry.as_ref().and_then(|entry| entry.blob_root.clone())
+                    .or_else(|| self.effective_sendme_blob_dir()).as_deref(),
             );
         }
         self.persist_user_settings();
@@ -983,15 +1009,16 @@ impl DataBeamApp {
         }
     }
 
-    fn start_blob_cleanup_scan(&mut self, show_prompt: bool) {
+    fn start_blob_cleanup_scan(&mut self, ctx: &egui::Context, show_prompt: bool) {
         if self.cleanup_scan_rx.is_some() { return; }
         let roots = self.sendme_blob_scan_roots();
-        let current = blob_cleanup::absolute(&self.effective_sendme_blob_dir().unwrap_or_else(std::env::temp_dir));
-        let known = self.eazysendme_code_ticket_map.values()
-            .filter_map(|entry| native_ticket_to_hex_hash(&entry.ticket)).collect();
+        let ctx = ctx.clone();
         let (tx, rx) = mpsc::channel();
         self.cleanup_scan_rx = Some(rx);
-        thread::spawn(move || { let _ = tx.send(blob_cleanup::scan(roots, &current, &known, show_prompt)); });
+        thread::spawn(move || {
+            let _ = tx.send(blob_cleanup::scan(roots, show_prompt));
+            ctx.request_repaint();
+        });
     }
 
     fn clear_aged_transfers(&mut self) {
@@ -1013,8 +1040,12 @@ impl DataBeamApp {
         }
         let present = self.eazysendme_code_ticket_map.len();
         self.eazysendme_code_ticket_map.retain(|_, entry| entry.timestamp == 0 || entry.timestamp > seconds);
-        let kept = self.eazysendme_code_ticket_map.values()
+        let mut kept: std::collections::HashSet<_> = self.eazysendme_code_ticket_map.values()
             .filter_map(|entry| native_ticket_to_hex_hash(&entry.ticket)).collect();
+        if let Some(history) = Self::croc_history_path() {
+            kept.extend(croc_history::entries(&history).iter().filter_map(|entry|
+                entry.ticket.as_deref().and_then(native_ticket_to_hex_hash)));
+        }
         blob_cleanup::clear_expired(self.sendme_blob_scan_roots(), &kept, cutoff);
         if present != self.eazysendme_code_ticket_map.len() {
             self.persist_user_settings();
@@ -1351,6 +1382,7 @@ impl DataBeamApp {
         if self.selected_tool == tool {
             return;
         }
+        self.native_receive_draft = None;
         let within_sendme = matches!(self.selected_tool, SelectedTool::Sendme | SelectedTool::EazySendme)
             && matches!(tool, SelectedTool::Sendme | SelectedTool::EazySendme);
         self.selected_tool = tool;
@@ -1408,6 +1440,7 @@ impl DataBeamApp {
                         }
                     }
                     PickerResult::ReceiveFolder(Some(path)) => {
+                        self.native_receive_draft = None;
                         self.receive_output_dir = Some(path);
                         self.persist_user_settings();
                     }
@@ -1481,6 +1514,7 @@ impl DataBeamApp {
     }
 
     fn reset_transfer(&mut self) {
+        self.native_receive_entry = None;
         self.recorded_send_active = false;
         self.history_review_entry = None;
         if let Some(handle) = &self.transfer_handle {
@@ -1525,6 +1559,7 @@ impl DataBeamApp {
         self.transfer_end_time = None;
         self.croc_qr_popup_open = false;
         self.eazy_local_check_started_at = None;
+        self.easy_receive_attempt = EasyReceiveAttempt::New;
         self.eazysendme_ticket = None;
         self.eazysendme_croc_handle = None;
         self.eazysendme_croc_rx = None;
@@ -1814,27 +1849,6 @@ impl DataBeamApp {
             }
         }
 
-        // "blobs-incomplete" is a sentinel from sendme_check_local: it means the blob store
-        // check found the data is not fully cached locally. Immediately fall through to the
-        // full Croc receive path without charging a retry or waiting.
-        if e == "blobs-incomplete"
-            && self.selected_tool == SelectedTool::EazySendme
-            && self.view == AppView::Receive
-        {
-            // Prevent auto-retry from re-inserting the same ticket and looping local-check forever.
-            self.eazysendme_ticket = None;
-            let code_key = self.easy_receive_code().to_owned();
-            if !code_key.is_empty() && self.eazysendme_code_ticket_map.remove(&code_key).is_some() {
-                self.persist_user_settings();
-            }
-            self.transfer_log
-                .push("Local blobs incomplete, starting full receive...".to_string());
-            self.eazy_next_retry_time = Some(self.animation_time); // trigger immediately
-            self.transfer_state = TransferState::Failed(e);
-            self.transfer_end_time = Some(self.animation_time);
-            return;
-        }
-
         // "File already exists" should be intercepted to show the overwrite modal.
         let is_file_exists_error = !e.starts_with("conflict-detected") && (e.to_lowercase().contains("already exists")
             || e.to_lowercase().contains("file exists")
@@ -1934,37 +1948,85 @@ impl DataBeamApp {
         if let Some(handle) = &self.transfer_handle {
             handle.request_cancel();
         }
-        // Persist code→ticket association (for the is_auto path) or clear it (manual retry).
-        // NOTE: start_receive reads the ticket directly from the map now, so no need to
-        // restore eazysendme_ticket here — start_receive captures it before reset_transfer.
-        if self.selected_tool == SelectedTool::EazySendme
-            && self.view == AppView::Receive
-        {
-            let code_key = self.easy_receive_code().to_owned();
-            // Persist the in-memory ticket to the map so start_receive can find it.
-            if let Some(ticket) = &self.eazysendme_ticket {
-                if !code_key.is_empty() {
-                    let should_update = self
-                        .eazysendme_code_ticket_map
-                        .get(&code_key)
-                        .map(|e| e.ticket != *ticket)
-                        .unwrap_or(true);
-                    if should_update {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        self.eazysendme_code_ticket_map.insert(code_key, EazyCacheEntry {
-                            ticket: ticket.clone(),
-                            timestamp: now,
-                        });
-                        self.persist_user_settings();
-                    }
-                }
+        let expected_hash = match &self.easy_receive_attempt {
+            EasyReceiveAttempt::NeedsFreshTicket(hash) | EasyReceiveAttempt::RefreshingTicket(hash) =>
+                Some(hash.clone()),
+            _ => None,
+        };
+        self.start_receive_with_expected_hash(is_auto, expected_hash);
+    }
+
+    fn require_fresh_easy_ticket(&mut self, expected_hash: String, message: &str) {
+        self.easy_receive_attempt = EasyReceiveAttempt::NeedsFreshTicket(expected_hash);
+        self.eazy_retry_count = 0;
+        self.eazy_next_retry_time = None;
+        self.transfer_state = TransferState::Failed(message.to_owned());
+        self.transfer_end_time = Some(self.animation_time);
+    }
+
+    fn start_easy_sendme_download(&mut self, ticket: String, attempt: EasyReceiveAttempt) {
+        self.eazysendme_ticket = Some(ticket.clone());
+        self.easy_receive_attempt = attempt;
+        let opts = self.native_receive_options(ticket);
+        let (rx, handle) = sendme_receive(opts, "");
+        self.transfer_rx = Some(rx);
+        self.transfer_handle = Some(handle);
+        self.transfer_phase = TransferPhase::Preparing;
+        self.transfer_start_time = Some(self.animation_time);
+        self.transfer_end_time = None;
+    }
+
+    fn native_receive_options(&mut self, ticket: String) -> SendmeReceiveOptions {
+        use croc_history::ReceiveMode;
+        let mode = if self.selected_tool == SelectedTool::Sendme { ReceiveMode::Sendme } else { ReceiveMode::EasySendMe };
+        let hash = native_ticket_to_hex_hash(&ticket);
+        let draft = self.native_receive_draft.as_ref().filter(|entry| {
+            entry.mode == mode && hash.is_some()
+                && entry.ticket.as_deref().and_then(native_ticket_to_hex_hash) == hash
+        });
+        let destination = draft.map(|entry| entry.destination.clone())
+            .or_else(|| self.receive_output_dir.clone())
+            .or_else(dirs::download_dir)
+            .or_else(|| std::env::current_dir().ok())
+            .map(|path| blob_cleanup::absolute(&path));
+        let root = draft.and_then(|entry| entry.blob_root.clone()).or_else(|| {
+            let name = format!(".sendme-recv-{}", hash.as_deref()?);
+            self.sendme_blob_scan_roots().into_iter().find(|root| root.join(&name).is_dir())
+        }).unwrap_or_else(|| blob_cleanup::absolute(&self.effective_sendme_blob_dir().unwrap_or_else(std::env::temp_dir)));
+        let code = (mode == ReceiveMode::EasySendMe).then(|| self.easy_receive_code().to_owned());
+        if let (Some(history), Some(destination), Some(_)) = (Self::croc_history_path(), destination.clone(), hash) {
+            match croc_history::remember_native(&history, mode, ticket.clone(), code, destination, root.clone()) {
+                Ok(entry) => self.native_receive_entry = Some(entry),
+                Err(error) => self.transfer_log.push(format!("Could not save receive history: {error}")),
             }
         }
-        self.reset_transfer();
-        self.start_receive(is_auto);
+        SendmeReceiveOptions { ticket, output_dir: destination, blob_dir: Some(root), overwrite: true }
+    }
+
+    fn update_native_receive_entry(&mut self, output: Option<(PathBuf, bool)>) {
+        let (Some(history), Some(entry)) = (Self::croc_history_path(), &mut self.native_receive_entry) else { return; };
+        if entry.complete { return; }
+        let done = self.transfer_done_bytes.unwrap_or(entry.done);
+        let total = self.transfer_total_bytes.unwrap_or(entry.total);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        if output.is_none() && (now <= entry.updated || (entry.done == done && entry.total == total)) { return; }
+        entry.done = if output.is_some() { total } else { done };
+        entry.total = total;
+        entry.elapsed_ms = self.transfer_payload_start_time.map(|start| ((self.animation_time - start).max(0.0) * 1000.0) as u64);
+        entry.route = self.sendme_route.map(|route| match route {
+            SendmeRoute::Direct => CrocRoute::Direct,
+            SendmeRoute::Relay => CrocRoute::Relay,
+        });
+        let result = match output {
+            Some((path, wrapped)) => {
+                self.native_receive_draft = None;
+                croc_history::finish_native(&history, entry, blob_cleanup::absolute(&path), wrapped, self.always_unwrap_sendme)
+            }
+            None => entry.save(&history),
+        };
+        if let Err(error) = result {
+            self.show_toast(format!("Receive history: {error}"), ERROR);
+        }
     }
 
     fn update_transfer_metrics_from_log(&mut self, line: &str) {
@@ -3184,6 +3246,9 @@ impl DataBeamApp {
                                     }
                                 }
                             }
+                            TransferMsg::ReceiveOutput { path, wrapped } => {
+                                self.update_native_receive_entry(Some((path, wrapped)));
+                            }
                             TransferMsg::Completed => {
                                 self.eazy_local_check_started_at = None;
                                 self.transfer_end_time = Some(self.animation_time);
@@ -3202,7 +3267,9 @@ impl DataBeamApp {
                                         && self.transfer_rx.is_none()
                                     {
                                         // Receiver side: Croc finished receiving the ticket
-                                        if self.croc_received_text.is_none() {
+                                        if self.croc_received_text.is_none()
+                                            && !matches!(self.easy_receive_attempt, EasyReceiveAttempt::RefreshingTicket(_))
+                                        {
                                             // Fallback: If Croc finished but we already had this ticket in cache (unlikely but possible during retries), reuse it.
                                             let code_key = self.easy_receive_code().to_owned();
                                             if let Some(entry) = self.eazysendme_code_ticket_map.get(&code_key) {
@@ -3211,14 +3278,21 @@ impl DataBeamApp {
                                         }
 
                                         if let Some(ticket) = self.croc_received_text.clone() {
+                                            let normalized_ticket =
+                                                normalize_sendme_ticket(&ticket).unwrap_or(ticket);
+                                            if let EasyReceiveAttempt::RefreshingTicket(expected) = &self.easy_receive_attempt {
+                                                if native_ticket_to_hex_hash(&normalized_ticket).as_ref() != Some(expected) {
+                                                    self.require_fresh_easy_ticket(
+                                                        expected.clone(),
+                                                        "This code didn’t provide a ticket for the saved files. Ask the sender to share the original files again, then enter their current EasySendMe code.",
+                                                    );
+                                                    return;
+                                                }
+                                            }
                                             self.transfer_log.push(
                                                 "Ticket received via Croc. Starting Sendme..."
                                                     .to_string(),
                                             );
-                                            let normalized_ticket =
-                                                normalize_sendme_ticket(&ticket).unwrap_or(ticket);
-                                            self.eazysendme_ticket =
-                                                Some(normalized_ticket.clone()); // Start native sendme_receive
                                             // Record code→ticket mapping so local-blob retry
                                             // works even after reset_transfer clears the ticket.
                                             let code_key = self.easy_receive_code().to_owned();
@@ -3235,18 +3309,12 @@ impl DataBeamApp {
                                                      });
                                                 self.persist_user_settings();
                                             }
-                                            let opts = SendmeReceiveOptions {
-                                                ticket: normalized_ticket,
-                                                output_dir: self.receive_output_dir.clone(),
-                                                blob_dir: self.effective_sendme_blob_dir(),
-                                                overwrite: true, // Smart overwrite is now the default
+                                            let attempt = if matches!(self.easy_receive_attempt, EasyReceiveAttempt::RefreshingTicket(_)) {
+                                                EasyReceiveAttempt::SavedTicket
+                                            } else {
+                                                EasyReceiveAttempt::New
                                             };
-                                            let sendme_binary = self.get_tool_binary(&Tool::Sendme).unwrap_or_default();
-                                            let (new_rx, new_handle) = sendme_receive(opts, &sendme_binary);
-                                            self.transfer_rx = Some(new_rx);
-                                            self.transfer_handle = Some(new_handle);
-                                            self.transfer_phase = TransferPhase::Preparing;
-                                            self.transfer_start_time = Some(self.animation_time);
+                                            self.start_easy_sendme_download(normalized_ticket, attempt);
                                             return; // Exit poll_transfer, will resume next frame with new_rx
                                         } else {
                                             self.fail_transfer(
@@ -3270,7 +3338,8 @@ impl DataBeamApp {
                                             if let Some(ticket) = self.transfer_code.clone() {
                                                 crate::backend::cleanup_sendme_receive_artifacts_for_ticket(
                                                     &ticket,
-                                                    self.effective_sendme_blob_dir().as_deref(),
+                                                    self.native_receive_entry.as_ref().and_then(|entry| entry.blob_root.clone())
+                                                        .or_else(|| self.effective_sendme_blob_dir()).as_deref(),
                                                 );
                                             }
                                         }
@@ -3291,6 +3360,22 @@ impl DataBeamApp {
                                               }
                                          }
                                     }
+                                }
+                            }
+                            TransferMsg::ReceiverDisconnected => {
+                                if matches!(self.selected_tool, SelectedTool::Sendme | SelectedTool::EazySendme)
+                                    && self.sendme_one_shot
+                                    && self.view == AppView::Send
+                                    && self.transfer_state == TransferState::Running
+                                {
+                                    self.mark_sendme_sender_waiting();
+                                    if self.selected_tool == SelectedTool::EazySendme {
+                                        self.transfer_phase = TransferPhase::EazyWaitingForPeer;
+                                    }
+                                    self.sendme_waiting_after_cycle = false;
+                                    self.sendme_route = None;
+                                    self.eazy_next_retry_time = None;
+                                    self.transfer_log.push("Receiver disconnected. Waiting for it to reconnect.".to_string());
                                 }
                             }
                             TransferMsg::PeerDisconnected => {
@@ -3360,6 +3445,35 @@ impl DataBeamApp {
                                         self.sendme_active_transfers = 0;
                                     }
                                 }
+                            }
+                            TransferMsg::SendmeSenderUnavailable(e) => {
+                                if self.transfer_state != TransferState::Completed {
+                                    let expected_hash = self.eazysendme_ticket.as_deref().and_then(native_ticket_to_hex_hash);
+                                    if let (EasyReceiveAttempt::SavedTicket, Some(hash)) =
+                                        (&self.easy_receive_attempt, expected_hash)
+                                    {
+                                        self.transfer_log.push(e);
+                                        self.require_fresh_easy_ticket(
+                                            hash,
+                                            "The saved ticket couldn’t reach the sender. Ask them to share the same files again, then enter their current EasySendMe code.",
+                                        );
+                                    } else {
+                                        self.fail_transfer(e);
+                                    }
+                                }
+                            }
+                            TransferMsg::Error(ref e)
+                                if e == "blobs-incomplete"
+                                    && self.selected_tool == SelectedTool::EazySendme
+                                    && self.view == AppView::Receive
+                                    && self.eazysendme_ticket.is_some()
+                                    && self.transfer_state == TransferState::Running =>
+                            {
+                                self.eazy_local_check_started_at = None;
+                                let ticket = self.eazysendme_ticket.take().expect("saved ticket");
+                                self.transfer_log.push("Trying the saved Sendme ticket to continue this download.".to_string());
+                                self.start_easy_sendme_download(ticket, EasyReceiveAttempt::SavedTicket);
+                                return;
                             }
                             TransferMsg::Error(e) => {
                                 self.eazy_local_check_started_at = None;
@@ -3764,7 +3878,7 @@ impl DataBeamApp {
                     return;
                 }
                 // Step 1: Start sendme_send to get a ticket
-                // EazySendme MUST be one-shot because tickets are single-use.
+                // Stop after confirmed delivery, keeping the ticket usable through interruptions.
                 self.sendme_one_shot = true;
                 self.transfer_phase = TransferPhase::Preparing;
 
@@ -3787,6 +3901,10 @@ impl DataBeamApp {
     }
 
     fn start_receive(&mut self, is_auto: bool) {
+        self.start_receive_with_expected_hash(is_auto, None);
+    }
+
+    fn start_receive_with_expected_hash(&mut self, is_auto: bool, expected_hash: Option<String>) {
         if self.app_updater.installing {
             self.show_toast("DataBeam is updating. Transfers will be available after restart.".into(), WARNING);
             return;
@@ -3797,13 +3915,20 @@ impl DataBeamApp {
             self.switch_tool(SelectedTool::EazySendme);
             self.receive_code = supplied;
         }
+        let cached_ticket = if self.selected_tool == SelectedTool::EazySendme && expected_hash.is_none() {
+            self.eazysendme_code_ticket_map
+                .get(self.easy_receive_code())
+                .map(|entry| entry.ticket.clone())
+        } else {
+            None
+        };
         // Same overlap guard as start_send (see above): never run a
         // croc-backed transfer while the croc binary may be replaced.
-        if matches!(
+        let needs_croc = cached_ticket.is_none() && matches!(
             self.selected_tool,
             SelectedTool::Croc | SelectedTool::EazySendme
-        ) && self.croc_update_phase != CrocUpdatePhase::Idle
-        {
+        );
+        if needs_croc && self.croc_update_phase != CrocUpdatePhase::Idle {
             if is_auto && self.selected_tool == SelectedTool::EazySendme {
                 self.eazy_next_retry_time = Some(self.animation_time + 5.0);
             } else if !is_auto {
@@ -3827,11 +3952,23 @@ impl DataBeamApp {
             self.show_toast("Enter a code or ticket".to_string(), WARNING);
             return;
         }
+        let binary = if needs_croc {
+            let Some(binary) = self.get_tool_binary(&Tool::Croc) else {
+                self.show_toast("Croc not found".to_string(), ERROR);
+                return;
+            };
+            binary
+        } else {
+            String::new()
+        };
 
         if matches!(self.selected_tool, SelectedTool::Sendme | SelectedTool::EazySendme) {
             self.remember_sendme_blob_dir();
         }
         self.reset_transfer();
+        if let Some(hash) = expected_hash {
+            self.easy_receive_attempt = EasyReceiveAttempt::RefreshingTicket(hash);
+        }
         let raw_code = easy_code.unwrap_or_else(|| self.receive_code.trim().to_owned());
         self.transfer_code = Some(raw_code.clone());
 
@@ -3850,19 +3987,6 @@ impl DataBeamApp {
             }
         }
 
-        let binary = match self.selected_tool {
-            SelectedTool::Croc | SelectedTool::EazySendme => {
-                match self.get_tool_binary(&Tool::Croc) {
-                    Some(b) => b,
-                    None => {
-                        self.show_toast("Croc not found".to_string(), ERROR);
-                        return;
-                    }
-                }
-            }
-            SelectedTool::Sendme => self.get_tool_binary(&Tool::Sendme).unwrap_or_default(),
-        };
-
         match self.selected_tool {
             SelectedTool::Croc => {
                 let code = self.receive_code.trim().to_string();
@@ -3878,12 +4002,7 @@ impl DataBeamApp {
                 }
             }
             SelectedTool::Sendme => {
-                let opts = SendmeReceiveOptions {
-                    ticket: self.receive_code.trim().to_string(),
-                    output_dir: self.receive_output_dir.clone(),
-                    blob_dir: self.effective_sendme_blob_dir(),
-                    overwrite: true, // Smart overwrite for standalone Sendme receive.
-                };
+                let opts = self.native_receive_options(self.receive_code.trim().to_string());
                 let (rx, handle) = sendme_receive(opts, &binary);
                 self.transfer_rx = Some(rx);
                 self.transfer_handle = Some(handle);
@@ -3891,9 +4010,9 @@ impl DataBeamApp {
             SelectedTool::EazySendme => {
                 let code_key = raw_code;
 
-                if let Some(entry) = self.eazysendme_code_ticket_map.get(&code_key) {
+                if let Some(ticket) = cached_ticket {
                     let disk_size = crate::backend::get_sendme_blob_directory_size(
-                        &entry.ticket,
+                        &ticket,
                         self.effective_sendme_blob_dir().as_deref(),
                     );
 
@@ -3907,14 +4026,9 @@ impl DataBeamApp {
                     });
 
                     // Set the ticket now to prevent "ghost" Croc restarts later
-                    self.eazysendme_ticket = Some(entry.ticket.clone());
+                    self.eazysendme_ticket = Some(ticket.clone());
 
-                    let opts = SendmeReceiveOptions {
-                        ticket: entry.ticket.clone(),
-                        output_dir: self.receive_output_dir.clone(),
-                        blob_dir: self.effective_sendme_blob_dir(),
-                        overwrite: true, // Use smart overwrite for local exports too
-                    };
+                    let opts = self.native_receive_options(ticket);
                     let (rx, handle) = sendme_check_local(opts);
                     self.transfer_rx = Some(rx);
                     self.transfer_handle = Some(handle);
@@ -3929,7 +4043,11 @@ impl DataBeamApp {
                 let (rx, handle) = match crate::backend::croc_receive_ticket(code_key, &binary, self.custom_croc_relay()) {
                     Ok(transfer) => transfer,
                     Err(error) => {
-                        self.show_toast(error, ERROR);
+                        if let EasyReceiveAttempt::RefreshingTicket(hash) = &self.easy_receive_attempt {
+                            self.require_fresh_easy_ticket(hash.clone(), &error);
+                        } else {
+                            self.show_toast(error, ERROR);
+                        }
                         return;
                     }
                 };
@@ -4094,10 +4212,13 @@ impl DataBeamApp {
                     });
                 });
                 egui::CollapsingHeader::new("Files and storage").show(ui, |ui| {
-                    if ui.button("Croc receive history").clicked() {
+                    if ui.button("Receive history").clicked() {
                         open_history = true;
                     }
                     ui.add_enabled_ui(self.transfer_state != TransferState::Running, |ui| {
+                        if ui.checkbox(&mut self.always_unwrap_sendme, "Always unwrap Sendme and EasySendMe receives").changed() {
+                            self.persist_user_settings();
+                        }
                         if ui.checkbox(&mut self.always_unwrap_croc, "Always unwrap Croc receives")
                             .on_hover_text("Save verified files and folders directly in the receive location. Keep both items when their names match.")
                             .changed()
@@ -4112,7 +4233,11 @@ impl DataBeamApp {
                                     7 => "After 1 week", 30 => "After 1 month", _ => "Off",
                                 }).show_ui(ui, |ui| {
                                     for (days, label) in [(0, "Off"), (7, "After 1 week"), (30, "After 1 month")] {
-                                        ui.selectable_value(&mut self.transfer_cleanup_days, days, label);
+                                        let mut text = RichText::new(label);
+                                        if self.transfer_cleanup_days == days {
+                                            text = text.color(Color32::BLACK);
+                                        }
+                                        ui.selectable_value(&mut self.transfer_cleanup_days, days, text);
                                     }
                                 });
                         });
@@ -4219,12 +4344,75 @@ impl DataBeamApp {
         self.history_open |= open_history;
     }
 
+    fn cleanup_receive_codes(&self) -> Vec<String> {
+        let mut codes: Vec<_> = self
+            .eazysendme_code_ticket_map
+            .iter()
+            .filter_map(|(code, entry)| {
+                let hash = native_ticket_to_hex_hash(&entry.ticket)?;
+                let name = format!(".sendme-recv-{hash}");
+                self.cleanup_targets.iter().any(|path| path.file_name().is_some_and(|file| file == name.as_str()))
+                    .then(|| code.clone())
+            })
+            .collect();
+        codes.sort();
+        codes
+    }
+
+    fn populate_cleanup_receive(&mut self, code: &str) {
+        self.native_receive_draft = None;
+        if self.selected_tool == SelectedTool::EazySendme {
+            self.reset_transfer();
+        } else {
+            self.switch_tool(SelectedTool::EazySendme);
+        }
+        self.view = AppView::Receive;
+        self.receive_code = format!("{code}esm");
+    }
+
+    fn populate_native_receive(&mut self, entry: croc_history::ReceiveEntry) {
+        use croc_history::ReceiveMode;
+        let Some(ticket) = entry.ticket.clone() else { return; };
+        match entry.mode {
+            ReceiveMode::Croc => return,
+            ReceiveMode::Sendme => {
+                self.switch_tool(SelectedTool::Sendme);
+                self.reset_transfer();
+                self.receive_code = ticket;
+            }
+            ReceiveMode::EasySendMe => {
+                let Some(code) = entry.code.as_deref() else { return; };
+                self.populate_cleanup_receive(code);
+                self.eazysendme_code_ticket_map.insert(code.to_owned(), EazyCacheEntry { ticket, timestamp: entry.updated });
+                self.persist_user_settings();
+            }
+        }
+        self.view = AppView::Receive;
+        self.native_receive_draft = Some(entry);
+    }
+
     fn render_cleanup_popup(&mut self, ctx: &egui::Context) {
         let mut open = self.cleanup_prompt_open;
         if !open {
             return;
         }
         let mut close_modal = false;
+        let entries: Vec<_> = Self::croc_history_path().into_iter().flat_map(|history| croc_history::entries(&history))
+            .filter(|entry| entry.native_cache().is_some_and(|path| self.cleanup_targets.contains(&path)))
+            .collect();
+        let mut codes = self.cleanup_receive_codes();
+        codes.retain(|code| !entries.iter().any(|entry| entry.code.as_ref() == Some(code)));
+        let handled: std::collections::HashSet<_> = entries.iter().filter_map(|entry| entry.native_cache())
+            .collect();
+        let legacy_names: std::collections::HashSet<_> = codes.iter().filter_map(|code| {
+            native_ticket_to_hex_hash(&self.eazysendme_code_ticket_map.get(code)?.ticket)
+                .map(|hash| std::ffi::OsString::from(format!(".sendme-recv-{hash}")))
+        }).collect();
+        let unidentified = self.cleanup_targets.iter().any(|path|
+            !handled.contains(path) && !path.file_name().is_some_and(|name| legacy_names.contains(name)));
+        let mut resume_entry = None;
+        let mut resume_code = None;
+        let mut enter_ticket = false;
         
         egui::Window::new("Incomplete Downloads Detected")
             .open(&mut open)
@@ -4244,20 +4432,51 @@ impl DataBeamApp {
                 ui.label(RichText::new("Would you like to delete these incomplete temporary files to reclaim disk space?").color(TEXT_MUTED));
                 
                 ui.add_space(12.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_enabled_ui(self.transfer_state != TransferState::Running, |ui| {
+                        if entries.len() + codes.len() + usize::from(unidentified) <= 1 {
+                            if ui.button("Continue transfer").clicked() {
+                                resume_entry = entries.first().cloned();
+                                resume_code = codes.first();
+                                enter_ticket = resume_entry.is_none() && resume_code.is_none();
+                            }
+                        } else {
+                            ui.menu_button("Continue transfer", |ui| {
+                                for entry in &entries {
+                                    let label = entry.code.as_ref().map(|code| format!("EasySendMe · {code}"))
+                                        .unwrap_or_else(|| format!("Sendme · {}", backend::format_size_unit(entry.done)));
+                                    if ui.button(label).clicked() {
+                                        resume_entry = Some(entry.clone());
+                                        ui.close_menu();
+                                    }
+                                }
+                                for code in &codes {
+                                    if ui.button(format!("{code}esm")).clicked() {
+                                        resume_code = Some(code);
+                                        ui.close_menu();
+                                    }
+                                }
+                                if unidentified && ui.button("Use a Sendme ticket").clicked() {
+                                    enter_ticket = true;
+                                    ui.close_menu();
+                                }
+                            });
+                        }
+                    });
                     if ui.add_enabled_ui(self.transfer_state != TransferState::Running, |ui|
                         accent_button_sized(ui, "Delete Files", Color32::from_rgb(200, 60, 60), Vec2::new(120.0, 32.0))
                     ).inner.clicked() {
                         let targets = self.cleanup_targets.clone();
                         let roots = self.sendme_blob_scan_roots();
-                        let current = blob_cleanup::absolute(&self.effective_sendme_blob_dir().unwrap_or_else(std::env::temp_dir));
+                        let ctx = ctx.clone();
                         let (tx, rx) = mpsc::channel();
                         self.cleanup_scan_rx = Some(rx);
                         std::thread::spawn(move || {
                             for path in targets {
                                 let _ = std::fs::remove_dir_all(&path);
                             }
-                            let _ = tx.send(blob_cleanup::scan(roots, &current, &Default::default(), false));
+                            let _ = tx.send(blob_cleanup::scan(roots, false));
+                            ctx.request_repaint();
                         });
                         self.show_toast("Deleted incomplete downloads".to_string(), SUCCESS);
                         close_modal = true;
@@ -4267,7 +4486,24 @@ impl DataBeamApp {
                     }
                 });
             });
-            
+
+        if let Some(code) = resume_code {
+            self.populate_cleanup_receive(code);
+            close_modal = true;
+        }
+        if let Some(entry) = resume_entry {
+            self.populate_native_receive(entry);
+            close_modal = true;
+        }
+        if enter_ticket {
+            self.switch_tool(SelectedTool::Sendme);
+            self.reset_transfer();
+            self.native_receive_draft = None;
+            self.receive_code.clear();
+            self.view = AppView::Receive;
+            self.show_toast("Paste a Sendme ticket for the same files to reuse the saved bytes.".into(), WARNING);
+            close_modal = true;
+        }
         if !open || close_modal {
             self.cleanup_prompt_open = false;
             self.cleanup_targets.clear();
@@ -4422,7 +4658,7 @@ impl eframe::App for DataBeamApp {
             self.initialized_once = true;
 
             self.clear_aged_transfers();
-            self.start_blob_cleanup_scan(true);
+            self.start_blob_cleanup_scan(ctx, true);
         }
 
         if let Some(rx) = &self.cleanup_scan_rx {
@@ -4449,12 +4685,15 @@ impl eframe::App for DataBeamApp {
         self.poll_size_updates();
         let was_running = self.transfer_state == TransferState::Running;
         self.poll_transfer();
+        if self.transfer_state == TransferState::Running {
+            self.update_native_receive_entry(None);
+        }
         self.clear_aged_transfers();
         if was_running && self.transfer_state == TransferState::Completed {
             if self.recorded_send_active {
                 self.clear_send_draft();
             }
-            self.start_blob_cleanup_scan(false);
+            self.start_blob_cleanup_scan(ctx, false);
         }
         if self.troubleshoot_monitor.poll(ctx, &mut self.troubleshoot_news) {
             self.persist_user_settings();
@@ -4830,10 +5069,11 @@ impl DataBeamApp {
         }
         if self.history_open {
             let mut shown = true;
-            egui::Window::new("Croc receive history").open(&mut shown)
+            let mut selected_native = None;
+            egui::Window::new("Receive history").open(&mut shown)
                 .default_width(450.0).show(ctx, |ui| {
                     let entries = croc_history::entries(&directory);
-                    if entries.is_empty() { ui.label("Croc file receives will appear here."); }
+                    if entries.is_empty() { ui.label("Received files and unfinished downloads will appear here."); }
                     egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
                         for mut entry in entries {
                             ui.push_id(&entry.id.clone(), |ui| {
@@ -4841,7 +5081,7 @@ impl DataBeamApp {
                                 let status = if entry.complete { "Received" }
                                     else if entry.ready_to_save { "Ready to save" }
                                     else { "Interrupted" };
-                                ui.label(format!("{status} · {} of {}", backend::format_size_unit(entry.done), backend::format_size_unit(entry.total)));
+                                ui.label(format!("{} · {status} · {} of {}", entry.mode.label(), backend::format_size_unit(entry.done), backend::format_size_unit(entry.total)));
                                 if entry.complete {
                                     let mut info = Vec::new();
                                     if let Some(date) = entry.completed_at.and_then(|value| i64::try_from(value).ok())
@@ -4867,14 +5107,18 @@ impl DataBeamApp {
                                                 self.show_toast(error.to_string(), ERROR);
                                             }
                                         }
-                                        if entry.wrapper.is_some() && ui.button("Move files out").clicked() {
+                                        if entry.wrapper.is_some() && ui.button("Unwrap").clicked() {
                                             if let Err(error) = croc_history::unwrap(&directory, &mut entry) {
                                                 self.show_toast(error.to_string(), ERROR);
                                             }
                                         }
                                     } else if ui.button("Resume").clicked() {
-                                        self.history_code = entry.code.clone().unwrap_or_default();
-                                        self.history_resume = Some(entry.clone());
+                                        if entry.mode == croc_history::ReceiveMode::Croc {
+                                            self.history_code = entry.code.clone().unwrap_or_default();
+                                            self.history_resume = Some(entry.clone());
+                                        } else {
+                                            selected_native = Some(entry.clone());
+                                        }
                                     }
                                     if ui.button(if entry.complete { "Remove from history" } else { "Discard partial files" }).clicked() {
                                         self.history_discard = Some(entry.clone());
@@ -4885,6 +5129,10 @@ impl DataBeamApp {
                         }
                     });
                 });
+            if let Some(entry) = selected_native {
+                self.populate_native_receive(entry);
+                shown = false;
+            }
             self.history_open = shown;
         }
         if let Some(entry) = self.history_resume.clone() {
@@ -5104,7 +5352,7 @@ impl DataBeamApp {
                 self.view = AppView::Send;
             }
         });
-        if ui.button("Croc receive history").clicked() {
+        if ui.button("Receive history").clicked() {
             self.history_open = true;
         }
     }
@@ -5822,7 +6070,7 @@ impl DataBeamApp {
 
     fn show_receive(&mut self, ui: &mut egui::Ui) {
         section_header(ui, "📥", "Receive");
-        if self.selected_tool == SelectedTool::Croc && ui.button("Croc receive history").clicked() {
+        if ui.button("Receive history").clicked() {
             self.history_open = true;
         }
         self.show_sendme_modes(ui, self.transfer_state == TransferState::Running);
@@ -5906,13 +6154,13 @@ impl DataBeamApp {
                         if disk_size > 0 {
                             (
                                 true,
-                                "Local blob cache found - retry will verify and export if complete",
+                                "Saved download found. Receive will continue with the saved ticket.",
                                 Color32::from_rgb(100, 200, 120),
                             )
                         } else {
                             (
                                 false,
-                                "Cached ticket found - no local blob data yet",
+                                "Receive will try the saved ticket.",
                                 TEXT_MUTED,
                             )
                         }
@@ -5936,7 +6184,7 @@ impl DataBeamApp {
                     ui.label(RichText::new(msg).color(color).size(10.0));
                 });
             } else if self.selected_tool == SelectedTool::Croc {
-                ui.label(RichText::new("Resume interrupted files from Croc receive history.")
+                ui.label(RichText::new("Resume interrupted files from Receive history.")
                     .color(TEXT_MUTED).size(10.0));
             } else {
                 ui.label(
@@ -5958,9 +6206,16 @@ impl DataBeamApp {
                         .strong()
                         .size(13.0),
                 );
-                let dir_text = self
-                    .receive_output_dir
-                    .as_ref()
+                let draft = self.native_receive_draft.as_ref().filter(|entry| match self.selected_tool {
+                    SelectedTool::Sendme => entry.ticket.as_deref() == Some(self.receive_code.trim()),
+                    SelectedTool::EazySendme => entry.code.as_deref() == Some(self.easy_receive_code()),
+                    SelectedTool::Croc => false,
+                });
+                let has_draft = draft.is_some();
+                let folder = draft.map(|entry| entry.destination.clone())
+                    .or_else(|| self.receive_output_dir.clone())
+                    .or_else(|| (self.selected_tool != SelectedTool::Croc).then(dirs::download_dir).flatten());
+                let dir_text = folder.as_ref()
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|| "Current directory".into());
                 ui.label(
@@ -5970,7 +6225,7 @@ impl DataBeamApp {
                 );
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if let Some(dir) = self.effective_receive_folder() {
+                    if let Some(dir) = folder.or_else(|| self.effective_receive_folder()) {
                         if accent_button_sized(ui, "↗", self.engine_color(), Vec2::new(24.0, 22.0))
                             .clicked()
                         {
@@ -5982,7 +6237,7 @@ impl DataBeamApp {
                     {
                         self.launch_picker(PickerRequest::ReceiveFolder);
                     }
-                    if self.receive_output_dir.is_some()
+                    if (has_draft || self.receive_output_dir.is_some())
                         && accent_button_sized(
                             ui,
                             "✕",
@@ -5991,6 +6246,7 @@ impl DataBeamApp {
                         )
                         .clicked()
                     {
+                        self.native_receive_draft = None;
                         self.receive_output_dir = None;
                         self.persist_user_settings();
                     }
@@ -6077,7 +6333,9 @@ impl DataBeamApp {
                         self.reset_transfer();
                         self.receive_code.clear();
                     }
-                    if let Some(dir) = self.effective_receive_folder() {
+                    if let Some(dir) = self.native_receive_entry.as_ref()
+                        .filter(|entry| entry.complete).map(|entry| entry.location().to_path_buf())
+                        .or_else(|| self.effective_receive_folder()) {
                         if accent_button_sized(
                             ui,
                             "📂 Open Folder",
@@ -6101,10 +6359,12 @@ impl DataBeamApp {
                         self.reset_transfer();
                         self.receive_code.clear();
                     }
-                    if self.selected_tool != SelectedTool::Croc && accent_button_sized(
-                        ui, "🔄 Retry", self.engine_color(), Vec2::new(100.0, 32.0),
-                    ).clicked() {
-                        self.retry_receive(false);
+                    if self.selected_tool != SelectedTool::Croc {
+                        let fresh_ticket = matches!(self.easy_receive_attempt, EasyReceiveAttempt::NeedsFreshTicket(_));
+                        let (label, width) = if fresh_ticket { ("Get fresh ticket", 130.0) } else { ("🔄 Retry", 100.0) };
+                        if accent_button_sized(ui, label, self.engine_color(), Vec2::new(width, 32.0)).clicked() {
+                            self.retry_receive(false);
+                        }
                     }
                 });
             }
@@ -7750,6 +8010,21 @@ mod parse_tests {
     }
 
     #[test]
+    fn transfer_cleanup_defaults_to_one_week_and_preserves_saved_intervals() {
+        let missing: super::UserSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(missing.transfer_cleanup_days, 7);
+        assert_eq!(super::DataBeamApp::default().transfer_cleanup_days, 7);
+
+        for days in [0, 7, 30] {
+            let settings: super::UserSettings = serde_json::from_value(serde_json::json!({
+                "transfer_cleanup_days": days,
+            }))
+            .unwrap();
+            assert_eq!(settings.transfer_cleanup_days, days);
+        }
+    }
+
+    #[test]
     fn old_settings_support_troubleshoot_news_and_preserve_it_when_saved() {
         let mut settings: super::UserSettings = serde_json::from_str("{}").unwrap();
         assert!(!settings.troubleshoot_news.has_unread());
@@ -8918,6 +9193,82 @@ mod parse_tests {
     }
 
     #[test]
+    fn easy_sendme_sender_keeps_sharing_after_receiver_disconnects() {
+        let mut app = DataBeamApp::default();
+        app.selected_tool = SelectedTool::EazySendme;
+        app.view = AppView::Send;
+        app.transfer_state = TransferState::Running;
+        app.transfer_phase = TransferPhase::Transferring;
+        app.eazysendme_auto_retry = true;
+        app.sendme_one_shot = true;
+        app.transfer_code = Some("resume-code".into());
+        app.eazysendme_ticket = Some("saved-ticket".into());
+        app.transfer_progress = 1.0;
+        app.sendme_had_transfer = true;
+        let (tx, rx) = mpsc::channel();
+        app.transfer_rx = Some(rx);
+        tx.send(TransferMsg::ReceiverDisconnected).unwrap();
+
+        app.poll_transfer();
+
+        assert_eq!(app.transfer_state, TransferState::Running);
+        assert_eq!(app.transfer_phase, TransferPhase::EazyWaitingForPeer);
+        assert_eq!(app.transfer_progress, 0.0);
+        assert_eq!(app.transfer_code.as_deref(), Some("resume-code"));
+        assert_eq!(app.eazysendme_ticket.as_deref(), Some("saved-ticket"));
+        assert!(app.eazy_next_retry_time.is_none());
+
+        tx.send(TransferMsg::SenderTransferActivity).unwrap();
+        app.poll_transfer();
+        assert_eq!(app.transfer_phase, TransferPhase::Transferring);
+
+        tx.send(TransferMsg::Error("Sendme transfer failed on sender side".into())).unwrap();
+        app.poll_transfer();
+        assert!(matches!(app.transfer_state, TransferState::Failed(_)));
+        assert!(app.eazy_next_retry_time.is_some());
+    }
+
+    #[test]
+    fn easy_sendme_resume_requires_matching_content_from_a_fresh_code() {
+        use super::{native_ticket_to_hex_hash, EasyReceiveAttempt};
+        let saved_ticket = "blobacxfr74igmsbvsbnn73wcecg5vt3kbzncqwfrdiampuufwnhkublmaaaaafyju2y4tel43bymjvsdax7k5mbrotl2p2lsbdetff6ctftksqhe";
+        let saved_hash = native_ticket_to_hex_hash(saved_ticket).unwrap();
+        let mut app = DataBeamApp::default();
+        app.selected_tool = SelectedTool::EazySendme;
+        app.view = AppView::Receive;
+        app.transfer_state = TransferState::Running;
+        app.eazysendme_auto_retry = true;
+        app.easy_receive_attempt = EasyReceiveAttempt::SavedTicket;
+        app.eazysendme_ticket = Some(saved_ticket.into());
+        let (tx, rx) = mpsc::channel();
+        app.transfer_rx = Some(rx);
+        tx.send(TransferMsg::SendmeSenderUnavailable("Connection timed out".into())).unwrap();
+
+        app.poll_transfer();
+
+        assert!(matches!(&app.easy_receive_attempt, EasyReceiveAttempt::NeedsFreshTicket(hash) if hash == &saved_hash));
+        assert!(app.eazy_next_retry_time.is_none());
+        assert_eq!(app.eazysendme_ticket.as_deref(), Some(saved_ticket));
+
+        app.transfer_state = TransferState::Running;
+        app.eazysendme_ticket = None;
+        let other_hash = "0".repeat(64);
+        assert_ne!(saved_hash, other_hash);
+        app.easy_receive_attempt = EasyReceiveAttempt::RefreshingTicket(other_hash.clone());
+        let (tx, rx) = mpsc::channel();
+        app.transfer_rx = Some(rx);
+        tx.send(TransferMsg::ReceivedText(saved_ticket.into())).unwrap();
+        tx.send(TransferMsg::Completed).unwrap();
+
+        app.poll_transfer();
+
+        assert!(matches!(&app.easy_receive_attempt, EasyReceiveAttempt::NeedsFreshTicket(hash) if hash == &other_hash));
+        assert!(app.eazysendme_ticket.is_none());
+        assert!(app.transfer_handle.is_none());
+        assert!(app.eazysendme_code_ticket_map.is_empty());
+    }
+
+    #[test]
     fn sendme_one_shot_incomplete_on_early_peer_disconnect() {
         let mut app = DataBeamApp::default();
         app.selected_tool = SelectedTool::Sendme;
@@ -9112,6 +9463,47 @@ mod parse_tests {
     }
 
     #[test]
+    fn startup_prompts_for_a_remembered_easy_sendme_partial() {
+        let _lock = super::tray::TRAY_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let _settings = SettingsFileGuard::set(&temp.path().join("settings.json"));
+        let root = temp.path().join("blobs");
+        let code = "test-easy-receive";
+        let ticket = "blobacxfr74igmsbvsbnn73wcecg5vt3kbzncqwfrdiampuufwnhkublmaaaaafyju2y4tel43bymjvsdax7k5mbrotl2p2lsbdetff6ctftksqhe";
+        let hash = super::native_ticket_to_hex_hash(ticket).unwrap();
+        let cache = root.join(format!(".sendme-recv-{hash}"));
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("partial"), vec![0; 1024 * 1024 + 1]).unwrap();
+
+        let mut app = DataBeamApp::default();
+        app.sendme_blob_dir_mode = super::SendmeBlobDirMode::Custom;
+        app.sendme_blob_custom_dir = Some(root);
+        app.eazysendme_code_ticket_map.insert(code.into(), super::EazyCacheEntry {
+            ticket: ticket.into(),
+            timestamp: 0,
+        });
+        app.persist_user_settings();
+
+        let mut restarted = DataBeamApp::default();
+        restarted.load_user_settings();
+        restarted.start_blob_cleanup_scan(&egui::Context::default(), true);
+        let scan = restarted.cleanup_scan_rx.take().unwrap()
+            .recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        restarted.apply_blob_cleanup_scan(scan);
+
+        assert!(restarted.cleanup_prompt_open);
+        assert!(restarted.cleanup_targets.contains(&cache));
+        assert_eq!(restarted.eazysendme_code_ticket_map[code].ticket, ticket);
+        assert_eq!(restarted.cleanup_receive_codes(), [code.to_owned()]);
+        restarted.populate_cleanup_receive(code);
+        assert_eq!(restarted.selected_tool, SelectedTool::EazySendme);
+        assert_eq!(restarted.view, AppView::Receive);
+        assert_eq!(restarted.easy_receive_code(), code);
+        assert_eq!(restarted.transfer_state, TransferState::Idle);
+        assert!(cache.is_dir());
+    }
+
+    #[test]
     fn blob_cleanup_history_survives_destination_change_and_prunes_after_removal() {
         let _lock = super::tray::TRAY_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let temp = tempfile::tempdir().unwrap();
@@ -9135,17 +9527,13 @@ mod parse_tests {
         restarted.load_user_settings();
         assert!(restarted.sendme_blob_scan_roots().contains(&old));
         assert!(restarted.sendme_blob_scan_roots().contains(&new));
-        restarted.apply_blob_cleanup_scan(crate::blob_cleanup::scan(
-            vec![old.clone(), new.clone()], &new, &Default::default(), true,
-        ));
+        restarted.apply_blob_cleanup_scan(crate::blob_cleanup::scan(vec![old.clone(), new.clone()], true));
         assert_eq!(restarted.cleanup_targets, [cache.clone()]);
         assert!(restarted.cleanup_prompt_open);
 
         assert!(cache.starts_with(temp.path()));
         std::fs::remove_dir_all(&cache).unwrap();
-        restarted.apply_blob_cleanup_scan(crate::blob_cleanup::scan(
-            vec![old.clone()], &new, &Default::default(), false,
-        ));
+        restarted.apply_blob_cleanup_scan(crate::blob_cleanup::scan(vec![old.clone()], false));
         let mut restored = DataBeamApp::default();
         restored.load_user_settings();
         assert!(!restored.sendme_blob_cleanup_dirs.contains(&old));
@@ -9153,9 +9541,7 @@ mod parse_tests {
         restored.remember_sendme_blob_dir();
         restored.view = AppView::Home;
         restored.transfer_state = TransferState::Running;
-        restored.apply_blob_cleanup_scan(crate::blob_cleanup::scan(
-            vec![new.clone()], &new, &Default::default(), false,
-        ));
+        restored.apply_blob_cleanup_scan(crate::blob_cleanup::scan(vec![new.clone()], false));
         assert!(restored.sendme_blob_cleanup_dirs.contains(&new), "do not prune a receiver's directory before its store is created");
     }
 

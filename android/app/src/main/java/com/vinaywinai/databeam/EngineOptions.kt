@@ -20,6 +20,6 @@ object EngineOptions {
         if("Sendme" in modes(disabled))add(2)
         if("Croc" in modes(disabled))add(3)
         if("EasySendMe" in modes(disabled))add(4)
-        if("Croc" in modes(disabled))add(CROC_HISTORY_ACTION)
+        add(CROC_HISTORY_ACTION)
     }
 }

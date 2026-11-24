@@ -51,7 +51,7 @@ object EasyResumeRegression {
                 (field(if(primary)"primary" else "resumeButton") as Button).performClick()
                 if(!primary){
                     val dialog=field("resumeDialog") as AlertDialog
-                    check(dialog.findViewById<TextView>(android.R.id.message).text.contains("exact same files"))
+                    check(dialog.findViewById<TextView>(android.R.id.message).text.contains("saved ticket"))
                     dialog.getButton(DialogInterface.BUTTON_NEUTRAL).performClick()
                 }
             }

@@ -71,6 +71,54 @@ impl EventEmitter for Events {
 }
 
 #[tokio::test]
+async fn same_ticket_serves_two_receivers_after_success() -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let dir = tempfile::tempdir()?;
+        let source = dir.path().join("broadcast.bin");
+        let bytes = vec![0xb7; 512 * 1024];
+        std::fs::write(&source, &bytes)?;
+        let events = Arc::new(Events::default());
+        let share = start_share(
+            vec![source],
+            "payload".into(),
+            SendOptions {
+                relay_mode: RelayModeOption::Disabled,
+                magic_ipv4_addr: Some("127.0.0.1:0".parse()?),
+                blob_dir: Some(dir.path().join("sender")),
+                ..Default::default()
+            },
+            Some(events.clone()),
+        ).await?;
+        let endpoint = share.router.endpoint();
+        let addr = EndpointAddr::new(endpoint.id()).with_ip_addr(
+            endpoint.bound_sockets().into_iter().find(|addr| addr.is_ipv4()).unwrap());
+        let ticket = BlobTicket::new(addr, share.temp_tag.hash(), BlobFormat::HashSeq).to_string();
+        for cycle in 1..=2 {
+            let result = download(
+                ticket.clone(),
+                ReceiveOptions {
+                    output_dir: Some(dir.path().join(format!("received-{cycle}"))),
+                    blob_dir: Some(dir.path().join(format!("cache-{cycle}"))),
+                    relay_mode: RelayModeOption::Disabled,
+                    ..Default::default()
+                },
+                None,
+            ).await?;
+            assert_eq!(std::fs::read(result.file_path.join("broadcast.bin"))?, bytes);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while events.0.lock().unwrap().iter()
+                    .filter(|(event, _)| event == "transfer-completed").count() < cycle {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }).await.context("sender did not confirm broadcast download")?;
+        }
+        assert!(!events.0.lock().unwrap().iter().any(|(event, _)| event == "transfer-interrupted"));
+        share.router.shutdown().await?;
+        anyhow::Ok(())
+    }).await?
+}
+
+#[tokio::test]
 async fn cli_collection_names_export_without_file_directory_collisions() -> anyhow::Result<()> {
     use iroh_blobs::{format::collection::Collection, store::fs::FsStore, BlobsProtocol};
     tokio::time::timeout(Duration::from_secs(30), async {

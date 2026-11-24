@@ -1,11 +1,15 @@
 //! Keep a one-shot sender alive until QUIC acknowledges the response data.
 use super::types::AppHandle;
 use n0_future::StreamExt;
-use std::io;
+use std::{
+    collections::HashSet,
+    io,
+    sync::{Arc, Mutex},
+};
 
 use bytes::Bytes;
 use iroh::{
-    endpoint::{Connection, SendStream, VarInt},
+    endpoint::{Connection, ConnectionError, SendStream, StoppedError, VarInt, WriteError},
     protocol::{AcceptError, ProtocolHandler},
 };
 use iroh_blobs::{
@@ -18,11 +22,19 @@ use iroh_blobs::{
     util::SendStream as BlobSendStream,
 };
 
+// Provider abort events carry byte counts without a cause. Record the transport
+// error against the exact stream before the provider publishes its abort.
+pub(super) type PeerInterruptions = Arc<Mutex<HashSet<(u64, u64)>>>;
+
+// Sent once a native receiver has read and verified the complete GET.
+pub(super) const PAYLOAD_RECEIVED: VarInt = VarInt::from_u32(u32::from_be_bytes(*b"DBOK"));
+
 #[derive(Clone)]
 pub(super) struct AcknowledgedBlobs {
     store: Store,
     events: EventSender,
     route_emitter: AppHandle,
+    peer_interruptions: PeerInterruptions,
 }
 
 impl std::fmt::Debug for AcknowledgedBlobs {
@@ -39,6 +51,7 @@ impl AcknowledgedBlobs {
             store,
             events,
             route_emitter: None,
+            peer_interruptions: PeerInterruptions::default(),
         }
     }
 
@@ -49,6 +62,10 @@ impl AcknowledgedBlobs {
 
     pub(super) fn store(&self) -> &Store {
         &self.store
+    }
+
+    pub(super) fn peer_interruptions(&self) -> PeerInterruptions {
+        self.peer_interruptions.clone()
     }
 }
 
@@ -130,9 +147,16 @@ impl ProtocolHandler for AcknowledgedBlobs {
             tokio::select! {
                 stream = connection.accept_bi() => {
                     let Ok((send, recv)) = stream else { break };
-                    let pair = StreamPair::new(
-                        connection_id, recv, AcknowledgedSendStream(send), self.events.clone(),
-                    );
+                    let request = (connection_id, send.id().index());
+                    let writer = AcknowledgedSendStream {
+                        stream: send,
+                        request: Some(ActiveRequest {
+                            interruptions: self.peer_interruptions(),
+                            key: request,
+                            connection: connection.clone(),
+                        }),
+                    };
+                    let pair = StreamPair::new(connection_id, recv, writer, self.events.clone());
                     let store = self.store.clone();
                     streams.spawn(async move {
                         if let Err(error) = provider::handle_stream(pair, store).await {
@@ -158,41 +182,99 @@ impl ProtocolHandler for AcknowledgedBlobs {
     }
 }
 
-struct AcknowledgedSendStream(SendStream);
+struct ActiveRequest {
+    interruptions: PeerInterruptions,
+    key: (u64, u64),
+    connection: Connection,
+}
+
+struct AcknowledgedSendStream {
+    stream: SendStream,
+    request: Option<ActiveRequest>,
+}
+
+fn payload_received(error: &ConnectionError) -> bool {
+    matches!(error, ConnectionError::ApplicationClosed(close) if close.error_code == PAYLOAD_RECEIVED)
+}
+
+impl AcknowledgedSendStream {
+    fn record_peer_interruption(&self) {
+        if let Some(request) = &self.request {
+            request.interruptions.lock().unwrap().insert(request.key);
+        }
+    }
+
+    fn write_result(&self, result: Result<(), WriteError>) -> io::Result<()> {
+        match &result {
+            Err(WriteError::Stopped(_)) => self.record_peer_interruption(),
+            Err(WriteError::ConnectionLost(error)) if super::network::peer_connection_lost(error) => {
+                self.record_peer_interruption();
+            }
+            _ => {}
+        }
+        result.map_err(io::Error::other)
+    }
+}
 
 impl BlobSendStream for AcknowledgedSendStream {
     async fn send_bytes(&mut self, bytes: Bytes) -> io::Result<()> {
-        self.0.write_chunk(bytes).await.map_err(io::Error::other)
+        let result = self.stream.write_chunk(bytes).await;
+        self.write_result(result)
     }
 
     async fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.0.write_all(bytes).await.map_err(io::Error::other)
+        let result = self.stream.write_all(bytes).await;
+        self.write_result(result)
     }
 
     async fn sync(&mut self) -> io::Result<()> {
         // Upstream's QUIC adapter makes sync() a no-op. Its Completed event
         // therefore means queued, not delivered. Finish and await the ACK of
         // all bytes plus FIN before allowing one-shot mode to stop the runtime.
-        self.0.finish().map_err(io::Error::other)?;
-        match self.0.stopped().await.map_err(io::Error::other)? {
-            None => Ok(()),
-            Some(code) => Err(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                format!("receiver stopped the response: {code}"),
-            )),
+        self.stream.finish().map_err(io::Error::other)?;
+        match self.stream.stopped().await {
+            Ok(None) => Ok(()),
+            Err(StoppedError::ConnectionLost(error)) if payload_received(&error) => Ok(()),
+            Err(error) => {
+                if matches!(&error, StoppedError::ConnectionLost(reason) if super::network::peer_connection_lost(reason)) {
+                    self.record_peer_interruption();
+                }
+                Err(io::Error::other(error))
+            }
+            Ok(Some(code)) => {
+                // The GET reader can drop the stream after verifying its final
+                // range, before reading FIN. Give its explicit receipt time
+                // to arrive if the stream closed with the default drop code.
+                if code == VarInt::from_u32(0) {
+                    if let Some(request) = &self.request {
+                        let close = tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            request.connection.closed(),
+                        ).await;
+                        if close.as_ref().is_ok_and(payload_received) {
+                            return Ok(());
+                        }
+                    }
+                }
+                self.record_peer_interruption();
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    format!("receiver stopped the response: {code}"),
+                ))
+            }
         }
     }
 
     fn reset(&mut self, code: VarInt) -> io::Result<()> {
-        self.0.reset(code).map_err(io::Error::other)
+        self.stream.reset(code).map_err(io::Error::other)
     }
 
     async fn stopped(&mut self) -> io::Result<Option<VarInt>> {
-        self.0.stopped().await.map_err(io::Error::other)
+        self.stream.stopped().await.map_err(io::Error::other)
     }
 
     fn id(&self) -> u64 {
-        self.0.id().index()
+        self.stream.id().index()
     }
 }
 
@@ -207,6 +289,75 @@ mod tests {
         time::Duration,
     };
     use tokio::{net::UdpSocket, sync::Notify};
+
+    #[tokio::test]
+    async fn final_stream_stop_only_completes_with_verified_receipt() -> anyhow::Result<()> {
+        use iroh::{endpoint::presets, Endpoint, EndpointAddr, RelayMode};
+
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let listener = Endpoint::builder(presets::Minimal)
+                .alpns(vec![iroh_blobs::ALPN.to_vec()])
+                .relay_mode(RelayMode::Disabled)
+                .bind()
+                .await?;
+            let port = listener.bound_sockets().into_iter().find(|addr| addr.is_ipv4())
+                .expect("IPv4 listener").port();
+            let address = EndpointAddr::new(listener.id())
+                .with_ip_addr(([127, 0, 0, 1], port).into());
+            let client = Endpoint::builder(presets::Minimal)
+                .relay_mode(RelayMode::Disabled)
+                .bind()
+                .await?;
+            for verified in [true, false] {
+                let interruptions = PeerInterruptions::default();
+                let (peer_stopped, wait_for_stop) = tokio::sync::oneshot::channel();
+                let sender = async {
+                    let connection = listener.accept().await.expect("incoming connection").await?;
+                    let (send, mut req) = connection.accept_bi().await?;
+                    req.read_to_end(1).await?;
+                    let mut response = AcknowledgedSendStream {
+                        stream: send,
+                        request: Some(ActiveRequest {
+                            interruptions: interruptions.clone(),
+                            key: (1, 0),
+                            connection,
+                        }),
+                    };
+                    response.send(b"data").await?;
+                    assert_eq!(response.stream.stopped().await?, Some(0u32.into()));
+                    peer_stopped.send(()).expect("receiver is waiting for STOP");
+                    response.sync().await
+                        .map_err(anyhow::Error::from)
+                        .map(|_| true)
+                        .or_else(|error| {
+                            if interruptions.lock().unwrap().contains(&(1, 0)) {
+                                Ok(false)
+                            } else {
+                                Err(error)
+                            }
+                        })
+                };
+                let receiver = async {
+                    let connection = client.connect(address.clone(), iroh_blobs::ALPN).await?;
+                    let (mut req, mut response) = connection.open_bi().await?;
+                    req.write_all(b"x").await?;
+                    req.finish()?;
+                    let mut bytes = [0; 4];
+                    response.read_exact(&mut bytes).await?;
+                    assert_eq!(&bytes, b"data");
+                    response.stop(0u32.into())?;
+                    wait_for_stop.await?;
+                    let code = if verified { PAYLOAD_RECEIVED } else { 0u32.into() };
+                    connection.close(code, b"");
+                    anyhow::Ok(())
+                };
+                let (completed, ()) = tokio::try_join!(sender, receiver)?;
+                assert_eq!(completed, verified);
+                assert_eq!(interruptions.lock().unwrap().contains(&(1, 0)), !verified);
+            }
+            anyhow::Ok(())
+        }).await?
+    }
 
     #[tokio::test]
     async fn response_completion_waits_for_delayed_network_delivery() -> anyhow::Result<()> {
@@ -277,7 +428,7 @@ mod tests {
             hold.store(true, Ordering::SeqCst);
             let completion = tokio::spawn(async move {
                 if wait_for_ack {
-                    let mut send = AcknowledgedSendStream(send);
+                    let mut send = AcknowledgedSendStream { stream: send, request: None };
                     send.send(b"fully delivered response").await?;
                     send.sync().await
                 } else {

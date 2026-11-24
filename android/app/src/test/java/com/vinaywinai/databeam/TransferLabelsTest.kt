@@ -48,7 +48,7 @@ class TransferLabelsTest {
     }
     @Test fun failedCrocFilesKeepTheirCodeWhileTextRemainsEditable(){
         val s=state("send","stopped").put("mode","Croc")
-        assertTrue(TransferLabels.message(s).contains("resume from Croc receive history"))
+        assertTrue(TransferLabels.message(s).contains("resume from Receive history"))
         assertTrue(TransferLabels.message(s).contains("reselect the exact same files"))
         s.put("text","generated text")
         assertTrue(TransferLabels.message(s).contains("Tap Resend to share the same text again"))

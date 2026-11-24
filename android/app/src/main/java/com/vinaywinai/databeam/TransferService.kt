@@ -153,6 +153,10 @@ class TransferService : Service() {
                 .put("action",intent?.getStringExtra("action").orEmpty()).put("status","interrupted").put("message","Could not open transfer settings: ${error.message}")
             persist();busy.set(false);stopForeground(STOP_FOREGROUND_REMOVE);stopSelf();return START_NOT_STICKY
         }
+        // A requested code lookup belongs to this attempt only. Reopening an
+        // interrupted transfer must still find the last accepted code and ticket.
+        val lookupCode=if(state.optString("mode")=="EasySendMe" && state.optString("action")=="receive")
+            EasyReceive.takeRequestedCode(state) else null
         reviewCrocChanges=state.optBoolean("reviewCrocChanges")
         state.remove("reviewCrocChanges")
         state.remove("crocReview")
@@ -160,6 +164,9 @@ class TransferService : Service() {
         if(!state.has("saveFolder"))state.put("saveFolder",AppSettings.folder(this)).put("saveFolderLabel",AppSettings.folderLabel(this))
         if(state.optString("mode")=="Croc" && state.optString("action")=="receive" && !state.has("unwrapCroc")){
             state.put("unwrapCroc",!state.optBoolean("crocReadyToSave") && AppSettings.unwrapCroc(this))
+        }
+        if(state.optString("mode")!="Croc" && state.optString("action")=="receive" && !state.has("unwrapSendme")){
+            state.put("unwrapSendme",AppSettings.unwrapSendme(this))
         }
         state.remove("route");state.remove("senderRoutes")
         state.remove("timingConcurrent")
@@ -178,6 +185,7 @@ class TransferService : Service() {
             var terminalMessage="Complete"
             try {
                 val config=synchronized(this) {JSONObject(state.toString())}
+                if(lookupCode!=null)EasyReceive.requestLookup(config,lookupCode)
                 stageSources(config)
                 synchronized(this) {
                     state.put("paths",config.optJSONArray("paths"))
@@ -186,7 +194,11 @@ class TransferService : Service() {
                 persist()
                 check(!stopping.get()) {"Stopped"}
                 val mode=config.getString("mode")
-                if(mode=="Croc") {
+                if(mode!="Croc" && config.optString("action")=="receive" && config.optBoolean("nativeReadyToSave")){
+                    val staging=TransferCleanup.target(filesDir,"received/${config.getString("id")}")
+                    check(staging.isDirectory){"The files waiting to be saved are missing"}
+                    synchronized(this){state.put("output",staging.absolutePath)}
+                } else if(mode=="Croc") {
                     if(!config.optBoolean("crocReadyToSave") || config.getString("action")!="receive"){
                         val out=croc(config,config.getString("action"),null)
                         if(config.getString("action")=="receive" && !crocReceipt(config).isFile) synchronized(this) {state.put("text",out)}
@@ -220,7 +232,10 @@ class TransferService : Service() {
                             ticket=croc(config,"receive",null).split(Regex("\\s+")).firstOrNull { NativeBridge.hash(it).isNotEmpty() } ?: error("Sender did not supply a valid Sendme ticket")
                         }
                         EasyReceive.accept(config,ticket,NativeBridge::hash)
-                        synchronized(this){state.put("ticket",ticket).put("ticketCode",config.getString("ticketCode"));state.remove("refresh")};persist()
+                        synchronized(this){
+                            state.put("code",config.getString("code")).put("ticket",ticket)
+                                .put("ticketCode",config.getString("ticketCode"))
+                        };persist()
                         runNative(config)
                     }
                 } else runNative(config)
@@ -262,7 +277,9 @@ class TransferService : Service() {
                         val published=synchronized(this){state.optJSONObject("published") ?: JSONObject()}
                         val directories=synchronized(this){state.optJSONObject("publishedDirectories") ?: JSONObject()}
                         val crocFiles=mode=="Croc" && crocReceipt(config).isFile
-                        val unwrap=crocFiles && config.optBoolean("unwrapCroc")
+                        val nativeWrapper=if(mode!="Croc")state.optString("nativeWrapper") else ""
+                        val nativeUnwrap=nativeWrapper.isNotEmpty() && config.optBoolean("unwrapSendme")
+                        val unwrap=(crocFiles && config.optBoolean("unwrapCroc")) || nativeUnwrap
                         val wrapper=if(crocFiles && !unwrap){
                             state.optString("crocWrapper").ifBlank {
                                 val preferred=JSONObject(crocReceipt(config).readText()).getString("wrapper")
@@ -271,25 +288,35 @@ class TransferService : Service() {
                                 synchronized(this){state.put("crocWrapper",it).put("crocReadyToSave",true)}
                                 checkpointCroc()
                             }
-                        }else ""
+                        } else if(nativeWrapper.isNotEmpty() && !unwrap){
+                            state.optString("nativePublishedWrapper").ifBlank {
+                                Storage.availableWrapper(this,config.optString("saveFolder"),nativeWrapper)
+                            }.also{state.put("nativePublishedWrapper",it);checkpointCroc()}
+                        } else ""
                         val topLevelNames=if(unwrap){
-                            (state.optJSONObject("crocMoveTargets") ?: Storage.unwrappedNames(this,config.optString("saveFolder"),File(output))).also{
-                                synchronized(this){state.put("crocMoveTargets",it).put("crocReadyToSave",true)}
+                            val key=if(crocFiles)"crocMoveTargets" else "nativeMoveTargets"
+                            val unwrappedSource=if(nativeUnwrap)File(output,nativeWrapper) else File(output)
+                            (state.optJSONObject(key) ?: Storage.unwrappedNames(this,config.optString("saveFolder"),unwrappedSource)).also{
+                                synchronized(this){
+                                    state.put(key,it)
+                                    if(crocFiles)state.put("crocReadyToSave",true)
+                                }
                                 checkpointCroc()
                             }
                         }else null
                         Storage.publishDownloads(this,File(output),published,{stopping.get()},config.optString("saveFolder"),directories,{_,_->
                             synchronized(this){state.put("publishedDirectories",directories)}
                             if(crocFiles)checkpointCroc() else persist()
-                        },wrapper,topLevelNames){_,_->
+                        },wrapper,topLevelNames,nativeWrapper){_,_->
                             synchronized(this){state.put("published",published)}
                             if(crocFiles)checkpointCroc() else persist()
                         }
-                        if(unwrap)synchronized(this){state.put("crocMoved",true)}
+                        if(unwrap)synchronized(this){state.put(if(crocFiles)"crocMoved" else "nativeMoved",true)}
                         val receipt=synchronized(this){JSONObject(state.toString())}
                         TransferCleanup.saved(this,receipt)
                         synchronized(this){
                             state.put("workingCleaned",true)
+                            state.remove("nativeReadyToSave")
                             if(mode=="Croc"){state.remove("crocReadyToSave");state.remove("code");state.remove("receiveCode")}
                         };persist()
                         terminalMessage="Saved to ${config.optString("saveFolderLabel","Downloads / DataBeam")}${if(wrapper.isEmpty())"" else " / $wrapper"}"
@@ -396,7 +423,17 @@ class TransferService : Service() {
         }
         val result=JSONObject(NativeBridge.run(nativeConfig.toString()))
         if(result.optString("status")=="error") error(result.optString("message"))
-        synchronized(this) { state.put("output",c.getString("output")) }
+        if(c.optString("action")=="receive"){
+            val root=File(c.getString("output")).canonicalFile
+            val saved=File(result.getString("path")).canonicalFile
+            val wrapped=result.optBoolean("wrapped",saved.parentFile==root && saved!=root)
+            check(if(wrapped)saved.parentFile==root && saved.isDirectory else saved==root){"Unexpected receive output"}
+            synchronized(this){
+                state.put("output",root.absolutePath).put("nativeReadyToSave",true)
+                if(wrapped)state.put("nativeWrapper",saved.name) else state.remove("nativeWrapper")
+            }
+            checkpointCroc()
+        }
     }
     private fun croc(c:JSONObject,action:String,text:String?):String {
         return crocAttempt(c,action,text,true)

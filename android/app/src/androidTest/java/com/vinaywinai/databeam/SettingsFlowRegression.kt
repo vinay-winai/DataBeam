@@ -42,7 +42,7 @@ object SettingsFlowRegression {
                 (field("sendmeEngineToggle") as Switch).isChecked=false
                 check((field("sendmeEngineToggle") as Switch).isChecked)
             }
-            check(AppSettings.disabledEngine(c)=="Croc");closeSettings();check(menuIds()==listOf(2))
+            check(AppSettings.disabledEngine(c)=="Croc");closeSettings();check(menuIds()==listOf(2,EngineOptions.CROC_HISTORY_ACTION))
             main{check((field("contentSwitch") as View).visibility==View.GONE);check((field("sendCode") as View).visibility==View.GONE)}
             main{
                 val method=MainActivity::class.java.getDeclaredMethod("acceptScannedCode",String::class.java).apply{isAccessible=true}

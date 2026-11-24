@@ -12,6 +12,8 @@ object ReceiveCache {
         val bases=listOf(canonical)+(canonical.listFiles()?.filter{it.isDirectory && it.canonicalFile.parentFile==canonical} ?: emptyList())
         return bases.map{File(it,".sendme-recv-$hash")}.filter{it.isDirectory && it.canonicalFile==File(it.parentFile.canonicalFile,it.name)}
     }
+    fun hasSavedData(root:File,ticket:String):Boolean=
+        runCatching{stores(root,ticket).any{it.list()?.isNotEmpty()==true}}.getOrDefault(false)
     fun inspect(root:File,ticket:String):JSONObject? = stores(root,ticket).mapNotNull{store->
         val raw=NativeBridge.inspectCache(ticket,store.parentFile!!.absolutePath)
         if(raw=="null")null else JSONObject(raw).also{

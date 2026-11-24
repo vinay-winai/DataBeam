@@ -912,9 +912,12 @@ pub enum TransferMsg {
     Progress(f32),
     Code(String),
     Completed,
+    ReceiveOutput { path: PathBuf, wrapped: bool },
     Error(String),
+    SendmeSenderUnavailable(String),
     Started,
     PeerDisconnected,
+    ReceiverDisconnected,
     WaitingForReceiver,
     SenderTransferActivity,
     ActiveTransfers(usize),
@@ -982,6 +985,10 @@ pub struct SendmeReceiveOptions {
     pub blob_dir: Option<PathBuf>,
     pub overwrite: bool,
 }
+
+// Finishing a cancelled receive flushes its partial ranges. A retry can be
+// queued before that shutdown finishes, so serialize desktop cache access.
+static SENDME_RECEIVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn sender_blob_base_dir(base_dir: Option<&Path>) -> Option<PathBuf> {
     base_dir.map(|dir| dir.join("databeam_sender_stuff"))
@@ -1060,6 +1067,7 @@ enum NativeSendmeEvent {
     SenderRequestCompleted(NativeSenderRequestCompleted),
     TransferCompleted,
     TransferFailed,
+    TransferInterrupted,
     ActiveConnectionCount(usize),
     ReceiveStarted,
     ReceiveRoute(Option<SendmeRoute>),
@@ -1074,6 +1082,7 @@ enum NativeSendmeEvent {
         total: u64,
     },
     ReceiveCompleted,
+    ReceiveOutput { path: PathBuf, wrapped: bool },
 }
 
 #[derive(Clone)]
@@ -1093,6 +1102,7 @@ impl NativeSendmeEventEmitter for NativeSendmeEmitter {
             "transfer-started" => NativeSendmeEvent::TransferStarted,
             "transfer-completed" => NativeSendmeEvent::TransferCompleted,
             "transfer-failed" => NativeSendmeEvent::TransferFailed,
+            "transfer-interrupted" => NativeSendmeEvent::TransferInterrupted,
             "receive-started" => NativeSendmeEvent::ReceiveStarted,
             "receive-completed" => NativeSendmeEvent::ReceiveCompleted,
             _ => return Ok(()),
@@ -1104,6 +1114,12 @@ impl NativeSendmeEventEmitter for NativeSendmeEmitter {
 
     fn emit_event_with_payload(&self, event_name: &str, payload: &str) -> Result<(), String> {
         let evt = match event_name {
+            "receive-output" => {
+                #[derive(Deserialize)]
+                struct Output { path: PathBuf, wrapped: bool }
+                let Ok(output) = serde_json::from_str::<Output>(payload) else { return Ok(()); };
+                NativeSendmeEvent::ReceiveOutput { path: output.path, wrapped: output.wrapped }
+            }
             "preparation-progress" => {
                 let Some((done, total, speed_bps)) = parse_native_progress_payload(payload) else {
                     return Ok(());
@@ -1868,7 +1884,7 @@ where
         }
         let _ = tx.send(TransferMsg::Error("Transfer cancelled".to_string()));
     });
-    (rx, ProcessHandle { cancel, child_pid })
+    (rx, ProcessHandle { cancel, child_pid, receive_shutdown: None })
 }
 
 #[cfg(test)]
@@ -2072,6 +2088,14 @@ pub fn sendme_send(
 pub fn sendme_send_with_duplicate_filter(
     opts: SendmeSendOptions, _binary_path: &str, skip_duplicates: bool,
 ) -> (mpsc::Receiver<TransferMsg>, ProcessHandle) {
+    spawn_sendme_sender(opts, skip_duplicates, NativeRelayModeOption::Default)
+}
+
+fn spawn_sendme_sender(
+    opts: SendmeSendOptions,
+    skip_duplicates: bool,
+    relay_mode: NativeRelayModeOption,
+) -> (mpsc::Receiver<TransferMsg>, ProcessHandle) {
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel2 = cancel.clone();
@@ -2124,13 +2148,14 @@ pub fn sendme_send_with_duplicate_filter(
             paths,
             payload_root_name,
             NativeSendOptions {
-                relay_mode: NativeRelayModeOption::Default,
+                relay_mode,
                 ticket_type: NativeAddrInfoOptions::RelayAndAddresses,
                 magic_ipv4_addr: None,
                 magic_ipv6_addr: None,
                 blob_dir: sender_blob_dir.clone(),
                 jobs: None,
                 cancel: Some(cancel2.clone()),
+                complete_on_first_receiver: opts.one_shot,
             },
             app_handle,
         ));
@@ -2373,7 +2398,9 @@ pub fn sendme_send_with_duplicate_filter(
                     } else {
                         let _ = tx.send(TransferMsg::WaitingForReceiver);
                         waiting_for_new_connection = true;
-                        waiting_seen_zero_connections = false;
+                        // The native sender has already drained this cycle. The next
+                        // receiver can start directly with a payload request.
+                        waiting_seen_zero_connections = true;
                         sender_activity_emitted = false;
                         sender_progress_max = 0.0;
                         last_logged_done = 0;
@@ -2382,7 +2409,16 @@ pub fn sendme_send_with_duplicate_filter(
                         sender_requests.clear();
                     }
                 }
-                Ok(NativeSendmeEvent::TransferFailed) => {
+                Ok(NativeSendmeEvent::TransferInterrupted) if opts.one_shot => {
+                    sender_activity_emitted = false;
+                    sender_progress_max = 0.0;
+                    last_logged_done = 0;
+                    last_seen_total = 0;
+                    last_seen_speed_bps = 0.0;
+                    sender_requests.clear();
+                    let _ = tx.send(TransferMsg::ReceiverDisconnected);
+                }
+                Ok(NativeSendmeEvent::TransferFailed | NativeSendmeEvent::TransferInterrupted) => {
                     if opts.one_shot {
                         // Written/queued byte counts are not proof of delivery.
                         // Never turn an explicit provider failure into a peer
@@ -2414,6 +2450,7 @@ pub fn sendme_send_with_duplicate_filter(
                 | Ok(NativeSendmeEvent::ReceiveRoute(_))
                 | Ok(NativeSendmeEvent::ReceiveProgress { .. })
                 | Ok(NativeSendmeEvent::ReceiveCompleted)
+                | Ok(NativeSendmeEvent::ReceiveOutput { .. })
                 | Ok(NativeSendmeEvent::ReceiveExportStarted)
                 | Ok(NativeSendmeEvent::ReceiveExportProgress { .. }) => {}
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -2464,7 +2501,7 @@ pub fn sendme_send_with_duplicate_filter(
         }
     });
 
-    (rx, ProcessHandle { cancel, child_pid })
+    (rx, ProcessHandle { cancel, child_pid, receive_shutdown: None })
 }
 /// Create a deterministic staging directory with all items copied/linked into it for sendme
 fn get_dir_size(path: &Path, cancel: &AtomicBool) -> Result<u64, String> {
@@ -2534,12 +2571,28 @@ pub fn sendme_receive(
     opts: SendmeReceiveOptions,
     _binary_path: &str,
 ) -> (mpsc::Receiver<TransferMsg>, ProcessHandle) {
+    spawn_sendme_receiver(opts, NativeRelayModeOption::Default)
+}
+
+fn spawn_sendme_receiver(
+    opts: SendmeReceiveOptions,
+    relay_mode: NativeRelayModeOption,
+) -> (mpsc::Receiver<TransferMsg>, ProcessHandle) {
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel2 = cancel.clone();
     let child_pid = Arc::new(std::sync::Mutex::new(None));
+    let (shutdown, receive_shutdown) = mpsc::channel();
 
     let _worker = thread::spawn(move || {
+        // Keep this alive until the runtime and store have shut down.
+        let _shutdown = shutdown;
+        let tx = tx;
+        let _cache = SENDME_RECEIVE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        if cancel2.load(Ordering::Relaxed) {
+            let _ = tx.send(TransferMsg::Error("Transfer cancelled".to_string()));
+            return;
+        }
         let _ = tx.send(TransferMsg::Started);
 
         let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -2562,7 +2615,7 @@ pub fn sendme_receive(
             opts.ticket.clone(),
             NativeReceiveOptions {
                 output_dir: opts.output_dir.clone(),
-                relay_mode: NativeRelayModeOption::Default,
+                relay_mode,
                 magic_ipv4_addr: None,
                 magic_ipv6_addr: None,
                 blob_dir: opts.blob_dir.clone(),
@@ -2616,6 +2669,9 @@ pub fn sendme_receive(
                 Ok(NativeSendmeEvent::ReceiveCompleted) => {
                     let _ = tx.send(TransferMsg::Progress(1.0));
                 }
+                Ok(NativeSendmeEvent::ReceiveOutput { path, wrapped }) => {
+                    let _ = tx.send(TransferMsg::ReceiveOutput { path, wrapped });
+                }
                 Ok(NativeSendmeEvent::ReceiveExportStarted) => {
                     let _ = tx.send(TransferMsg::Output(
                         "[4/4] Writing files to disk...".to_string(),
@@ -2640,6 +2696,7 @@ pub fn sendme_receive(
                 | Ok(NativeSendmeEvent::SenderRequestCompleted(_))
                 | Ok(NativeSendmeEvent::TransferCompleted)
                 | Ok(NativeSendmeEvent::TransferFailed)
+                | Ok(NativeSendmeEvent::TransferInterrupted)
                 | Ok(NativeSendmeEvent::ActiveConnectionCount(_)) => {}
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {}
@@ -2652,6 +2709,9 @@ pub fn sendme_receive(
 
         while let Ok(evt) = evt_rx.try_recv() {
             match evt {
+                NativeSendmeEvent::ReceiveOutput { path, wrapped } => {
+                    let _ = tx.send(TransferMsg::ReceiveOutput { path, wrapped });
+                }
                 NativeSendmeEvent::ReceiveProgress { done, total, .. } if total > 0 => {
                     let progress = (done as f32 / total as f32).clamp(0.0, 1.0);
                     let _ = tx.send(TransferMsg::Progress(progress));
@@ -2681,7 +2741,13 @@ pub fn sendme_receive(
                 let _ = tx.send(TransferMsg::Completed);
             }
             Ok(Err(e)) => {
-                let _ = tx.send(TransferMsg::Error(format!("{e:#}")));
+                let message = format!("{e:#}");
+                let event = if e.is::<sendme_native::core::receive::SenderUnavailable>() {
+                    TransferMsg::SendmeSenderUnavailable(message)
+                } else {
+                    TransferMsg::Error(message)
+                };
+                let _ = tx.send(event);
             }
             Err(e) => {
                 let _ = tx.send(TransferMsg::Error(format!(
@@ -2692,7 +2758,7 @@ pub fn sendme_receive(
         }
     });
 
-    (rx, ProcessHandle { cancel, child_pid })
+    (rx, ProcessHandle { cancel, child_pid, receive_shutdown: Some(receive_shutdown) })
 }
 
 /// Tries to complete the receive by exporting blobs that are already fully cached locally.
@@ -2707,6 +2773,11 @@ pub fn sendme_check_local(
     let child_pid = Arc::new(std::sync::Mutex::new(None));
 
     let _worker = thread::spawn(move || {
+        let _cache = SENDME_RECEIVE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        if cancel2.load(Ordering::Relaxed) {
+            let _ = tx.send(TransferMsg::Error("Transfer cancelled".to_string()));
+            return;
+        }
         let _ = tx.send(TransferMsg::Started);
 
         let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -2776,6 +2847,9 @@ pub fn sendme_check_local(
                 Ok(NativeSendmeEvent::ReceiveCompleted) => {
                     let _ = tx.send(TransferMsg::Progress(1.0));
                 }
+                Ok(NativeSendmeEvent::ReceiveOutput { path, wrapped }) => {
+                    let _ = tx.send(TransferMsg::ReceiveOutput { path, wrapped });
+                }
                 _ => {}
             }
             if task.is_finished() {
@@ -2784,6 +2858,11 @@ pub fn sendme_check_local(
         }
 
         let result = runtime.block_on(async { task.await });
+        for event in evt_rx.try_iter() {
+            if let NativeSendmeEvent::ReceiveOutput { path, wrapped } = event {
+                let _ = tx.send(TransferMsg::ReceiveOutput { path, wrapped });
+            }
+        }
         match result {
             Ok(Ok(true)) => {
                 // Successfully exported from local blobs
@@ -2803,7 +2882,7 @@ pub fn sendme_check_local(
         }
     });
 
-    (rx, ProcessHandle { cancel, child_pid })
+    (rx, ProcessHandle { cancel, child_pid, receive_shutdown: None })
 }
 
 
@@ -3074,9 +3153,17 @@ fn strip_ansi(s: &str) -> String {
 pub struct ProcessHandle {
     pub cancel: Arc<AtomicBool>,
     pub child_pid: Arc<std::sync::Mutex<Option<u32>>>,
+    pub(crate) receive_shutdown: Option<mpsc::Receiver<()>>,
 }
 
 impl ProcessHandle {
+    pub fn cancel_on_exit(&self) {
+        self.request_cancel();
+        if let Some(shutdown) = &self.receive_shutdown {
+            let _ = shutdown.recv_timeout(Duration::from_secs(3));
+        }
+    }
+
     pub fn request_cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
         // Actually kill the child process
@@ -3988,11 +4075,89 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "uses real native endpoints and a large temporary payload"]
+    #[ignore = "uses native loopback endpoints and a large temporary payload"]
     fn sendme_stop_receiver_then_restart_sender_preserves_resume() {
+        check_sendme_resume_after_receiver_stops(false, false);
+    }
+
+    #[test]
+    #[ignore = "uses native loopback endpoints and a large temporary payload"]
+    fn sendme_one_shot_receiver_can_resume_with_the_same_ticket_after_pause() {
+        check_sendme_resume_after_receiver_stops(true, false);
+    }
+
+    #[test]
+    #[ignore = "uses native loopback endpoints and a large temporary payload"]
+    fn easy_sendme_receiver_can_resume_with_the_same_ticket_after_tray_exit() {
+        check_sendme_resume_after_receiver_stops(true, true);
+    }
+
+    struct StopSendmeOnDrop(super::ProcessHandle);
+
+    impl Drop for StopSendmeOnDrop {
+        fn drop(&mut self) {
+            self.0.request_cancel();
+        }
+    }
+
+    #[test]
+    fn sendme_broadcast_remains_available_after_two_completed_downloads() {
         use super::*;
-        struct StopOnDrop(ProcessHandle);
-        impl Drop for StopOnDrop { fn drop(&mut self) { self.0.request_cancel(); } }
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("broadcast.bin");
+        let bytes = vec![0xb7; 512 * 1024];
+        fs::write(&source, &bytes).unwrap();
+        let (sender_rx, sender) = spawn_sendme_sender(SendmeSendOptions {
+            paths: vec![source],
+            one_shot: false,
+            blob_dir: Some(temp.path().join("broadcast-sender")),
+        }, false, NativeRelayModeOption::Disabled);
+        let _sender = StopSendmeOnDrop(sender);
+        let ticket = loop {
+            match sender_rx.recv_timeout(Duration::from_secs(10)).expect("start broadcast") {
+                TransferMsg::Code(ticket) => break ticket,
+                TransferMsg::Error(error) => panic!("{error}"),
+                _ => {}
+            }
+        };
+        while !matches!(sender_rx.recv_timeout(Duration::from_secs(5)).expect("broadcast waiting"), TransferMsg::WaitingForReceiver) {}
+        for cycle in 1..=2 {
+            let output = temp.path().join(format!("receive-{cycle}"));
+            let (receiver_rx, receiver) = spawn_sendme_receiver(SendmeReceiveOptions {
+                ticket: ticket.clone(),
+                output_dir: Some(output.clone()),
+                blob_dir: Some(temp.path().join(format!("receive-cache-{cycle}"))),
+                overwrite: true,
+            }, NativeRelayModeOption::Disabled);
+            let _receiver = StopSendmeOnDrop(receiver);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match receiver_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("broadcast receive") {
+                    TransferMsg::Completed => break,
+                    TransferMsg::Error(error) | TransferMsg::SendmeSenderUnavailable(error) => panic!("{error}"),
+                    _ => {}
+                }
+            }
+            assert_eq!(fs::read(output.join("broadcast.bin_databeam/broadcast.bin")).unwrap(), bytes);
+            let mut active = false;
+            let mut completed = false;
+            loop {
+                match sender_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("broadcast sender") {
+                    TransferMsg::SenderTransferActivity => active = true,
+                    TransferMsg::Output(line) if line == "finished sending to client" => completed = true,
+                    TransferMsg::WaitingForReceiver => break,
+                    TransferMsg::Error(error) => panic!("{error}"),
+                    TransferMsg::PeerDisconnected | TransferMsg::ReceiverDisconnected => panic!("broadcast stopped after download"),
+                    _ => {}
+                }
+            }
+            assert!(active, "broadcast cycle {cycle} never became active");
+            assert!(completed, "broadcast cycle {cycle} returned to waiting without confirming delivery");
+        }
+    }
+
+    fn check_sendme_resume_after_receiver_stops(keep_sender: bool, tray_exit: bool) {
+        use super::*;
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("resume.bin");
         let chunk: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
@@ -4013,17 +4178,27 @@ mod tests {
                 TransferMsg::Error(error) => panic!("sender startup: {error}"), _ => {}
             }
         };
-        let (sender_rx, sender) = sendme_send(sender_options(), "");
-        let sender = StopOnDrop(sender);
+        let (sender_rx, sender) = spawn_sendme_sender(sender_options(), false, NativeRelayModeOption::Disabled);
+        let sender = StopSendmeOnDrop(sender);
         let first_ticket = next_ticket(&sender_rx);
-        let (receiver_rx, receiver) = sendme_receive(receive_options(first_ticket.clone()), "");
-        let receiver = StopOnDrop(receiver);
+        let (receiver_rx, receiver) = spawn_sendme_receiver(receive_options(first_ticket.clone()), NativeRelayModeOption::Disabled);
+        let mut receiving_app = crate::DataBeamApp::default();
+        receiving_app.transfer_handle = Some(receiver);
+        receiving_app.transfer_state = crate::TransferState::Running;
+        receiving_app.selected_tool = if tray_exit { crate::SelectedTool::EazySendme } else { crate::SelectedTool::Sendme };
+        receiving_app.view = crate::AppView::Receive;
         let deadline = Instant::now() + Duration::from_secs(45);
         let stopped_at = loop {
             assert!(Instant::now() < deadline, "no partial receive progress");
             match receiver_rx.recv_timeout(Duration::from_secs(1)) {
                 Ok(TransferMsg::Progress(progress)) if progress > 0.0 && progress < 1.0 => {
-                    receiver.0.request_cancel(); break progress;
+                    if tray_exit {
+                        receiving_app.apply_tray_action(&egui::Context::default(), crate::tray::TrayAction::Quit);
+                    } else {
+                        receiving_app.cancel_transfer();
+                    }
+                    drop(receiving_app);
+                    break progress;
                 }
                 Ok(TransferMsg::Error(error)) => panic!("first receive: {error}"),
                 Ok(TransferMsg::Completed) => panic!("test failed to interrupt a partial receive"),
@@ -4031,28 +4206,43 @@ mod tests {
             }
         };
         loop {
-            match receiver_rx.recv_timeout(Duration::from_secs(5)) {
+            match receiver_rx.recv_timeout(Duration::from_secs(3)) {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(error) => panic!("receiver worker did not finish cancellation: {error}"),
+                Err(error) => panic!("receiver worker remained active after interruption: {error}"),
                 _ => {}
-            }
-        }
-        sender.0.request_cancel();
-        loop {
-            match sender_rx.recv_timeout(Duration::from_secs(5)) {
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(error) => panic!("sender worker did not stop: {error}"), _ => {}
             }
         }
         let cached = get_sendme_blob_directory_size(&first_ticket, Some(&temp.path().join("receiver-cache")));
         eprintln!("Stopped receiver at {stopped_at:.3}; cache contains {cached} bytes");
         assert!(cached > 0, "Stop discarded the partial receiver store");
-        let (sender_rx, second_sender) = sendme_send(sender_options(), "");
-        let _second_sender = StopOnDrop(second_sender);
-        let second_ticket = next_ticket(&sender_rx);
+        let (sender_rx, _sender, second_ticket) = if keep_sender {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                match sender_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(TransferMsg::ReceiverDisconnected) => break,
+                    Ok(TransferMsg::Error(error)) => panic!("sender stopped after disconnect: {error}"),
+                    Ok(TransferMsg::PeerDisconnected) => panic!("sender reported success after interruption"),
+                    Ok(_) => {},
+                    Err(error) => panic!("sender did not report receiver interruption: {error}"),
+                }
+            }
+            (sender_rx, sender, first_ticket.clone())
+        } else {
+            sender.0.request_cancel();
+            loop {
+                match sender_rx.recv_timeout(Duration::from_secs(5)) {
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(error) => panic!("sender worker did not stop: {error}"),
+                    _ => {}
+                }
+            }
+            let (rx, sender) = spawn_sendme_sender(sender_options(), false, NativeRelayModeOption::Disabled);
+            let ticket = next_ticket(&rx);
+            (rx, StopSendmeOnDrop(sender), ticket)
+        };
         assert_eq!(native_ticket_to_hex_hash(&first_ticket), native_ticket_to_hex_hash(&second_ticket), "same payload must keep the collection hash");
-        let (receiver_rx, second_receiver) = sendme_receive(receive_options(second_ticket), "");
-        let _second_receiver = StopOnDrop(second_receiver);
+        let (receiver_rx, second_receiver) = spawn_sendme_receiver(receive_options(second_ticket), NativeRelayModeOption::Disabled);
+        let _second_receiver = StopSendmeOnDrop(second_receiver);
         let mut resumed = None;
         let mut completed = false;
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -4075,6 +4265,16 @@ mod tests {
         let received = fs::read(temp.path().join("received/resume.bin_databeam/resume.bin")).unwrap();
         assert_eq!(received.len(), chunk.len() * 256);
         assert!(received.chunks(chunk.len()).all(|part| part == chunk.as_slice()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match sender_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(TransferMsg::PeerDisconnected) => break,
+                Ok(TransferMsg::ReceiverDisconnected) => panic!("sender reported a disconnect after successful resume"),
+                Ok(TransferMsg::Error(error)) => panic!("sender failed after receiver saved files: {error}"),
+                Ok(_) => {},
+                Err(error) => panic!("sender did not confirm resumed transfer: {error}"),
+            }
+        }
     }
 
     #[test]

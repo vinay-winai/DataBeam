@@ -28,6 +28,7 @@ class MainActivity:ComponentActivity() {
     private var cleanupBusy=false
     private var cleanupScanning=false
     private var cleanupScanned=false
+    private var cleanupDialog:AlertDialog?=null
     private var settingsFolder:TextView?=null
     private var settingsBackground:TextView?=null
     private var batteryButton:Button?=null
@@ -261,7 +262,7 @@ class MainActivity:ComponentActivity() {
         button(receiveActions,"Clear"){code.setText("")}
         receiveRecent=button(receivePanel,"Recent codes"){showRecent("receive",code)}
         saveLocation=label(receivePanel,"",12f).apply{setTextColor(accent)}
-        historyButton=button(receivePanel,"Croc receive history"){showCrocHistory()}
+        historyButton=button(receivePanel,"Receive history"){showCrocHistory()}
         updateSaveLocation()
         primary=button(layout,if(tab=="receive")"Receive" else "Send files",true){launch(tab)}
         val transfer=card(layout);transferPanel=transfer;transfer.visibility=View.GONE
@@ -474,7 +475,7 @@ class MainActivity:ComponentActivity() {
         label(transfers,"Applies to individually selected files. Folder contents are kept.").textSize=12f
 
         val storage=section("storage","Files and storage")
-        button(storage,"Croc receive history"){
+        button(storage,"Receive history"){
             settingsDialog?.dismiss()
             showCrocHistory()
         }
@@ -496,6 +497,12 @@ class MainActivity:ComponentActivity() {
             setOnCheckedChangeListener{_,checked->AppSettings.setUnwrapCroc(this@MainActivity,checked)}
         })
         label(storage,"Save Croc files and folders directly in the download folder.").textSize=12f
+        settingsConfiguration.add(Switch(this).apply{
+            text="Always unwrap Sendme and EasySendMe receives"
+            isChecked=AppSettings.unwrapSendme(this@MainActivity)
+            setTextColor(ink);storage.addView(this)
+            setOnCheckedChangeListener{_,checked->AppSettings.setUnwrapSendme(this@MainActivity,checked)}
+        })
         label(storage,"Auto-clear history and partials").textSize=13f
         val cleanupOptions=listOf(0,7,30)
         settingsConfiguration.add(Spinner(this).apply{
@@ -576,34 +583,59 @@ class MainActivity:ComponentActivity() {
         if(configurationLocked() || TransferService.isBusy()){
             if(manual)alert("End the active or paused connection before cleaning transfer storage.");return
         }
-        if(cleanupScanning)return
+        if(cleanupScanning || cleanupDialog?.isShowing==true)return
         val extra=sources.filter{it.scheme=="file"}.mapNotNull{it.path}
         cleanupScanning=true
         if(manual)Toast.makeText(this,"Checking transfer storage…",Toast.LENGTH_SHORT).show()
         Thread{
             val result=runCatching{TransferCleanup.scan(this,extra)}
             runOnUiThread{
-                cleanupScanning=false;if(isDestroyed || configurationLocked() || TransferService.isBusy())return@runOnUiThread
+                cleanupScanning=false;if(isDestroyed || isFinishing || configurationLocked() || TransferService.isBusy())return@runOnUiThread
                 result.onFailure{if(manual)alert(it.message ?: "Could not check transfer storage")}.onSuccess{report->
+                    if(!manual)cleanupScanned=true
                     val candidates=if(manual)report.candidates else report.candidates.filter{it.bytes>1024*1024}
+                    val available=report.receives.filter{it.mode in AppSettings.modes(this)}
                     val bytes=candidates.sumOf{it.bytes}
-                    if(!manual && candidates.isEmpty()){
+                    if(!manual && candidates.isEmpty() && available.isEmpty()){
                         if(report.reclaimed>0)Toast.makeText(this,"Freed ${ProgressEvents.size(report.reclaimed)} of saved working copies",Toast.LENGTH_LONG).show()
                         return@onSuccess
                     }
-                    val message="Freed ${ProgressEvents.size(report.reclaimed)} automatically.\nUnused transfer data: ${ProgressEvents.size(bytes)}.\nKept for the current resume/restart: ${ProgressEvents.size(report.protectedBytes)}.\n\nDeleting unused data removes older transfer caches and temporary copies. Those older transfers will need their sources again. Files saved to Downloads or your chosen folder stay intact.\n\nTo remove the current transfer's saved resume data too, clear its transfer card first, then check storage again."
+                    val message="Freed ${ProgressEvents.size(report.reclaimed)} automatically.\nIncomplete transfer data: ${ProgressEvents.size(bytes)}.\nKept for the current resume/restart: ${ProgressEvents.size(report.protectedBytes)}.\n\nDeleting incomplete data removes older transfer caches and temporary copies. Those older transfers will need their sources again. Files saved to Downloads or your chosen folder stay intact.\n\nTo remove the current transfer's saved resume data too, clear its transfer card first, then check storage again."
                     val dialog=AlertDialog.Builder(this).setTitle("Transfer storage").setMessage(message).setNegativeButton("Keep",null)
-                    if(candidates.isNotEmpty())dialog.setPositiveButton("Delete unused data"){_,_->
+                    if(available.isNotEmpty())dialog.setNeutralButton("Continue transfer"){_,_->continueSavedReceive(available)}
+                    if(candidates.isNotEmpty())dialog.setPositiveButton("Delete incomplete data"){_,_->
                         cleanupBusy=true;lockConfiguration(true)
                         Thread{
                             val removed=runCatching{TransferCleanup.deleteUnused(this,candidates,extra)}
                             runOnUiThread{cleanupBusy=false;if(!isDestroyed){lockConfiguration(configurationLocked());removed.onSuccess{alert("Freed ${ProgressEvents.size(it)}. Saved files and current resume/restart data were kept.")}.onFailure{alert(it.message ?: "Cleanup could not finish")}}}
                         }.start()
                     }
-                    dialog.show()
+                    cleanupDialog=dialog.create().apply{setOnDismissListener{cleanupDialog=null};show()}
                 }
             }
         }.start()
+    }
+    private fun continueSavedReceive(receives:List<TransferCleanup.ReceiveDraft>){
+        fun populate(draft:TransferCleanup.ReceiveDraft){
+            if(configurationLocked() || TransferService.isBusy())return
+            val restored=TransferCleanup.savedReceive(this,draft.id)
+            if(restored==null){alert("This saved transfer is no longer available.");return}
+            getSharedPreferences("transfer",0).edit().putString("state",restored.toString()).commit()
+            selectMode(draft.mode)
+            selectTab("receive")
+            code.setText(draft.input)
+            settingsDialog?.dismiss()
+            previous="";render()
+            screenScroll.smoothScrollTo(0,0)
+        }
+        if(receives.size==1){populate(receives.single());return}
+        val formatter=java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.MEDIUM,java.text.DateFormat.SHORT)
+        val labels=receives.map{draft->
+            val name=if(draft.mode=="EasySendMe")"${draft.mode} · ${draft.input}" else draft.mode
+            if(draft.updatedAt>0)"$name · ${formatter.format(java.util.Date(draft.updatedAt))}" else name
+        }
+        AlertDialog.Builder(this).setTitle("Continue which receive?").setItems(labels.toTypedArray()){_,index->populate(receives[index])}
+            .setNegativeButton("Cancel",null).show()
     }
     private fun selectTab(value:String){tab=value;updatePanels()}
     private fun selectedMode():String {
@@ -664,7 +696,7 @@ class MainActivity:ComponentActivity() {
     private fun updatePanels(){
         val selected=selectedMode()
         updateAccent(selected)
-        historyButton.visibility=if(tab=="receive" && selected=="Croc")View.VISIBLE else View.GONE
+        historyButton.visibility=if(tab=="receive")View.VISIBLE else View.GONE
         if(selected!="Croc")browserSend=false
         browserGuidance.visibility=if(tab=="send" && selected=="Croc" && browserSend && sendKind=="files")View.VISIBLE else View.GONE
         if(codeMode!=selected){
@@ -718,7 +750,7 @@ class MainActivity:ComponentActivity() {
             if(2 in allowed)menu.add(0,2,1,"Broadcast")
             if(3 in allowed)menu.add(0,3,2,"Send to browser")
             if(4 in allowed)menu.add(0,4,3,"EasySendMe")
-            if(EngineOptions.CROC_HISTORY_ACTION in allowed)menu.add(0,EngineOptions.CROC_HISTORY_ACTION,4,"Croc receive history")
+            if(EngineOptions.CROC_HISTORY_ACTION in allowed)menu.add(0,EngineOptions.CROC_HISTORY_ACTION,4,"Receive history")
             setOnMenuItemClickListener{item->runCatching{quickAction(item.itemId)}.onFailure{alert(it.message ?: "Cannot change the active transfer")};true}
             setOnDismissListener{quickMenu=null}
             show()
@@ -782,7 +814,12 @@ class MainActivity:ComponentActivity() {
             if(state.optString("action")=="receive" && state.optString("mode")==selectedMode() && state.optString("status") in listOf("paused","interrupted")) {
                 val old=if(selectedMode()=="Sendme")state.optString("ticket") else state.optString("code")
                 val same=entered==old || (selectedMode()=="Sendme" && NativeBridge.hash(entered).isNotEmpty() && NativeBridge.hash(entered)==NativeBridge.hash(old))
-                if(same){if(selectedMode()=="Sendme")state.put("ticket",entered);start(state);return}
+                if(same){
+                    val resumed=TransferCleanup.recoverEasyReceive(this,state)
+                    if(selectedMode()=="Sendme")resumed.put("ticket",entered)
+                    if(selectedMode()=="EasySendMe")EasyReceive.reuseSavedTicket(resumed,NativeBridge::hash)
+                    start(resumed);return
+                }
             }
         }
         val sendingText=selectedMode()=="Croc" && sendKind=="text"
@@ -849,30 +886,40 @@ class MainActivity:ComponentActivity() {
         }
     }
     private fun showResume(){
-        val saved=TransferService.state(this)
+        val saved=TransferCleanup.recoverEasyReceive(this,TransferService.state(this))
+        if(saved.optBoolean("nativeReadyToSave")){start(saved);return}
         if(saved.optString("mode")=="Croc"){
             if(saved.optBoolean("connectionRetained"))resume(false) else showCrocResume(saved)
             return
         }
         val ticketMode=saved.optString("mode")=="Sendme"
-        resumeDialog=AlertDialog.Builder(this).setTitle("Resume ${saved.optString("mode")}")
-            .setMessage("Pausing a normal desktop send ends its sharing session. Ask the sender to share the exact same files again, then choose ${if(ticketMode)"New ticket" else "New code"}. Matching saved data continues automatically.\n\nIf the sender is still sharing the original session, such as Sendme Broadcast, choose Sender still sharing to use its current ticket.")
-            .setPositiveButton(if(ticketMode)"New ticket" else "New code"){_,_->resume(true)}
-            .setNeutralButton("Sender still sharing"){_,_->resume(false)}
-            .setNegativeButton("Cancel",null).create().also{dialog->dialog.setOnDismissListener{resumeDialog=null};dialog.show()}
+        val canReconnect=ticketMode || EasyReceive.hasSavedTicket(saved,NativeBridge::hash)
+        val resumeMessage=if(ticketMode)
+            "If the sender is still sharing, choose Sender still sharing. If sharing ended, ask them to share the same files again and choose New ticket. Matching saved data continues automatically."
+        else if(canReconnect)
+            "Choose Sender still sharing to reconnect with the saved ticket. If sharing ended or the ticket fails, ask the sender to share the same files again and choose New code. Matching saved data continues automatically."
+        else
+            "This receive stopped before it got a Sendme ticket. Enter the sender’s current EasySendMe code to get one."
+        val dialog=AlertDialog.Builder(this).setTitle("Resume ${saved.optString("mode")}")
+            .setMessage(resumeMessage)
+            .setPositiveButton(if(ticketMode)"New ticket" else if(canReconnect)"New code" else "Enter code"){_,_->resume(true)}
+            .setNegativeButton("Cancel",null)
+        if(canReconnect)dialog.setNeutralButton("Sender still sharing"){_,_->resume(false)}
+        resumeDialog=dialog.create().also{it.setOnDismissListener{resumeDialog=null};it.show()}
     }
     private fun showCrocHistory(){
-        val entries=TransferCleanup.crocReceiveHistory(this)
-        if(entries.isEmpty()){alert("Croc file receives will appear here.");return}
-        AlertDialog.Builder(this).setTitle("Croc receive history")
+        val entries=TransferCleanup.receiveHistory(this)
+        if(entries.isEmpty()){alert("Received files and unfinished downloads will appear here.");return}
+        AlertDialog.Builder(this).setTitle("Receive history")
             .setItems(entries.map { entry ->
                 val names=entry.optJSONArray("payloadNames")
-                val title=entry.optString("crocWrapper").ifBlank{names?.optString(0).orEmpty().ifBlank{"Croc receive"}}
+                val mode=entry.optString("mode")
+                val title=TransferCleanup.receiveWrapper(entry).ifBlank{names?.optString(0).orEmpty().ifBlank{"$mode receive"}}
                 val state=TransferLabels.title(entry)
                 val total=entry.optLong("total")
                 val progress=if(total>0)" · ${ProgressEvents.size(entry.optLong("done"))} of ${ProgressEvents.size(total)}" else ""
                 val details=if(entry.optString("status")=="complete")crocHistoryDetails(entry) else emptyList()
-                listOf(title,"$state$progress",details.joinToString(" · ")).filter{it.isNotBlank()}.joinToString("\n")
+                listOf(title,"$mode · $state$progress",details.joinToString(" · ")).filter{it.isNotBlank()}.joinToString("\n")
             }.toTypedArray()){_,index->showCrocHistoryEntry(entries[index])}
             .setNegativeButton("Close",null).show()
     }
@@ -885,26 +932,40 @@ class MainActivity:ComponentActivity() {
     }
 
     private fun showCrocHistoryEntry(entry:JSONObject){
+        val mode=entry.optString("mode")
         val complete=entry.optString("status")=="complete"
         val active=entry.optString("status") in listOf("running","stopping") || entry.optBoolean("connectionRetained")
-        val wrapper=entry.optString("crocWrapper")
-        val availableFolder=wrapper.takeUnless{entry.optBoolean("crocMoved")}.orEmpty()
+        val wrapper=TransferCleanup.receiveWrapper(entry)
+        val availableFolder=wrapper.takeUnless{entry.optBoolean("crocMoved") || entry.optBoolean("nativeMoved")}.orEmpty()
         val summary=listOf(TransferLabels.title(entry),TransferLabels.message(entry))+crocHistoryDetails(entry)
-        val dialog=AlertDialog.Builder(this).setTitle(wrapper.ifBlank{"Croc receive"})
+        val dialog=AlertDialog.Builder(this).setTitle(wrapper.ifBlank{"$mode receive"})
             .setMessage(summary.filter(String::isNotBlank).distinct().joinToString("\n"))
             .setNegativeButton("Close",null)
-        if(!active && (complete || AppSettings.engineEnabled(this,"Croc")))dialog.setPositiveButton(if(complete)"Open folder" else "Resume"){_,_->
-            runCatching{if(complete)openDownloadFolder(entry.optString("saveFolder"),availableFolder) else showCrocResume(entry)}
+        if(!active && (complete || AppSettings.engineEnabled(this,mode)))dialog.setPositiveButton(if(complete)"Open folder" else "Resume"){_,_->
+            runCatching{
+                if(!complete)check(!configurationLocked() && !TransferService.isBusy()){"Finish or end the active transfer first"}
+                when {
+                    complete->openDownloadFolder(entry.optString("saveFolder"),availableFolder)
+                    mode=="Croc"->showCrocResume(entry)
+                    entry.optBoolean("nativeReadyToSave")->start(entry)
+                    else->{
+                        val restored=checkNotNull(TransferCleanup.savedReceive(this,entry.getString("id"))){"Saved download is no longer available"}
+                        getSharedPreferences("transfer",0).edit().putString("state",restored.toString()).commit()
+                        selectMode(mode);selectTab("receive");code.setText(receivedCodeText(restored));previous="";render()
+                        showResume()
+                    }
+                }
+            }
                 .onFailure{alert(it.message ?: "Could not open transfer")}
         }
         if(!active && !TransferService.isBusy())dialog.setNeutralButton(if(complete)"Actions" else "Discard partial files"){_,_->
             if(complete){
                 val move=availableFolder.isNotEmpty() && entry.optString("saveFolder").isEmpty() && android.os.Build.VERSION.SDK_INT>=29
-                val options=if(move)arrayOf("Move files out","Remove from history") else arrayOf("Remove from history")
-                AlertDialog.Builder(this).setTitle(wrapper.ifBlank{"Croc receive"}).setItems(options){_,index->
+                val options=if(move)arrayOf("Unwrap","Remove from history") else arrayOf("Remove from history")
+                AlertDialog.Builder(this).setTitle(wrapper.ifBlank{"$mode receive"}).setItems(options){_,index->
                     if(move && index==0){
                         Thread{
-                            val result=runCatching{TransferCleanup.moveCrocReceive(this,entry)}
+                            val result=runCatching{TransferCleanup.moveReceive(this,entry)}
                             runOnUiThread{if(!isDestroyed)result.onSuccess{alert("Files moved to Downloads / DataBeam")}.onFailure{alert(it.message ?: "Could not move files")}}
                         }.start()
                     }else confirmRemoveCrocHistory(entry,true)
@@ -918,7 +979,7 @@ class MainActivity:ComponentActivity() {
             AlertDialog.Builder(this).setMessage(if(complete)"Remove this history entry? Saved files will stay." else "Delete the partial data for this transfer? Files already saved will stay.")
                 .setNegativeButton("Cancel",null).setPositiveButton("Remove"){_,_->
                     Thread{
-                        val outcome=runCatching{TransferCleanup.discardCrocReceive(this,entry.getString("id"))}
+                        val outcome=runCatching{TransferCleanup.discardReceive(this,entry.getString("id"))}
                         runOnUiThread{if(!isDestroyed)outcome.onFailure{alert(it.message ?: "Could not remove transfer")};render()}
                     }.start()
                 }.show()
@@ -988,24 +1049,32 @@ class MainActivity:ComponentActivity() {
             .show()
     }
     private fun resume(replace:Boolean) {
-        val c=TransferService.state(this)
+        val c=TransferCleanup.recoverEasyReceive(this,TransferService.state(this))
         require(c.has("id")){"No interrupted transfer"}
         require(c.optString("status") !in listOf("running","stopping")){"Transfer is still running"}
         if(replace) {
             val ticketMode=c.optString("mode")=="Sendme"
             val entry=EditText(this).apply{hint=if(ticketMode)"Paste the sender’s new ticket" else "Sender’s current EasySendMe code";if(!ticketMode)setText(c.optString("code"))}
-            reconnectDialog=AlertDialog.Builder(this).setTitle(if(ticketMode)"New Sendme ticket" else "Current EasySendMe code").setMessage("Ask the sender to share the exact same files again, then enter their ${if(ticketMode)"new ticket" else "current code (it can be unchanged)"}. Matching saved data continues automatically.").setView(entry).setNegativeButton("Cancel",null).setPositiveButton("Receive"){_,_->
+            val guidance=if(!ticketMode && !EasyReceive.hasSavedTicket(c,NativeBridge::hash))
+                "Enter the code shown by the sender. Keep the sender sharing until the ticket is received."
+            else
+                "Ask the sender to share the exact same files again, then enter their ${if(ticketMode)"new ticket" else "current code (it can be unchanged)"}. Matching saved data continues automatically."
+            reconnectDialog=AlertDialog.Builder(this).setTitle(if(ticketMode)"New Sendme ticket" else "Current EasySendMe code").setMessage(guidance).setView(entry).setNegativeButton("Cancel",null).setPositiveButton("Receive"){_,_->
                 if(entry.text.isNotBlank()) {
                     val next=entry.text.toString().trim()
                     if(ticketMode){
                         if(NativeBridge.hash(next).isEmpty() || NativeBridge.hash(next)!=NativeBridge.hash(c.optString("ticket"))){alert("This ticket is invalid or belongs to different files. Start a new receive for different files.");return@setPositiveButton}
                         c.put("ticket",next)
-                    }else c.put("code",QrSharing.easySendMeCode(next) ?: next).put("refresh",true)
+                    }else EasyReceive.requestLookup(c,QrSharing.easySendMeCode(next) ?: next)
                     if(selectedMode()==c.optString("mode"))code.setText(receivedCodeText(c))
                     start(c)
                 }
             }.create().also{dialog->dialog.setOnDismissListener{reconnectDialog=null};dialog.show()}
         } else {
+            if(c.optString("mode")=="EasySendMe" && !EasyReceive.reuseSavedTicket(c,NativeBridge::hash)){
+                alert("This receive has no saved Sendme ticket. Enter the sender’s current EasySendMe code.")
+                return
+            }
             val entered=code.text.toString().trim()
             if(c.optString("action")=="receive" && entered.isNotEmpty()){
                 if(c.optString("mode")=="Croc" && entered!=c.optString("code")){
@@ -1181,7 +1250,14 @@ class MainActivity:ComponentActivity() {
         render()
         acceptShare(intent)
     }
-    override fun onResume(){super.onResume();Thread{runCatching{TransferCleanup.clearInactiveSenders(applicationContext);TransferCleanup.clearAgedTransfers(applicationContext)}}.start();updateBackgroundStatus();handler.post(ticker);updateTroubleshootBadge();TroubleshootNews.check(applicationContext,force=true){runOnUiThread{if(!isDestroyed)updateTroubleshootBadge()}};if(!cleanupScanned){cleanupScanned=true;showStorageCleanup(false)}}
+    override fun onResume(){
+        super.onResume()
+        updateBackgroundStatus();handler.post(ticker);updateTroubleshootBadge()
+        TroubleshootNews.check(applicationContext,force=true){runOnUiThread{if(!isDestroyed)updateTroubleshootBadge()}}
+        // The first scan also clears inactive senders and expired transfer data.
+        if(!cleanupScanned)showStorageCleanup(false)
+        else Thread{runCatching{TransferCleanup.clearInactiveSenders(applicationContext);TransferCleanup.clearAgedTransfers(applicationContext)}}.start()
+    }
     override fun onPause(){handler.removeCallbacks(ticker);super.onPause()}
-    override fun onDestroy(){quickMenu?.dismiss();quickMenu=null;resumeDialog?.dismiss();resumeDialog=null;reconnectDialog?.dismiss();reconnectDialog=null;crocHistoryDialog?.dismiss();crocReviewDialog?.dismiss();super.onDestroy()}
+    override fun onDestroy(){cleanupDialog?.dismiss();quickMenu?.dismiss();quickMenu=null;resumeDialog?.dismiss();resumeDialog=null;reconnectDialog?.dismiss();reconnectDialog=null;crocHistoryDialog?.dismiss();crocReviewDialog?.dismiss();super.onDestroy()}
 }

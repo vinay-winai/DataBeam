@@ -239,7 +239,7 @@ fn run(c: Config) -> anyhow::Result<Value> {
                 app,
             )
             .await?;
-            Ok(json!({"status":"complete","path":result.file_path}))
+            Ok(json!({"status":"complete","path":result.file_path,"wrapped":result.wrapped}))
         }
     })
 }

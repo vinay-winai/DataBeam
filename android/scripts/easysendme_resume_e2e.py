@@ -28,9 +28,9 @@ def main():
     if snap['transfer.xml']:
         node=ET.fromstring(snap['transfer.xml']).find("string[@name='state']")
         assert node is None or json.loads(node.text).get('status') not in ('running','stopping'),'A user transfer is active'
-    def spawn(cmd,label,env=None):
+    def spawn(cmd,label,env=None,stdin=None):
         out=(work/(label+'.out')).open('wb');err=(work/(label+'.err')).open('wb');handles.extend((out,err))
-        p=subprocess.Popen(list(map(str,cmd)),stdout=out,stderr=err,env=env,cwd=work,creationflags=0x08000000);children.append(p);return p
+        p=subprocess.Popen(list(map(str,cmd)),stdin=stdin,stdout=out,stderr=err,env=env,cwd=work,creationflags=0x08000000);children.append(p);return p
     def stop(p):
         if p.poll() is None:
             p.terminate()
@@ -45,7 +45,11 @@ def main():
             assert p.poll() is None,'Native sender stopped';time.sleep(.1)
         raise AssertionError('No sender ticket')
     def handoff(code,ticket,label):
-        return spawn([CROC,'--yes','--relay','127.0.0.1:19009','send','--no-local','--text',ticket],label,dict(os.environ,CROC_SECRET=code,CROC_NO_UPDATE_CHECK='1'))
+        p=spawn([CROC,'--yes','--relay','127.0.0.1:19009','send','--no-local','--text','-'],
+                label,dict(os.environ,CROC_SECRET=code,CROC_NO_UPDATE_CHECK='1'),stdin=subprocess.PIPE)
+        with p.stdin:
+            p.stdin.write(ticket.encode('utf-8'))
+        return p
     def marker():
         p=adb('exec-out','run-as',APP,'cat',f'files/easy-resume-{run}.json',check=False)
         if p.returncode:

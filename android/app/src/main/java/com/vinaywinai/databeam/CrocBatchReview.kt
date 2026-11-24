@@ -23,7 +23,7 @@ internal object CrocBatchReview {
         val state = TransferService.state(context)
         check(TransferService.isBusy() && state.optString("id") == transferId &&
             state.optString("crocReview") == token && read(context, transferId, token) != null
-        ) { "The file review has ended. Open Croc receive history to resume again." }
+        ) { "The file review has ended. Open Receive history to resume again." }
         val decision = AtomicFile(File(receipt(context, transferId).path + ".decision"))
         val stream = decision.startWrite()
         try {

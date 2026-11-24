@@ -10,7 +10,7 @@ class EngineOptionsTest {
         assertEquals(listOf("Croc"),EngineOptions.modes("Sendme"))
         assertEquals(listOf(1,3,EngineOptions.CROC_HISTORY_ACTION),EngineOptions.quickActions("Sendme"))
         assertEquals(listOf("Sendme"),EngineOptions.modes("Croc"))
-        assertEquals(listOf(2),EngineOptions.quickActions("Croc"))
+        assertEquals(listOf(2,EngineOptions.CROC_HISTORY_ACTION),EngineOptions.quickActions("Croc"))
     }
     @Test fun theLastEnabledEngineCannotBeDisabled(){
         for(engine in listOf("Sendme","Croc")){

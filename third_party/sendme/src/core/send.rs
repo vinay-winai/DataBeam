@@ -1,7 +1,7 @@
 use crate::core::types::{
     apply_options, get_or_create_secret, AddrInfoOptions, AppHandle, SendOptions, SendResult,
 };
-use super::sender_protocol::AcknowledgedBlobs;
+use super::sender_protocol::{AcknowledgedBlobs, PeerInterruptions};
 use anyhow::Context;
 use data_encoding::HEXLOWER;
 use iroh::{address_lookup::pkarr::PkarrPublisher, endpoint::presets, Endpoint, RelayMode};
@@ -234,6 +234,8 @@ pub async fn start_share(
                     size,
                     temp_tag.hash(),
                     sizes.clone(),
+                    blobs.peer_interruptions(),
+                    options.complete_on_first_receiver,
                 )));
 
             let router = iroh::protocol::Router::builder(endpoint)
@@ -625,7 +627,7 @@ mod tests {
     use std::sync::{atomic::AtomicU64, Arc};
 
     #[tokio::test]
-    async fn aborted_size_probe_is_not_a_payload_failure() -> anyhow::Result<()> {
+    async fn aborted_requests_report_the_payload_failure_reason() -> anyhow::Result<()> {
         use iroh_blobs::{protocol::{GetRequest, ChunkRangesSeq}, provider::events::{Notify, ProviderProto, RequestReceived, RequestUpdate, TransferStarted, TransferAborted}};
         #[derive(Default)]
         struct Events(std::sync::Mutex<Vec<String>>);
@@ -635,11 +637,21 @@ mod tests {
             }
             fn emit_event_with_payload(&self, _: &str, _: &str) -> Result<(), String> { Ok(()) }
         }
-        for probe in [true, false] {
+        for (probe, interrupted, expected) in [
+            (true, true, None),
+            (false, true, Some("transfer-interrupted")),
+            (false, false, Some("transfer-failed")),
+        ] {
             let hash = iroh_blobs::Hash::new(b"payload");
             let events = Arc::new(Events::default());
             let (tx, rx) = tokio::sync::mpsc::channel(16);
-            let task = tokio::spawn(show_provide_progress_with_logging(rx, Some(events.clone()), 4096, hash, vec![4096]));
+            let interruptions = PeerInterruptions::default();
+            if interrupted {
+                interruptions.lock().unwrap().insert((1, 1));
+            }
+            let task = tokio::spawn(show_provide_progress_with_logging(
+                rx, Some(events.clone()), 4096, hash, vec![4096], interruptions.clone(), false,
+            ));
             // Notify's constructor is private; its public serde representation
             // lets the test exercise the real provider-event stream.
             let request: Notify<RequestReceived<GetRequest>> = serde_json::from_value(serde_json::to_value(RequestReceived {
@@ -659,9 +671,88 @@ mod tests {
             drop(tx);
             tokio::time::timeout(Duration::from_secs(5), task).await???;
             let events = events.0.lock().unwrap();
-            assert_eq!(events.iter().filter(|name| *name == "transfer-failed").count(), usize::from(!probe));
+            let failures: Vec<_> = events.iter().map(String::as_str)
+                .filter(|name| matches!(*name, "transfer-interrupted" | "transfer-failed"))
+                .collect();
+            assert_eq!(failures, expected.into_iter().collect::<Vec<_>>());
             assert!(!events.iter().any(|name| name == "transfer-completed"));
+            assert!(interruptions.lock().unwrap().is_empty());
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_shot_resume_completes_while_the_old_receiver_is_still_open() -> anyhow::Result<()> {
+        use iroh_blobs::{
+            protocol::{ChunkRangesSeq, GetRequest},
+            provider::{
+                events::{Notify, ProviderProto, RequestReceived, RequestUpdate, TransferAborted,
+                    TransferCompleted, TransferStarted},
+                TransferStats,
+            },
+        };
+        #[derive(Default)]
+        struct Events(std::sync::Mutex<Vec<String>>);
+        impl crate::core::types::EventEmitter for Events {
+            fn emit_event(&self, name: &str) -> Result<(), String> {
+                self.0.lock().unwrap().push(name.into());
+                Ok(())
+            }
+            fn emit_event_with_payload(&self, _: &str, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let hash = iroh_blobs::Hash::new(b"payload");
+        let events = Arc::new(Events::default());
+        let interruptions = PeerInterruptions::default();
+        let (tx, rx) = mpsc::channel(16);
+        let task = tokio::spawn(show_provide_progress_with_logging(
+            rx, Some(events.clone()), 4096, hash, vec![4096], interruptions.clone(), true,
+        ));
+
+        let start = |connection_id| {
+            let tx = tx.clone();
+            async move {
+                let (updates, requests) = irpc::channel::mpsc::channel(16);
+                let request: Notify<RequestReceived<GetRequest>> =
+                    serde_json::from_value(serde_json::to_value(RequestReceived {
+                        connection_id,
+                        request_id: 1,
+                        request: GetRequest { hash, ranges: ChunkRangesSeq::all() },
+                    })?)?;
+                let request: irpc::WithChannels<_, ProviderProto> =
+                    (request, irpc::channel::none::NoSender, requests).into();
+                tx.send(request.into()).await?;
+                updates.send(RequestUpdate::Started(TransferStarted { index: 2, hash, size: 4096 })).await?;
+                anyhow::Ok(updates)
+            }
+        };
+        let stats = |payload_bytes_sent| Box::new(TransferStats {
+            payload_bytes_sent,
+            other_bytes_sent: 8,
+            other_bytes_read: 0,
+            duration: Duration::ZERO,
+        });
+        let old = start(1).await?;
+        let reopened = start(2).await?;
+        reopened.send(RequestUpdate::Completed(TransferCompleted { stats: stats(4096) })).await?;
+        drop(reopened);
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !events.0.lock().unwrap().iter().any(|event| event == "transfer-completed") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.context("waiting for the old connection blocked completion")?;
+
+        interruptions.lock().unwrap().insert((1, 1));
+        old.send(RequestUpdate::Aborted(TransferAborted { stats: stats(1024) })).await?;
+        drop(old);
+        drop(tx);
+        task.await??;
+        let events = events.0.lock().unwrap();
+        assert_eq!(events.iter().filter(|event| *event == "transfer-completed").count(), 1);
+        assert!(!events.iter().any(|event| matches!(event.as_str(), "transfer-failed" | "transfer-interrupted")));
         Ok(())
     }
 
@@ -975,9 +1066,11 @@ async fn show_provide_progress_with_logging(
     total_file_size: u64,
     collection_hash: iroh_blobs::Hash,
     file_sizes: Vec<u64>,
+    peer_interruptions: PeerInterruptions,
+    complete_on_first_receiver: bool,
 ) -> anyhow::Result<()> {
     use n0_future::FuturesUnordered;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -996,10 +1089,27 @@ async fn show_provide_progress_with_logging(
     }
 
     struct ProgressTracker {
+        pending_requests: std::collections::HashSet<(u64, u64)>,
         transfers: std::collections::HashMap<(u64, u64), TransferState>,
         completed_bytes: u64,
         started_at: Option<Instant>,
         resume: super::sender_progress::SenderProgress,
+    }
+
+    #[derive(Default)]
+    struct TransferCycle {
+        requests: AtomicUsize,
+        finished: AtomicUsize,
+        started: AtomicBool,
+        last_request: Mutex<Option<Instant>>,
+    }
+
+    impl TransferCycle {
+        fn reset(&self) {
+            self.requests.store(0, Ordering::SeqCst);
+            self.finished.store(0, Ordering::SeqCst);
+            self.started.store(false, Ordering::SeqCst);
+        }
     }
 
     fn snapshot_progress(tracker: &ProgressTracker, total_bytes: u64) -> (u64, f64) {
@@ -1027,17 +1137,15 @@ async fn show_provide_progress_with_logging(
     }
 
     let progress_tracker = Arc::new(Mutex::new(ProgressTracker {
+        pending_requests: Default::default(),
         transfers: Default::default(),
         completed_bytes: 0,
         started_at: None,
         resume: super::sender_progress::SenderProgress::new(file_sizes),
     }));
-    let active_requests = Arc::new(AtomicUsize::new(0));
-    let completed_requests = Arc::new(AtomicUsize::new(0));
-    let has_emitted_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let has_any_transfer = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let last_request_time: Arc<tokio::sync::Mutex<Option<Instant>>> =
-        Arc::new(tokio::sync::Mutex::new(None));
+    let broadcast_cycle = Arc::new(TransferCycle::default());
+    let mut peer_cycles = std::collections::HashMap::<u64, Arc<TransferCycle>>::new();
+    let latest_receiver = Arc::new(std::sync::Mutex::new(None));
 
     loop {
         tokio::select! {
@@ -1056,34 +1164,45 @@ async fn show_provide_progress_with_logging(
                         connections.lock().await.insert(msg.connection_id, endpoint_id);
                     }
                     iroh_blobs::provider::events::ProviderMessage::ConnectionClosed(msg) => {
+                        peer_cycles.remove(&msg.connection_id);
                         connections.lock().await.remove(&msg.connection_id);
-                        progress_tracker.lock().await.resume.close(msg.connection_id);
+                        let mut tracker = progress_tracker.lock().await;
+                        tracker.resume.close(msg.connection_id);
+                        // Keep causes for requests whose buffered abort events still need reading.
+                        peer_interruptions.lock().unwrap().retain(|request| {
+                            request.0 != msg.connection_id || tracker.pending_requests.contains(request)
+                        });
                     }
                     iroh_blobs::provider::events::ProviderMessage::GetRequestReceivedNotify(msg) => {
                         let connection_id = msg.connection_id;
                         let request_id = msg.request_id;
 
-                        active_requests.fetch_add(1, Ordering::SeqCst);
-
-                        let mut last_time = last_request_time.lock().await;
-                        *last_time = Some(Instant::now());
-                        drop(last_time);
+                        // Size probes may deliberately drop their stream before FIN. They
+                        // must not delay or decide whether a separate payload GET completed.
+                        let is_size_probe = msg.request.ranges
+                            == iroh_blobs::protocol::ChunkRangesSeq::verified_child_sizes();
+                        let cycle = if complete_on_first_receiver && !is_size_probe {
+                            *latest_receiver.lock().unwrap() = Some(connection_id);
+                            peer_cycles.entry(connection_id).or_default().clone()
+                        } else {
+                            broadcast_cycle.clone()
+                        };
+                        if !is_size_probe {
+                            cycle.requests.fetch_add(1, Ordering::SeqCst);
+                            *cycle.last_request.lock().await = Some(Instant::now());
+                        }
 
                         let app_handle_task = app_handle.clone();
                         let connections_task = connections.clone();
                         let progress_tracker_task = progress_tracker.clone();
-                        let active_requests_task = active_requests.clone();
-                        let completed_requests_task = completed_requests.clone();
-                        let has_emitted_started_task = has_emitted_started.clone();
-                        let has_any_transfer_task = has_any_transfer.clone();
-                        let last_request_time_task = last_request_time.clone();
-                        // Size discovery reads the root and only the last chunk
-                        // of each child. Request IDs do not identify payloads:
-                        // retries and other peers can issue more size probes.
-                        let is_size_probe = msg.request.ranges
-                            == iroh_blobs::protocol::ChunkRangesSeq::verified_child_sizes();
-                        if !is_size_probe && msg.request.hash == collection_hash {
-                            progress_tracker.lock().await.resume.begin(connection_id, request_id, &msg.request.ranges);
+                        let latest_receiver = latest_receiver.clone();
+                        let peer_interruptions = peer_interruptions.clone();
+                        {
+                            let mut tracker = progress_tracker.lock().await;
+                            tracker.pending_requests.insert((connection_id, request_id));
+                            if !is_size_probe && msg.request.hash == collection_hash {
+                                tracker.resume.begin(connection_id, request_id, &msg.request.ranges);
+                            }
                         }
 
                         let mut rx = msg.rx;
@@ -1091,8 +1210,22 @@ async fn show_provide_progress_with_logging(
                             let mut transfer_started = false;
                             let mut request_completed = false;
                             let mut payload_started = false;
+                            let current_receiver = || {
+                                !complete_on_first_receiver
+                                    || *latest_receiver.lock().unwrap() == Some(connection_id)
+                            };
+                            let failure_event = || {
+                                if peer_interruptions.lock().unwrap().remove(&(connection_id, request_id)) {
+                                    "transfer-interrupted"
+                                } else {
+                                    "transfer-failed"
+                                }
+                            };
 
                             while let Ok(Some(update)) = rx.recv().await {
+                                if is_size_probe && !matches!(&update, iroh_blobs::provider::events::RequestUpdate::Started(_)) {
+                                    continue;
+                                }
                                 match update {
                                     iroh_blobs::provider::events::RequestUpdate::Started(msg) => {
                                         let endpoint_id = connections_task
@@ -1103,9 +1236,24 @@ async fn show_provide_progress_with_logging(
                                             .unwrap_or_else(|| "?".to_string());
                                         let hash_short = msg.hash.fmt_short().to_string();
                                         let total_size = msg.size.max(1);
+                                        emit_event_with_payload(
+                                            &app_handle_task,
+                                            "sender-request-started",
+                                            &SenderRequestStartedPayload {
+                                                endpoint_id,
+                                                connection_id,
+                                                request_id,
+                                                item_index: msg.index,
+                                                hash_short,
+                                                total_bytes: total_size,
+                                            },
+                                        );
+                                        if is_size_probe {
+                                            continue;
+                                        }
                                         // Index 0 is the hash sequence and index 1
                                         // is collection metadata, not file data.
-                                        let count_toward_payload = !is_size_probe && msg.index > 1;
+                                        let count_toward_payload = msg.index > 1;
                                         payload_started |= count_toward_payload;
 
                                         let (active_count, done_bytes, speed_bps) = {
@@ -1158,29 +1306,16 @@ async fn show_provide_progress_with_logging(
                                             (tracker.transfers.len(), done_bytes, speed_bps)
                                         };
 
-                                        emit_event_with_payload(
-                                            &app_handle_task,
-                                            "sender-request-started",
-                                            &SenderRequestStartedPayload {
-                                                endpoint_id,
-                                                connection_id,
-                                                request_id,
-                                                item_index: msg.index,
-                                                hash_short,
-                                                total_bytes: total_size,
-                                            },
-                                        );
                                         emit_progress_event(&app_handle_task, done_bytes, total_bytes, speed_bps);
 
                                         if !transfer_started {
                                             emit_active_connection_count(&app_handle_task, active_count);
 
-                                            if !has_emitted_started_task.swap(true, Ordering::SeqCst) {
+                                            if !cycle.started.swap(true, Ordering::SeqCst) {
                                                 emit_event(&app_handle_task, "transfer-started");
                                             }
 
                                             transfer_started = true;
-                                            has_any_transfer_task.store(true, Ordering::SeqCst);
                                         }
                                     }
                                     iroh_blobs::provider::events::RequestUpdate::Progress(msg) => {
@@ -1192,11 +1327,10 @@ async fn show_provide_progress_with_logging(
 
                                             emit_active_connection_count(&app_handle_task, active_count);
 
-                                            if !has_emitted_started_task.swap(true, Ordering::SeqCst) {
+                                            if !cycle.started.swap(true, Ordering::SeqCst) {
                                                 emit_event(&app_handle_task, "transfer-started");
                                             }
                                             transfer_started = true;
-                                            has_any_transfer_task.store(true, Ordering::SeqCst);
                                         }
 
                                         let (payload, done_bytes, speed_bps) = {
@@ -1269,28 +1403,28 @@ async fn show_provide_progress_with_logging(
 
                                             request_completed = true;
 
-                                            let completed = completed_requests_task.fetch_add(1, Ordering::SeqCst) + 1;
-                                            let active = active_requests_task.load(Ordering::SeqCst);
+                                            let completed = cycle.finished.fetch_add(1, Ordering::SeqCst) + 1;
+                                            let active = cycle.requests.load(Ordering::SeqCst);
 
-                                            if payload_started
-                                                && completed >= active
-                                                && has_any_transfer_task.load(Ordering::SeqCst) {
+                                            if payload_started && completed >= active {
                                                 let active_before_wait = active;
 
                                                 tokio::time::sleep(Duration::from_millis(500)).await;
 
-                                                let completed_after = completed_requests_task.load(Ordering::SeqCst);
-                                                let active_after = active_requests_task.load(Ordering::SeqCst);
+                                                let completed_after = cycle.finished.load(Ordering::SeqCst);
+                                                let active_after = cycle.requests.load(Ordering::SeqCst);
 
                                                 let new_requests_arrived = active_after > active_before_wait;
 
                                                 let has_active_transfers = {
                                                     let tracker = progress_tracker_task.lock().await;
-                                                    !tracker.transfers.is_empty()
+                                                    tracker.transfers.keys().any(|(peer, _)| {
+                                                        !complete_on_first_receiver || *peer == connection_id
+                                                    })
                                                 };
 
                                                 let last_request_recent = {
-                                                    let last_time = last_request_time_task.lock().await;
+                                                    let last_time = cycle.last_request.lock().await;
                                                     if let Some(time) = *last_time {
                                                         time.elapsed() < Duration::from_millis(500)
                                                     } else {
@@ -1304,16 +1438,13 @@ async fn show_provide_progress_with_logging(
                                                     && !last_request_recent
                                                 {
                                                     emit_event(&app_handle_task, "transfer-completed");
-                                                    has_emitted_started_task.store(false, Ordering::SeqCst);
-
-                                                    active_requests_task.store(0, Ordering::SeqCst);
-                                                    completed_requests_task.store(0, Ordering::SeqCst);
-                                                    has_any_transfer_task.store(false, Ordering::SeqCst);
+                                                    cycle.reset();
                                                 }
                                             }
                                         }
                                     }
                                     iroh_blobs::provider::events::RequestUpdate::Aborted(_msg) => {
+                                        let terminal_event = failure_event();
                                         tracing::warn!("Request aborted: conn {} req {}", connection_id, request_id);
                                         if transfer_started && !request_completed {
                                             let (active_count, done_bytes, speed_bps) = {
@@ -1328,18 +1459,16 @@ async fn show_provide_progress_with_logging(
 
                                             request_completed = true;
 
-                                            let completed = completed_requests_task.fetch_add(1, Ordering::SeqCst) + 1;
-                                            let active = active_requests_task.load(Ordering::SeqCst);
+                                            let completed = cycle.finished.fetch_add(1, Ordering::SeqCst) + 1;
+                                            let active = cycle.requests.load(Ordering::SeqCst);
 
                                             // Size discovery deliberately stops reading once
                                             // it has the sizes. Its reset is not payload loss.
                                             if payload_started && completed >= active {
-                                                emit_event(&app_handle_task, "transfer-failed");
-                                                has_emitted_started_task.store(false, Ordering::SeqCst);
-
-                                                active_requests_task.store(0, Ordering::SeqCst);
-                                                completed_requests_task.store(0, Ordering::SeqCst);
-                                                has_any_transfer_task.store(false, Ordering::SeqCst);
+                                                if current_receiver() {
+                                                    emit_event(&app_handle_task, terminal_event);
+                                                }
+                                                cycle.reset();
                                             }
                                         }
                                     }
@@ -1356,16 +1485,23 @@ async fn show_provide_progress_with_logging(
 
                                 emit_progress_event(&app_handle_task, done_bytes, total_bytes, speed_bps);
 
-                                completed_requests_task.fetch_add(1, Ordering::SeqCst);
+                                cycle.finished.fetch_add(1, Ordering::SeqCst);
                                 // Losing the update stream is not a successful
                                 // payload completion, regardless of byte counts.
-                                if payload_started {
-                                    emit_event(&app_handle_task, "transfer-failed");
+                                let terminal_event = failure_event();
+                                if payload_started && current_receiver() {
+                                    emit_event(&app_handle_task, terminal_event);
+                                    if terminal_event == "transfer-interrupted" {
+                                        cycle.reset();
+                                    }
                                 }
                             }
                             // Also release display state when a request failed
                             // before its first Started update.
-                            progress_tracker_task.lock().await.resume.finish_request(connection_id, request_id);
+                            let mut tracker = progress_tracker_task.lock().await;
+                            tracker.resume.finish_request(connection_id, request_id);
+                            tracker.pending_requests.remove(&(connection_id, request_id));
+                            peer_interruptions.lock().unwrap().remove(&(connection_id, request_id));
                         });
                     }
                     _ => {}

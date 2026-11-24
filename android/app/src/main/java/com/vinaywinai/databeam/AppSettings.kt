@@ -24,8 +24,10 @@ object AppSettings {
     fun skipDuplicateFiles(c:Context)=prefs(c).getBoolean("skipDuplicateFiles",false)
     fun unwrapCroc(c:Context)=prefs(c).getBoolean("unwrapCroc",false)
     fun setUnwrapCroc(c:Context,value:Boolean){prefs(c).edit().putBoolean("unwrapCroc",value).apply()}
+    fun unwrapSendme(c:Context)=prefs(c).getBoolean("unwrapSendme",false)
+    fun setUnwrapSendme(c:Context,value:Boolean){prefs(c).edit().putBoolean("unwrapSendme",value).apply()}
     fun setSkipDuplicateFiles(c:Context,value:Boolean){prefs(c).edit().putBoolean("skipDuplicateFiles",value).apply()}
-    fun cleanupDays(c:Context)=prefs(c).getInt("transferCleanupDays",0).takeIf{it==7 || it==30} ?: 0
+    fun cleanupDays(c:Context)=prefs(c).getInt("transferCleanupDays",7).takeIf{it==7 || it==30} ?: 0
     fun setCleanupDays(c:Context,days:Int){prefs(c).edit().putInt("transferCleanupDays",days).apply()}
     fun folder(c:Context)=prefs(c).getString("saveFolder","")!!
     fun folderLabel(c:Context)=prefs(c).getString("saveFolderLabel","Downloads / DataBeam")!!

@@ -2,6 +2,17 @@
 use std::sync::OnceLock;
 use tokio::sync::watch;
 
+pub(super) fn peer_connection_lost(error: &iroh::endpoint::ConnectionError) -> bool {
+    use iroh::endpoint::ConnectionError;
+    matches!(
+        error,
+        ConnectionError::ConnectionClosed(_)
+            | ConnectionError::ApplicationClosed(_)
+            | ConnectionError::Reset
+            | ConnectionError::TimedOut
+    )
+}
+
 fn changes() -> &'static watch::Sender<u64> {
     static CHANGES: OnceLock<watch::Sender<u64>> = OnceLock::new();
     CHANGES.get_or_init(|| watch::channel(0).0)

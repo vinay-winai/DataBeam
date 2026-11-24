@@ -1,6 +1,13 @@
 use crate::core::types::{get_or_create_secret, AppHandle, ReceiveOptions, ReceiveResult};
 use anyhow::Context;
-use iroh::{address_lookup::dns::DnsAddressLookup, endpoint::presets, Endpoint};
+use iroh::{
+    address_lookup::dns::DnsAddressLookup,
+    endpoint::{
+        presets, ConnectError, ConnectWithOptsError, ConnectingError, ConnectionError, ReadError,
+        WriteError,
+    },
+    Endpoint,
+};
 use iroh_blobs::{
     api::{
         blobs::{BlobStatus, ExportMode, ExportOptions, ExportProgressItem},
@@ -17,6 +24,57 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tokio::select;
+
+#[derive(Debug, derive_more::Display)]
+#[display("Could not reach the Sendme sender")]
+pub struct SenderUnavailable;
+
+fn emit_receive_output(app_handle: &AppHandle, path: &Path, wrapped: bool) {
+    if let Some(path) = path.to_str() {
+        emit_event_with_payload(app_handle, "receive-output", &serde_json::json!({ "path": path, "wrapped": wrapped }).to_string());
+    }
+}
+
+fn sender_unavailable(error: &ConnectError) -> bool {
+    match error {
+        ConnectError::Connect {
+            source: ConnectWithOptsError::NoAddress { .. },
+            ..
+        } => true,
+        ConnectError::Connection { source, .. }
+        | ConnectError::Connecting {
+            source: ConnectingError::ConnectionError { source, .. },
+            ..
+        } => super::network::peer_connection_lost(source),
+        _ => false,
+    }
+}
+
+fn download_error(error: GetError) -> anyhow::Error {
+    let disconnected = [error.open(), error.remote_write(), error.remote_read()]
+        .into_iter()
+        .flatten()
+        .filter_map(std::io::Error::get_ref)
+        .any(|cause| {
+            let connection = cause
+                .downcast_ref::<ConnectionError>()
+                .or_else(|| match cause.downcast_ref::<WriteError>() {
+                    Some(WriteError::ConnectionLost(error)) => Some(error),
+                    _ => None,
+                })
+                .or_else(|| match cause.downcast_ref::<ReadError>() {
+                    Some(ReadError::ConnectionLost(error)) => Some(error),
+                    _ => None,
+                });
+            connection.is_some_and(super::network::peer_connection_lost)
+        });
+    let error = anyhow::Error::new(show_get_error(error));
+    if disconnected {
+        error.context(SenderUnavailable)
+    } else {
+        error
+    }
+}
 
 // Helper function to emit events through the app handle
 fn emit_event(app_handle: &AppHandle, event_name: &str) {
@@ -160,7 +218,13 @@ pub async fn download(
                         "With direct addrs: {:?}",
                         addr.ip_addrs().collect::<Vec<_>>()
                     );
-                    return Err(anyhow::Error::new(e).context("Connect to Sendme sender"));
+                    let unavailable = sender_unavailable(&e);
+                    let error = anyhow::Error::new(e).context("Connect to Sendme sender");
+                    return Err(if unavailable {
+                        error.context(SenderUnavailable)
+                    } else {
+                        error
+                    });
                 }
             };
 
@@ -204,7 +268,7 @@ pub async fn download(
                 Err(e) => {
                     tracing::error!("Failed to get sizes: {:?}", e);
                     tracing::error!("Error type: {}", std::any::type_name_of_val(&e));
-                    return Err(show_get_error(e).into());
+                    return Err(download_error(e));
                 }
             };
             let _total_size = sizes.iter().copied().sum::<u64>();
@@ -220,7 +284,7 @@ pub async fn download(
             // Emit initial progress event right away with our resumed progress
             emit_progress_event(&app_handle, local_size.min(payload_size), payload_size, 0.0);
 
-            let get = db.remote().execute_get(connection, local.missing());
+            let get = db.remote().execute_get(connection.clone(), local.missing());
             let mut stats = Stats::default();
             let mut stream = get.stream();
             let mut last_progress_emit = Instant::now();
@@ -257,7 +321,7 @@ pub async fn download(
                     }
                     GetProgressItem::Error(cause) => {
                         tracing::error!("Download error: {:?}", cause);
-                        anyhow::bail!(show_get_error(cause));
+                        return Err(download_error(cause));
                     }
                 }
             }
@@ -268,6 +332,9 @@ pub async fn download(
                 );
             }
 
+            // A successful, verified GET may close before the sender sees
+            // the final transport ACK. Confirm that the payload arrived.
+            connection.close(super::sender_protocol::PAYLOAD_RECEIVED, b"payload received");
             (stats, total_files, payload_size)
         } else {
             let total_files = local.children().unwrap() - 1;
@@ -327,6 +394,7 @@ pub async fn download(
         // 2. Resolve destination with smart incrementing logic
         let mut final_output_dir = output_dir_base.to_path_buf();
         let use_signature = uses_export_signature(&collection);
+        let wrapped = collection_root(&collection).is_some();
         if let Some(dir_component) = collection_root(&collection) {
             validate_path_component(dir_component)?;
             
@@ -372,12 +440,13 @@ pub async fn download(
         }
 
         // Emit completion event AFTER everything is done
+        emit_receive_output(&app_handle, &final_output_dir, wrapped);
         emit_event(&app_handle, "receive-completed");
 
-        anyhow::Ok((total_files, payload_size, stats, final_output_dir))
+        anyhow::Ok((total_files, payload_size, stats, final_output_dir, wrapped))
     };
 
-    let (total_files, payload_size, _stats, output_dir) = select! {
+    let (total_files, payload_size, _stats, output_dir, wrapped) = select! {
         biased;
         _ = cancelled => {
             // Dropping the download future stops its reads first. Keep the
@@ -413,6 +482,7 @@ pub async fn download(
     Ok(ReceiveResult {
         message: format!("Downloaded {} files, {} bytes", total_files, payload_size),
         file_path: output_dir,
+        wrapped,
     })
 }
 
@@ -783,7 +853,8 @@ pub async fn check_and_export_local_in(
 
     emit_event(&app_handle, "receive-started");
     emit_event(&app_handle, "receive-export-started");
-    let allow_overwrite = overwrite || collection_root(&collection).is_some();
+    let wrapped = collection_root(&collection).is_some();
+    let allow_overwrite = overwrite || wrapped;
     let export_fut = export(&db, collection, &final_output_dir, &app_handle, &content_hash, allow_overwrite);
 
     if let Some(mut cancel_rx) = cancel_token {
@@ -803,6 +874,7 @@ pub async fn check_and_export_local_in(
     // Release Windows database handles before removing the completed cache.
     db.shutdown().await?;
 
+    emit_receive_output(&app_handle, &final_output_dir, wrapped);
     emit_event(&app_handle, "receive-completed");
     
     // Remove the smart-overwrite signature file now that export is finished

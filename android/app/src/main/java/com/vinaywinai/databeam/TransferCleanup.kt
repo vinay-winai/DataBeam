@@ -18,7 +18,8 @@ object TransferCleanup {
     val lock=ReentrantLock()
     const val DAY_MS=24L*60*60*1000
     data class Candidate(val relative:String,val bytes:Long,val kind:String)
-    data class Report(val reclaimed:Long,val candidates:List<Candidate>,val protectedBytes:Long)
+    data class ReceiveDraft(val id:String,val mode:String,val input:String,val updatedAt:Long)
+    data class Report(val reclaimed:Long,val candidates:List<Candidate>,val protectedBytes:Long,val receives:List<ReceiveDraft>)
     private val validId=Regex("[A-Za-z0-9_-]{1,100}")
     private val namespaces=setOf("received","outgoing","blobs")
     fun target(root:File,relative:String):File {
@@ -46,13 +47,15 @@ object TransferCleanup {
         val id=state.optString("id");if(!validId.matches(id))return
         val value=JSONObject().put("id",id).put("status",status).put("updatedAt",System.currentTimeMillis())
         if(status=="complete")value.put("completedAt",state.optLong("completedAt",System.currentTimeMillis()))
-        for(key in listOf("action","mode","code","receiveCode","ticket","paths","output","cacheBase","saveFolder","saveFolderLabel","relay","route","published","publishedDirectories","workingCleaned","referencedSources","done","total","message","payloadNames","timing","crocWrapper","crocReadyToSave","crocDirect","crocStaged","crocPending","crocMoveTargets","crocMoved","unwrapCroc","crocUnwrapPending"))if(state.has(key))value.put(key,state.get(key))
+        for(key in listOf("action","mode","code","receiveCode","ticket","ticketCode","paths","output","cacheBase","saveFolder","saveFolderLabel","relay","route","published","publishedDirectories","workingCleaned","referencedSources","done","total","message","payloadNames","timing","crocWrapper","crocReadyToSave","crocDirect","crocStaged","crocPending","crocMoveTargets","crocMoved","unwrapCroc","crocUnwrapPending","nativeWrapper","nativePublishedWrapper","nativeReadyToSave","nativeMoved","nativeMoveTargets","unwrapSendme"))if(state.has(key))value.put(key,state.get(key))
         if(status=="complete" && state.optBoolean("workingCleaned")){
             value.remove("code")
             value.remove("receiveCode")
             value.remove("ticket")
+            value.remove("ticketCode")
             value.remove("crocPending")
             value.remove("crocReadyToSave")
+            value.remove("nativeReadyToSave")
         }
         val file=File(catalog(c),"$id.json");val temp=File(file.parentFile,"$id.tmp")
         synchronized(this){temp.writeText(value.toString());check(temp.renameTo(file)){"Cannot record transfer cleanup state"}}
@@ -71,7 +74,7 @@ object TransferCleanup {
                 val age=entry.optLong("completedAt",entry.optLong("updatedAt"))
                 val receiving=entry.optString("action")=="receive"
                 val unsavedExport=receiving && !entry.optBoolean("workingCleaned") &&
-                    (entry.optBoolean("crocReadyToSave") || entry.has("published") || entry.optString("status")=="complete")
+                    (entry.optBoolean("crocReadyToSave") || entry.optBoolean("nativeReadyToSave") || entry.has("published") || entry.optString("status")=="complete")
                 validId.matches(id) && age>0L && age<=cutoff && !unsavedExport
             }
             if(expired.isEmpty())return 0L
@@ -108,17 +111,47 @@ object TransferCleanup {
         }finally{lock.unlock()}
     }
     private fun records(c:Context):Map<String,JSONObject> = catalog(c).listFiles()?.filter{it.extension=="json"}?.mapNotNull{file->runCatching{JSONObject(file.readText())}.getOrNull()?.let{it.optString("id") to it}}?.toMap() ?: emptyMap()
-    fun crocReceiveHistory(c:Context):List<JSONObject> {
+    fun recoverEasyReceive(c:Context,state:JSONObject):JSONObject {
+        if(state.optString("action")!="receive" || state.optString("mode")!="EasySendMe" ||
+            EasyReceive.hasSavedTicket(state,NativeBridge::hash))return state
+        val code=state.optString("code")
+        if(code.isBlank())return state
+        val matches=records(c).values.filter{record->
+            record.optString("mode")=="EasySendMe" && record.optString("code")==code &&
+                isSavedNativeReceive(c,record)
+        }.groupBy{NativeBridge.hash(it.getString("ticket"))}
+        // A custom code can be reused for different files. The storage chooser
+        // can select a specific record when the code alone is ambiguous.
+        return matches.values.singleOrNull()?.maxByOrNull{it.optLong("updatedAt")} ?: state
+    }
+
+    fun savedReceive(c:Context,id:String):JSONObject? {
+        val current=TransferService.state(c)
+        val saved=if(current.optString("id")==id)current else records(c)[id]
+        return saved?.takeIf{isSavedNativeReceive(c,it)}?.also{
+            if(it.optString("status")!="paused")it.put("status","interrupted")
+            it.put("connectionRetained",false)
+        }
+    }
+
+    private fun isSavedNativeReceive(c:Context,state:JSONObject):Boolean =
+        state.optString("action")=="receive" && state.optString("mode") in listOf("Sendme","EasySendMe") &&
+            state.optString("status") in listOf("paused","interrupted","stopped","running","stopping") &&
+            ReceiveCache.hasSavedData(File(c.filesDir,"blobs"),state.optString("ticket"))
+    fun receiveHistory(c:Context):List<JSONObject> {
         val current=TransferService.state(c)
         val entries=records(c).toMutableMap()
         val currentId=current.optString("id")
-        if(current.optString("mode")=="Croc" && current.optString("action")=="receive" && validId.matches(currentId) &&
+        if(current.optString("action")=="receive" && validId.matches(currentId) &&
             entries[currentId]?.optString("status")!="complete"){
             entries[currentId]=JSONObject(current.toString()).put("updatedAt",System.currentTimeMillis())
         }
         return entries.values.filter{
-            it.optString("mode")=="Croc" && it.optString("action")=="receive" &&
-                (it.optString("status")!="complete" || it.optBoolean("workingCleaned"))
+            it.optString("action")=="receive" && when {
+                it.optString("status")=="complete" -> it.optBoolean("workingCleaned")
+                it.optString("mode")=="Croc" || it.optBoolean("nativeReadyToSave") -> true
+                else -> isSavedNativeReceive(c,it)
+            }
         }.sortedByDescending{it.optLong("updatedAt")}.map {
             if(it.optString("id")!=currentId && it.optString("status") in listOf("running","stopping")){
                 it.put("status","interrupted").put("connectionRetained",false)
@@ -128,32 +161,63 @@ object TransferCleanup {
         }
     }
 
-    fun discardCrocReceive(c:Context,id:String) {
+    fun crocReceiveHistory(c:Context)=receiveHistory(c).filter{it.optString("mode")=="Croc"}
+
+    fun receiveWrapper(entry:JSONObject):String {
+        if(entry.optString("mode")=="Croc")return entry.optString("crocWrapper")
+        val saved=entry.optString("nativePublishedWrapper")
+        if(saved.isNotEmpty())return saved
+        // Older native history records contain the original relative paths.
+        val paths=entry.optJSONObject("published")?.keys()?.asSequence().orEmpty() +
+            entry.optJSONObject("publishedDirectories")?.keys()?.asSequence().orEmpty()
+        return paths.map{it.substringBefore('/',"")}.distinct().toList().singleOrNull()
+            ?.takeIf{it.endsWith("_databeam")}.orEmpty()
+    }
+
+    fun discardReceive(c:Context,id:String) {
         lock.lock()
         try {
             check(!TransferService.isBusy()){"Finish the active transfer first"}
             require(validId.matches(id)){"Invalid transfer"}
-            val entry=crocReceiveHistory(c).firstOrNull{it.optString("id")==id} ?: error("Transfer no longer available")
+            val entry=receiveHistory(c).firstOrNull{it.optString("id")==id} ?: error("Transfer no longer available")
             if(entry.optString("status")!="complete"){
                 if(entry.optBoolean("crocDirect") && entry.optString("crocWrapper").isNotEmpty())
                     CrocDownloads.discard(c,entry.getString("crocWrapper"),entry.optJSONObject("crocPending") ?: JSONObject())
                 remove(c.filesDir,"received/$id")
                 remove(c.filesDir,"blobs/$id")
-                CrocBatchReview.clear(c,id)
+                if(entry.optString("mode")=="Croc")CrocBatchReview.clear(c,id)
+                else if(EasyReceive.hasSavedTicket(entry,NativeBridge::hash))ReceiveCache.delete(File(c.filesDir,"blobs"),entry.getString("ticket"))
             }
             File(catalog(c),"$id.json").delete()
             if(TransferService.state(c).optString("id")==id)c.getSharedPreferences("transfer",0).edit().remove("state").commit()
         }finally{lock.unlock()}
     }
 
-    fun moveCrocReceive(c:Context,entry:JSONObject){
+    fun discardCrocReceive(c:Context,id:String)=discardReceive(c,id)
+
+    fun moveReceive(c:Context,entry:JSONObject){
         lock.lock()
         try{
             check(!TransferService.isBusy() && entry.optString("status")=="complete"){"Finish the active transfer first"}
-            val targets=entry.optJSONObject("crocMoveTargets") ?: JSONObject().also{entry.put("crocMoveTargets",it)}
-            CrocDownloads.moveOut(c,entry.getString("crocWrapper"),entry.optJSONObject("published") ?: JSONObject(),
-                entry.optJSONObject("publishedDirectories") ?: JSONObject(),targets){record(c,entry)}
-            entry.put("crocMoved",true)
+            val croc=entry.optString("mode")=="Croc"
+            val wrapper=receiveWrapper(entry)
+            require(wrapper.isNotEmpty() && entry.optString("saveFolder").isEmpty()){"This folder cannot be unwrapped"}
+            val targetKey=if(croc)"crocMoveTargets" else "nativeMoveTargets"
+            val targets=entry.optJSONObject(targetKey) ?: JSONObject().also{entry.put(targetKey,it)}
+            val prefix=if(croc)"" else entry.optString("nativeWrapper",wrapper)+"/"
+            fun relative(key:String):JSONObject {
+                val source=entry.optJSONObject(key) ?: return JSONObject()
+                if(prefix.isEmpty())return source
+                return JSONObject().apply{for(path in source.keys())if(path.startsWith(prefix))put(path.removePrefix(prefix),source.getString(path))}
+            }
+            val directories=relative("publishedDirectories")
+            CrocDownloads.moveOut(c,wrapper,relative("published"),directories,targets){record(c,entry)}
+            if(!croc){
+                val saved=entry.optJSONObject("publishedDirectories") ?: JSONObject()
+                directories.keys().forEach{saved.put(prefix+it,directories.getString(it))}
+                entry.put("publishedDirectories",saved)
+            }
+            entry.put(if(croc)"crocMoved" else "nativeMoved",true)
             record(c,entry)
         }finally{lock.unlock()}
     }
@@ -215,12 +279,13 @@ object TransferCleanup {
         val original=hash(file.inputStream(),check);val saved=c.contentResolver.openInputStream(uri)?.let{hash(it,check)} ?: return@runCatching false
         original.first==saved.first && original.second.contentEquals(saved.second)
     }.getOrDefault(false)
-    private fun verify(c:Context,directory:File,published:JSONObject,dirs:JSONObject,check:()->Unit):Boolean {
-        if(!directory.isDirectory)return false
-        for(file in directory.walkTopDown()){
+    private fun verify(c:Context,directory:File,published:JSONObject,dirs:JSONObject,check:()->Unit,wrapper:String=""):Boolean {
+        val root=if(wrapper.isEmpty())directory else File(directory,wrapper)
+        if(!root.isDirectory || (wrapper.isNotEmpty() && root.canonicalFile.parentFile!=directory.canonicalFile))return false
+        for(file in root.walkTopDown()){
             check();if(Files.isSymbolicLink(file.toPath()))return false
             if(file.isFile){val relative=file.relativeTo(directory).invariantSeparatorsPath;val uri=published.optString(relative);if(uri.isEmpty() || !matches(c,file,Uri.parse(uri),check))return false}
-            else if(file!=directory && file.list()?.isEmpty()==true){
+            else if(file!=root && file.list()?.isEmpty()==true){
                 val relative=file.relativeTo(directory).invariantSeparatorsPath;val uri=dirs.optString(relative)
                 if(uri.isEmpty())return false
                 val exists=if(uri.startsWith("file:"))File(Uri.parse(uri).path!!).isDirectory else runCatching{c.contentResolver.query(Uri.parse(uri),arrayOf(android.provider.DocumentsContract.Document.COLUMN_DOCUMENT_ID),null,null,null)?.use{it.moveToFirst()} ?: false}.getOrDefault(false)
@@ -231,7 +296,7 @@ object TransferCleanup {
     }
     fun saved(c:Context,state:JSONObject):Long {
         val id=state.getString("id");val directory=target(c.filesDir,"received/$id")
-        require(verify(c,directory,state.optJSONObject("published") ?: JSONObject(),state.optJSONObject("publishedDirectories") ?: JSONObject(),{})){"Saved files could not be verified. Working copies were kept; resume to save them again."}
+        require(verify(c,directory,state.optJSONObject("published") ?: JSONObject(),state.optJSONObject("publishedDirectories") ?: JSONObject(),{},state.optString("nativeWrapper"))){"Saved files could not be verified. Working copies were kept; resume to save them again."}
         record(c,state,"complete") // Durable publication receipts precede deletion.
         var reclaimed=remove(c.filesDir,"received/$id")
         if(state.optString("mode")=="Croc")CrocBatchReview.clear(c,id)
@@ -259,9 +324,10 @@ object TransferCleanup {
     }
     /** Run while idle. Unknown legacy caches are offered for deletion, never silently aged out. */
     fun scan(c:Context,extra:List<String> = emptyList(),migrate:Boolean=true):Report {
-        if(!lock.tryLock())return Report(0,emptyList(),0)
+        fun idle(){check(!TransferService.isBusy()){"Finish or pause the transfer before cleaning storage"}}
+        idle()
+        lock.lock()
         try {
-            fun idle(){check(!TransferService.isBusy()){"Finish or pause the transfer before cleaning storage"}}
             idle();var reclaimed=clearAgedTransfers(c);var kept=0L;val found=mutableListOf<Candidate>();val known=records(c)
             // File senders now require fresh selection, so no inactive private
             // sender snapshot is reusable. Never prompt to keep these copies.
@@ -278,7 +344,7 @@ object TransferCleanup {
                 var entry=known[directory.name]
                 if(kind=="received" && migrate){
                     if(entry==null)entry=migratePublished(c,checked,::idle)
-                    if(entry!=null && entry.optString("action")=="receive" && (entry.optString("status")=="complete" || entry.has("published")) && verify(c,checked,entry.optJSONObject("published") ?: JSONObject(),entry.optJSONObject("publishedDirectories") ?: JSONObject(),::idle)){
+                    if(entry!=null && entry.optString("action")=="receive" && (entry.optString("status")=="complete" || entry.has("published")) && verify(c,checked,entry.optJSONObject("published") ?: JSONObject(),entry.optJSONObject("publishedDirectories") ?: JSONObject(),::idle,entry.optString("nativeWrapper"))){
                         idle();reclaimed+=saved(c,entry);continue
                     }
                 }
@@ -289,8 +355,21 @@ object TransferCleanup {
                     idle();reclaimed+=remove(c.filesDir,relative)
                 }else found.add(Candidate(relative,bytes,kind))
             }
-            return Report(reclaimed,found,kept)
+            return Report(reclaimed,found,kept,savedReceiveDrafts(c,known))
         } finally{lock.unlock()}
+    }
+    private fun savedReceiveDrafts(c:Context,known:Map<String,JSONObject>):List<ReceiveDraft> {
+        val current=TransferService.state(c)
+        val entries=known+(current.optString("id") to current)
+        return entries.mapNotNull{(id,state)->
+            val mode=state.optString("mode")
+            if(!isSavedNativeReceive(c,state))return@mapNotNull null
+            val ticket=state.optString("ticket")
+            val input=if(mode=="Sendme")ticket else QrSharing.sharedCode(mode,state.optString("code"))
+            if(input.isBlank())return@mapNotNull null
+            val draft=ReceiveDraft(id,mode,input,state.optLong("updatedAt",known[id]?.optLong("updatedAt") ?: 0L))
+            draft to NativeBridge.hash(ticket)
+        }.sortedByDescending{it.first.updatedAt}.distinctBy{(draft,hash)->Triple(draft.mode,draft.input,hash)}.map{it.first}
     }
     fun deleteUnused(c:Context,selected:List<Candidate>,extra:List<String> = emptyList()):Long {
         lock.lock()

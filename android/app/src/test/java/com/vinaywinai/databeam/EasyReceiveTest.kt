@@ -25,4 +25,30 @@ class EasyReceiveTest {
         try{EasyReceive.accept(config,"other",::hash);fail("Accepted different content")}catch(_:IllegalArgumentException){}
         assertEquals("old",config.getString("ticket"));assertTrue(config.getBoolean("refresh"))
     }
+
+    @Test fun senderStillSharingAfterReopeningUsesSavedTicketDespiteAnInterruptedLookup(){
+        val original=JSONObject().put("code","first-code").put("ticket","old")
+        EasyReceive.requestLookup(original,"replacement-code")
+        val reopened=JSONObject(original.toString())
+        assertTrue(EasyReceive.needsLookup(reopened))
+        assertTrue(EasyReceive.reuseSavedTicket(reopened,::hash))
+        assertEquals("first-code",reopened.getString("code"))
+        assertEquals("old",reopened.getString("ticket"))
+        assertFalse(EasyReceive.needsLookup(reopened))
+    }
+
+    @Test fun requestingACodeDoesNotPersistTheLookupAsTheNextResumeAction(){
+        val snapshot=JSONObject().put("code","first-code").put("ticket","old")
+        EasyReceive.requestLookup(snapshot,"replacement-code")
+        assertEquals("replacement-code",EasyReceive.takeRequestedCode(snapshot))
+        assertFalse(EasyReceive.needsLookup(JSONObject(snapshot.toString())))
+        assertEquals("first-code",snapshot.getString("code"))
+    }
+
+    @Test fun interruptedInitialLookupHasNoSavedTicketToReconnectWith(){
+        val config=JSONObject().put("code","first-code").put("ticket","")
+        assertFalse(EasyReceive.hasSavedTicket(config,::hash))
+        assertFalse(EasyReceive.reuseSavedTicket(config,::hash))
+        assertTrue(EasyReceive.needsLookup(config))
+    }
 }

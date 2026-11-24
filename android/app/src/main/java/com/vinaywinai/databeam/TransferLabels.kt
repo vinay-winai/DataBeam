@@ -11,7 +11,7 @@ object TransferLabels {
         val retry=if(hasSendPayload(s))"Tap Resend to share the same files again. Select any missing items if prompted."
             else if(selectionRetained)"To resume, send the same selected files or folder again."
             else "To resume, reselect the exact same files or folder and start a new transfer."
-        val receiver=if(s.optString("mode")=="Croc")"Share your current Croc code so the receiver can resume from Croc receive history."
+        val receiver=if(s.optString("mode")=="Croc")"Share your current Croc code so the receiver can resume from Receive history."
             else "Share the new code or ticket with the receiver so they can continue using saved data."
         return "$retry $receiver"
     }
@@ -82,6 +82,6 @@ object TransferLabels {
         else if(s.optString("mode")=="Sendme")"Saved data is kept. Tap Resume. Use the current session while it is still sharing, or New ticket after the sender shares the same files again."
         else if(s.optBoolean("connectionRetained"))"Tap Resume to continue the current connection."
         else if(s.optJSONArray("payloadNames")?.length()?.let{it>0}==true)
-            "Open Croc receive history and tap Resume. Ask the sender to share the same files again."
+            "Open Receive history and tap Resume. Ask the sender to share the same files again."
         else "Confirm the Croc code and ask the sender to keep sharing, then try Receive again."
 }

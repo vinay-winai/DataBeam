@@ -121,15 +121,23 @@ object Storage {
     }
 
     /** Publish completed files automatically; record each URI to make export retries idempotent. */
-    fun publishDownloads(c:Context,source:File,published:org.json.JSONObject,stopped:()->Boolean,folder:String="",directories:org.json.JSONObject=org.json.JSONObject(),recordDirectory:(String,String)->Unit={_,_->},wrapper:String="",topLevelNames:org.json.JSONObject?=null,record:(String,String)->Unit) {
+    fun publishDownloads(c:Context,source:File,published:org.json.JSONObject,stopped:()->Boolean,folder:String="",directories:org.json.JSONObject=org.json.JSONObject(),recordDirectory:(String,String)->Unit={_,_->},wrapper:String="",topLevelNames:org.json.JSONObject?=null,stripWrapper:String="",record:(String,String)->Unit) {
         require(source.isDirectory){"Received files are not ready"}
-        fun destination(relative:String):String {
-            if(wrapper.isNotEmpty())return "${safe(wrapper)}/$relative"
-            if(topLevelNames==null)return relative
-            val name=relative.substringBefore('/')
-            return safe(topLevelNames.getString(name))+relative.substring(name.length)
+        val contentRoot=if(stripWrapper.isEmpty())source else File(source,safe(stripWrapper))
+        if(stripWrapper.isNotEmpty()){
+            require(contentRoot.isDirectory && contentRoot.canonicalFile==File(source.canonicalFile,stripWrapper)){"The saved wrapper changed"}
         }
-        source.walkTopDown().filter{it.isDirectory && it!=source && it.list()?.isEmpty()==true}.forEach{directory->
+        fun destination(relative:String):String {
+            val item=if(stripWrapper.isEmpty())relative else {
+                check(relative.startsWith("$stripWrapper/")){"The saved wrapper changed"}
+                relative.substring(stripWrapper.length+1)
+            }
+            if(wrapper.isNotEmpty())return "${safe(wrapper)}/$item"
+            if(topLevelNames==null)return item
+            val name=item.substringBefore('/')
+            return safe(topLevelNames.getString(name))+item.substring(name.length)
+        }
+        contentRoot.walkTopDown().filter{it.isDirectory && it!=contentRoot && it.list()?.isEmpty()==true}.forEach{directory->
             check(!stopped()){"Paused"}
             val relative=directory.relativeTo(source).invariantSeparatorsPath
             val parts=destination(relative).split('/').map{safe(it)}
@@ -151,7 +159,7 @@ object Storage {
         }
         // The native receiver removes its temporary signature after export.
         // A user file with that name must still be published.
-        source.walkTopDown().filter{it.isFile}.forEach{file->
+        contentRoot.walkTopDown().filter{it.isFile}.forEach{file->
             check(!stopped()){ "Paused" }
             val relative=file.relativeTo(source).invariantSeparatorsPath
             val known=published.optString(relative)

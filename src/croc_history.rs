@@ -10,9 +10,33 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[derive(Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ReceiveMode {
+    #[default]
+    Croc,
+    Sendme,
+    EasySendMe,
+}
+
+impl ReceiveMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Croc => "Croc",
+            Self::Sendme => "Sendme",
+            Self::EasySendMe => "EasySendMe",
+        }
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 pub struct ReceiveEntry {
     pub id: String,
+    #[serde(default)]
+    pub mode: ReceiveMode,
+    #[serde(default)]
+    pub ticket: Option<String>,
+    #[serde(default)]
+    pub blob_root: Option<PathBuf>,
     pub destination: PathBuf,
     pub original_code: Option<String>,
     pub code: Option<String>,
@@ -69,7 +93,7 @@ pub fn pending_review(history: &Path, entry_id: &str) -> Option<BatchReview> {
 
 pub fn answer_review(history: &Path, entry_id: &str, review_id: &str, apply: bool) -> io::Result<()> {
     if !pending_review(history, entry_id).is_some_and(|review| review.id == review_id) {
-        return Err(io::Error::other("The file review has ended. Open Croc receive history to resume again."));
+        return Err(io::Error::other("The file review has ended. Open Receive history to resume again."));
     }
     let mut file = tempfile::NamedTempFile::new_in(history)?;
     write!(file, "{} {review_id}", if apply { "apply" } else { "keep" })?;
@@ -83,6 +107,11 @@ fn valid_id(id: &str) -> bool {
 }
 
 impl ReceiveEntry {
+    pub fn native_cache(&self) -> Option<PathBuf> {
+        let hash = crate::backend::native_ticket_to_hex_hash(self.ticket.as_deref()?)?;
+        Some(self.blob_root.as_ref()?.join(format!(".sendme-recv-{hash}")))
+    }
+
     fn work(&self) -> PathBuf {
         self.destination.join(format!(".databeam-croc-{}", self.id))
     }
@@ -92,7 +121,7 @@ impl ReceiveEntry {
     fn receipt(&self, history: &Path) -> PathBuf {
         history.join(format!("{}.json", self.id))
     }
-    fn save(&mut self, history: &Path) -> io::Result<()> {
+    pub fn save(&mut self, history: &Path) -> io::Result<()> {
         self.updated = now_seconds();
         let mut temp = tempfile::NamedTempFile::new_in(history)?;
         serde_json::to_writer(temp.as_file_mut(), self).map_err(io::Error::other)?;
@@ -114,7 +143,7 @@ impl ReceiveEntry {
                     .ok()
                     .map(|offer| offer.wrapper)
             })
-            .unwrap_or_else(|| "Croc receive".into())
+            .unwrap_or_else(|| format!("{} receive", self.mode.label()))
     }
     pub fn location(&self) -> &Path {
         self.wrapper.as_deref().unwrap_or(&self.destination)
@@ -123,6 +152,70 @@ impl ReceiveEntry {
     pub fn can_change_code(&self, history: &Path) -> bool {
         read_offer(&self.offer(history)).is_ok_and(|offer| offer.strong)
     }
+}
+
+pub fn remember_native(
+    history: &Path,
+    mode: ReceiveMode,
+    ticket: String,
+    code: Option<String>,
+    destination: PathBuf,
+    blob_root: PathBuf,
+) -> io::Result<ReceiveEntry> {
+    let hash = crate::backend::native_ticket_to_hex_hash(&ticket)
+        .ok_or_else(|| io::Error::other("Invalid Sendme ticket"))?;
+    fs::create_dir_all(history)?;
+    let cache = blob_root.join(format!(".sendme-recv-{hash}"));
+    let mut entry = read_entries(history).into_iter().find(|entry| {
+        !entry.complete && entry.mode == mode && entry.destination == destination
+            && entry.native_cache().as_ref() == Some(&cache)
+    }).unwrap_or_else(|| ReceiveEntry {
+        id: format!("{:032x}", rand::random::<u128>()),
+        mode,
+        ticket: None,
+        blob_root: Some(blob_root),
+        destination,
+        original_code: None,
+        code: None,
+        wrapper: None,
+        done: 0,
+        total: 0,
+        complete: false,
+        ready_to_save: false,
+        unwrap_on_save: false,
+        updated: 0,
+        completed_at: None,
+        elapsed_ms: None,
+        route: None,
+        name: String::new(),
+        error: String::new(),
+    });
+    entry.ticket = Some(ticket);
+    entry.code = code;
+    entry.error.clear();
+    entry.save(history)?;
+    Ok(entry)
+}
+
+pub fn finish_native(history: &Path, entry: &mut ReceiveEntry, output: PathBuf, wrapped: bool, unwrap_on_save: bool) -> io::Result<()> {
+    entry.destination = if wrapped {
+        output.parent().ok_or_else(|| io::Error::other("Missing receive destination"))?.to_owned()
+    } else {
+        output.clone()
+    };
+    if wrapped {
+        entry.name = output.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    }
+    entry.wrapper = wrapped.then_some(output);
+    entry.complete = true;
+    entry.completed_at = Some(now_seconds());
+    entry.ticket = None;
+    entry.code = None;
+    entry.save(history)?;
+    if unwrap_on_save && entry.wrapper.is_some() {
+        unwrap(history, entry)?;
+    }
+    Ok(())
 }
 
 fn now_seconds() -> u64 {
@@ -134,6 +227,16 @@ fn read_offer(path: &Path) -> io::Result<Offer> {
 }
 
 pub fn entries(history: &Path) -> Vec<ReceiveEntry> {
+    read_entries(history).into_iter().filter(|entry| {
+        entry.complete || if entry.mode == ReceiveMode::Croc {
+            entry.work().is_dir()
+        } else {
+            entry.native_cache().is_some_and(|path| path.is_dir())
+        }
+    }).collect()
+}
+
+fn read_entries(history: &Path) -> Vec<ReceiveEntry> {
     let Ok(files) = fs::read_dir(history) else {
         return Vec::new();
     };
@@ -152,7 +255,7 @@ pub fn entries(history: &Path) -> Vec<ReceiveEntry> {
             if entry.id != id {
                 return None;
             }
-            (entry.complete || entry.work().is_dir()).then_some(entry)
+            Some(entry)
         })
         .collect();
     entries.sort_by_key(|entry| std::cmp::Reverse(entry.updated));
@@ -162,6 +265,18 @@ pub fn entries(history: &Path) -> Vec<ReceiveEntry> {
 pub fn discard(history: &Path, entry: &ReceiveEntry) -> io::Result<()> {
     if !valid_id(&entry.id) {
         return Err(io::Error::other("Invalid receive record"));
+    }
+    if entry.mode != ReceiveMode::Croc {
+        if !entry.complete {
+            if let (Some(path), Some(root)) = (entry.native_cache(), &entry.blob_root) {
+                if fs::symlink_metadata(&path).is_ok_and(|info| info.file_type().is_dir())
+                    && path.canonicalize()?.parent() == Some(root.canonicalize()?.as_path())
+                {
+                    fs::remove_dir_all(path)?;
+                }
+            }
+        }
+        return remove_if_present(&entry.receipt(history));
     }
     let work = entry.work();
     if !entry.complete && work.exists() {
@@ -181,10 +296,14 @@ pub fn discard(history: &Path, entry: &ReceiveEntry) -> io::Result<()> {
 }
 
 pub fn clear_expired(history: &Path, cutoff: u64) {
-    for entry in entries(history) {
+    for entry in read_entries(history) {
         let age_from = entry.completed_at.unwrap_or(entry.updated);
         if !entry.ready_to_save && age_from != 0 && age_from <= cutoff {
-            let _ = discard(history, &entry);
+            let _ = if entry.mode == ReceiveMode::Croc {
+                discard(history, &entry)
+            } else {
+                remove_if_present(&entry.receipt(history))
+            };
         }
     }
 }
@@ -397,6 +516,9 @@ pub fn start(
             let destination = destination.canonicalize()?;
             let entry = ReceiveEntry {
                 id: format!("{:032x}", rand::random::<u128>()),
+                mode: ReceiveMode::Croc,
+                ticket: None,
+                blob_root: None,
                 destination,
                 original_code: Some(code.clone()),
                 code: Some(code.clone()),
@@ -429,6 +551,7 @@ pub fn start(
             ProcessHandle {
                 cancel: Default::default(),
                 child_pid: Default::default(),
+                receive_shutdown: None,
             },
         )
     } else {
@@ -542,6 +665,9 @@ mod tests {
         fs::create_dir(&history).unwrap();
         let mut entry = ReceiveEntry {
             id: format!("{:032x}", 1),
+            mode: ReceiveMode::Croc,
+            ticket: None,
+            blob_root: None,
             destination: temp.path().to_owned(),
             original_code: Some("example-code".into()),
             code: Some("example-code".into()),
@@ -584,6 +710,29 @@ mod tests {
         );
         assert!(temp.path().join("Photos (1)/empty").is_dir());
         assert!(!temp.path().join("report.pdf_and_more_databeam").exists());
+    }
+
+    #[test]
+    fn native_history_unwrap_preserves_existing_files_and_drops_the_ticket() {
+        let temp = tempfile::tempdir().unwrap();
+        let history = temp.path().join("history");
+        let destination = temp.path().join("downloads");
+        let blobs = temp.path().join("blobs");
+        let ticket = "blobacxfr74igmsbvsbnn73wcecg5vt3kbzncqwfrdiampuufwnhkublmaaaaafyju2y4tel43bymjvsdax7k5mbrotl2p2lsbdetff6ctftksqhe";
+        let mut entry = remember_native(&history, ReceiveMode::Sendme, ticket.into(), None, destination.clone(), blobs).unwrap();
+        fs::create_dir_all(entry.native_cache().unwrap()).unwrap();
+        assert!(entries(&history).iter().any(|saved| saved.ticket.as_deref() == Some(ticket)));
+        let wrapper = destination.join("report.txt_databeam");
+        fs::create_dir_all(wrapper.join("empty")).unwrap();
+        fs::write(wrapper.join("report.txt"), "received").unwrap();
+        fs::write(destination.join("report.txt"), "existing").unwrap();
+        finish_native(&history, &mut entry, wrapper.clone(), true, true).unwrap();
+        assert_eq!(fs::read_to_string(destination.join("report.txt")).unwrap(), "existing");
+        assert_eq!(fs::read_to_string(destination.join("report (1).txt")).unwrap(), "received");
+        assert!(destination.join("empty").is_dir());
+        assert!(!wrapper.exists());
+        let saved = entries(&history).pop().unwrap();
+        assert!(saved.complete && saved.ticket.is_none() && saved.wrapper.is_none());
     }
 
     #[test]

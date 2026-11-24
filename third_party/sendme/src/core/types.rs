@@ -29,6 +29,7 @@ pub struct SendResult {
 pub struct ReceiveResult {
     pub message: String,
     pub file_path: PathBuf,
+    pub wrapped: bool,
 }
 
 #[derive(Debug, Default)]
@@ -43,6 +44,9 @@ pub struct SendOptions {
     pub jobs: Option<usize>,
     /// Cooperative GUI cancellation, including directory scanning and imports.
     pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// A one-shot share completes when one receiver finishes, even if a
+    /// previous receiver's connection is still draining.
+    pub complete_on_first_receiver: bool,
     /// Session-local read-only source handles, keyed by their staged filenames.
     #[cfg(feature = "descriptor-sources")]
     pub source_files: Arc<std::collections::HashMap<PathBuf, Arc<std::fs::File>>>,
