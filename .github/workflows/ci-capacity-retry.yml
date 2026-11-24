@@ -1,0 +1,59 @@
+name: Retry CI after hosted runner capacity failure
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+concurrency:
+  group: ci-capacity-retry-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    if: >-
+      github.event.workflow_run.run_attempt == 1 &&
+      (github.event.workflow_run.conclusion == 'failure' ||
+       github.event.workflow_run.conclusion == 'cancelled')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+    outputs:
+      retry: ${{ steps.inspect.outputs.retry }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Inspect failed jobs
+        id: inspect
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/retry_ci_capacity.py inspect
+
+  retry:
+    needs: inspect
+    if: needs.inspect.outputs.retry == 'true'
+    # Set this environment's wait timer to 60 minutes. No runner is used while waiting.
+    environment:
+      name: ci-capacity-retry
+      deployment: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      checks: read
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Retry capacity failures once
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/retry_ci_capacity.py retry
