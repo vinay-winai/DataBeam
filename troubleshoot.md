@@ -60,3 +60,11 @@ Desktop DataBeam retains upstream's normal transport settings and automatic Dire
 ## Suggestions
 
 - EazySendme/Sendme recommended for sensitive data transfers.
+- **Croc**
+Prefers a direct connection. If Croc selects a relay, it keeps that route for the rest of the transfer while the connection stays up. Supports resumable file transfers, text, and browser sharing.
+
+- **Sendme**
+Always prefers a direct connection and can switch from relay to direct mid-transfer when a suitable route becomes available. Transfers can continue across network changes and resume from saved data. Broadcast keeps sharing available for multiple receivers.
+
+- **EasySendMe**
+Sendme engine but with short Croc code. Croc delivers the sendme ticket, then Sendme transfers the files.
