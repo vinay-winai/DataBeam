@@ -15,6 +15,9 @@ import java.io.File
 import java.util.UUID
 
 class MainActivity:ComponentActivity() {
+    companion object {
+        const val PRIVACY_POLICY_URL="https://wisesloth.pages.dev/DataBeam/privacy.html"
+    }
     private var qrDialog:AlertDialog?=null
     private var settingsDialog:AlertDialog?=null
     private var reconnectDialog:AlertDialog?=null
@@ -573,6 +576,9 @@ class MainActivity:ComponentActivity() {
                 }
             }.start()
         }
+        button(panel,"Privacy policy"){
+            runCatching{startActivity(Intent(Intent.ACTION_VIEW,Uri.parse(PRIVACY_POLICY_URL)))}.onFailure{alert("Could not open privacy policy")}
+        }.apply{(layoutParams as? LinearLayout.LayoutParams)?.topMargin=dp(12)}
         settingsDialog=AlertDialog.Builder(this).setTitle("Settings").setView(scroll)
             .setPositiveButton("Done"){_,_->if(!configurationLocked())AppSettings.setRelay(this,custom.text.toString())}.create().also{dialog->
                 dialog.setOnDismissListener{if(!configurationLocked())AppSettings.setRelay(this,custom.text.toString());settingsFolder=null;settingsBackground=null;batteryButton=null;notificationsButton=null;sendmeEngineToggle=null;crocEngineToggle=null;settingsDialog=null;settingsConfiguration.clear()};dialog.show();lockConfiguration(configurationLocked())
