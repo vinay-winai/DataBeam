@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Privacy Policy | DataBeam</title>
+    <meta name="description" content="Privacy Policy for DataBeam (Desktop and Android com.vinaywinai.databeam).">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+    <link rel="icon" type="image/x-icon" href="favicon.ico">
+    <style>
+        .policy-wrap {
+            max-width: 820px;
+            margin: 24px auto 64px;
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 40px;
+            backdrop-filter: var(--blur);
+        }
+        .policy-wrap h1 {
+            font-size: 2.25rem;
+            margin-bottom: 8px;
+            letter-spacing: -0.02em;
+        }
+        .policy-meta {
+            color: var(--text-muted);
+            font-size: 0.9rem;
+            margin-bottom: 32px;
+        }
+        .policy-wrap h2 {
+            font-size: 1.25rem;
+            margin-top: 28px;
+            margin-bottom: 10px;
+            color: var(--accent);
+        }
+        .policy-wrap p, .policy-wrap li {
+            color: var(--text-muted);
+            margin-bottom: 12px;
+        }
+        .policy-wrap ul {
+            padding-left: 20px;
+            margin-bottom: 16px;
+        }
+        .policy-wrap a {
+            color: #ff8c00;
+        }
+        @media (max-width: 640px) {
+            .policy-wrap { padding: 24px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="background-effects">
+        <div class="glow glow-1"></div>
+        <div class="glow glow-2"></div>
+    </div>
+
+    <div class="container">
+        <header class="header">
+            <div class="logo">
+                <a href="./" style="display:flex;align-items:center;gap:12px;color:inherit;text-decoration:none;">
+                    <svg width="32" height="32" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <circle cx="50" cy="50" r="48" fill="#000000" />
+                        <circle cx="50" cy="50" r="42" stroke="#ff4500" stroke-width="6" fill="none" />
+                        <path d="M35 65 L65 35 M65 35 L48 35 M65 35 L65 52" stroke="#ff4500" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                    <span>DataBeam</span>
+                </a>
+            </div>
+            <nav class="nav">
+                <a href="./">Home</a>
+                <a href="https://github.com/vinay-winai/DataBeam" target="_blank">GitHub</a>
+            </nav>
+        </header>
+
+        <main class="policy-wrap">
+            <h1>Privacy Policy</h1>
+            <p class="policy-meta">Applies to <strong>DataBeam</strong> (Desktop and Android: <code>com.vinaywinai.databeam</code>) · Effective November 25, 2026</p>
+
+            <p>DataBeam is an open-source, peer-to-peer file and text transfer application built around Croc and Sendme. We do not require accounts, show advertisements, or sell or share your personal data.</p>
+
+            <h2>1. Files, Text, and Transfers</h2>
+            <ul>
+                <li><strong>End-to-end encrypted transfers:</strong> Files, folders, and text snippets you choose to send or receive are transferred directly between your devices over your local network or routed via encrypted Croc or Iroh relays using your transfer code or ticket.</li>
+                <li><strong>No developer servers:</strong> DataBeam does not upload your transferred files or text to developer-owned servers.</li>
+                <li><strong>Public or custom relays:</strong> When direct peer-to-peer connections cannot be established, encrypted transfer traffic passes through public Croc/Iroh relays or a custom relay you configure in Settings.</li>
+            </ul>
+
+            <h2>2. Local Device Storage</h2>
+            <p>Preferences, recent short codes, receive history, and incomplete transfer caches are stored locally on your device solely to support pause/resume and user preferences. On Android, automatic cloud backup and device-to-device data extraction are disabled.</p>
+
+            <h2>3. Permissions Used on Android</h2>
+            <ul>
+                <li><strong>Network &amp; Wi-Fi state:</strong> Used to establish direct LAN and relay-assisted peer transfers.</li>
+                <li><strong>Camera (optional):</strong> Requested only when you open the built-in QR scanner to read a transfer code or ticket. Camera frames are processed on-device and are not uploaded by DataBeam.</li>
+                <li><strong>Notifications &amp; Foreground Service (<code>dataSync</code>):</strong> Used to display live transfer progress and keep user-initiated transfers running reliably in the background.</li>
+            </ul>
+
+            <h2>4. Third-Party Libraries &amp; Network Checks</h2>
+            <ul>
+                <li><strong>QR Code Scanning (Google ML Kit):</strong> The Android app uses Google ML Kit Barcode Scanning (bundled on-device model) with auto-zoom enabled to detect QR codes locally. According to Google's ML Kit documentation, ML Kit may send basic operational diagnostics, device/app metadata, and ephemeral scanning session metrics encrypted in transit to Google for performance diagnostics and abuse prevention.</li>
+                <li><strong>Troubleshooting Guide Check:</strong> DataBeam periodically fetches the public <code>troubleshoot.md</code> file from GitHub to display an unread indicator when troubleshooting documentation is updated.</li>
+            </ul>
+
+            <h2>5. Children's Privacy</h2>
+            <p>DataBeam does not knowingly collect personal information from children under 13.</p>
+
+            <h2>6. Changes &amp; Contact</h2>
+            <p>Updates to this policy will be posted on this page. For questions or support, please open an issue on the <a href="https://github.com/vinay-winai/DataBeam/issues" target="_blank">DataBeam GitHub repository</a>.</p>
+        </main>
+
+        <footer class="footer">
+            <p>&copy; GNU Affero General Public License v3.0 | DataBeam. Built around Croc and Sendme.</p>
+        </footer>
+    </div>
+</body>
+</html>
