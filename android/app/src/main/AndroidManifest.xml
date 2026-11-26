@@ -18,7 +18,7 @@
    <intent-filter><action android:name="android.intent.action.SEND"/><action android:name="android.intent.action.SEND_MULTIPLE"/><category android:name="android.intent.category.DEFAULT"/><data android:mimeType="*/*"/></intent-filter>
    <intent-filter><action android:name="android.intent.action.PROCESS_TEXT"/><category android:name="android.intent.category.DEFAULT"/><data android:mimeType="text/plain"/></intent-filter>
   </activity-alias>
-  <activity android:name=".QrScannerActivity" android:screenOrientation="portrait" android:exported="false"/>
+  <activity android:name=".QrScannerActivity" android:exported="false"/>
   <service android:name=".TransferService" android:exported="false" android:foregroundServiceType="dataSync"/>
  </application>
 </manifest>

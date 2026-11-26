@@ -101,7 +101,7 @@
 
             <h2>4. Third-Party Libraries &amp; Network Checks</h2>
             <ul>
-                <li><strong>QR Code Scanning (Google ML Kit):</strong> The Android app uses Google ML Kit Barcode Scanning (bundled on-device model) with auto-zoom enabled to detect QR codes locally. According to Google's ML Kit documentation, ML Kit may send basic operational diagnostics, device/app metadata, and ephemeral scanning session metrics encrypted in transit to Google for performance diagnostics and abuse prevention.</li>
+                <li><strong>No Analytics or Telemetry SDKs:</strong> DataBeam does not include advertising, analytics, crash-reporting, or tracking SDKs. QR code scanning uses an offline, open-source on-device library (ZXing) with Android CameraX; no images, codes, or scanning diagnostics leave your device.</li>
                 <li><strong>Troubleshooting Guide Check:</strong> DataBeam periodically fetches the public <code>troubleshoot.md</code> file from GitHub to display an unread indicator when troubleshooting documentation is updated.</li>
             </ul>
 

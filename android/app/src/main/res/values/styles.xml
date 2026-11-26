@@ -7,8 +7,5 @@
         <item name="android:colorButtonNormal">#1C1C1C</item>
         <item name="android:textColorPrimary">#F5F5F5</item>
         <item name="android:textColorSecondary">#B0B0B0</item>
-        <item name="android:statusBarColor">@color/databeam_background</item>
-        <item name="android:navigationBarColor">@color/databeam_background</item>
-        <item name="android:windowLightStatusBar">false</item>
     </style>
 </resources>

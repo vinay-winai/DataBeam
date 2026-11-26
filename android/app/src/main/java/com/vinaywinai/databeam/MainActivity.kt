@@ -1,6 +1,8 @@
 package com.vinaywinai.databeam
 import android.app.*
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.view.doOnPreDraw
 import android.graphics.Bitmap
@@ -140,6 +142,10 @@ class MainActivity:ComponentActivity() {
     private fun rounded(color:Int)=android.graphics.drawable.GradientDrawable().apply{setColor(color);cornerRadius=dp(14).toFloat()}
     override fun onCreate(savedInstanceState:Bundle?) {
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge(
+            statusBarStyle=SystemBarStyle.dark(Color.TRANSPARENT),
+            navigationBarStyle=SystemBarStyle.dark(Color.TRANSPARENT)
+        )
         NativeBridge.initialize(applicationContext)
         RelayRecovery.initializeWordList(assets.open("eff-short-wordlist-1.txt").bufferedReader().use{it.readText()})
         sendKind=savedInstanceState?.getString("sendKind") ?: "files"
@@ -157,8 +163,13 @@ class MainActivity:ComponentActivity() {
         val layout=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL;setPadding(dp(20),dp(12),dp(20),dp(24))}
         scroll.addView(layout);screen.addView(scroll,LinearLayout.LayoutParams(-1,0,1f));setContentView(screen)
         screen.setOnApplyWindowInsetsListener{v,insets->
-            if(Build.VERSION.SDK_INT>=30){val bars=insets.getInsets(WindowInsets.Type.systemBars());v.setPadding(bars.left,bars.top,bars.right,bars.bottom)}
-            else v.setPadding(insets.systemWindowInsetLeft,insets.systemWindowInsetTop,insets.systemWindowInsetRight,insets.systemWindowInsetBottom)
+            if(Build.VERSION.SDK_INT>=30){
+                val bars=insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout() or WindowInsets.Type.ime())
+                v.setPadding(bars.left,bars.top,bars.right,bars.bottom)
+            } else {
+                @Suppress("DEPRECATION")
+                v.setPadding(insets.systemWindowInsetLeft,insets.systemWindowInsetTop,insets.systemWindowInsetRight,insets.systemWindowInsetBottom)
+            }
             insets
         }
         fun label(parent:LinearLayout,text:String,size:Float=14f)=TextView(this).apply{this.text=text;textSize=size;setTextColor(ink);setPadding(0,dp(6),0,dp(6));parent.addView(this)}
